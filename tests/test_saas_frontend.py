@@ -235,6 +235,8 @@ def test_jobs_fit_desk_uses_both_columns_and_resume_profile_controls() -> None:
     assert 'linkedin_url: "profile-linkedin"' in APP_JS
     assert 'github_url: "profile-github"' in APP_JS
     assert 'graduation_year: "profile-graduation-year"' in APP_JS
+    assert "function isPlaceholderProfileUrl" in APP_JS
+    assert "mayReplacePlaceholder" in APP_JS
     assert ".fit-desk" in STYLES_CSS
     assert ".job-fit-meter" in STYLES_CSS
 

@@ -261,6 +261,16 @@ def test_groq_resume_analysis_is_strictly_allowlisted_and_bounded(
     assert "github_url" not in result
 
 
+def test_groq_resume_analysis_discards_placeholder_profile_urls() -> None:
+    result = groq._clean_resume_analysis(  # noqa: SLF001 - boundary regression test
+        {
+            "linkedin_url": "https://linkedin.com/in/CHANGE-ME",
+            "github_url": "https://github.com/ada",
+        }
+    )
+    assert result == {"github_url": "https://github.com/ada"}
+
+
 def test_refresh_preserves_refresh_token(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.saas import gmail
 

@@ -14,6 +14,8 @@ from urllib.parse import urlsplit
 
 import requests
 
+from .profile_urls import is_placeholder_profile_url
+
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_TIMEOUT: tuple[float, float] = (5.0, 45.0)
@@ -233,7 +235,7 @@ def _bounded_string(value: Any, limit: int) -> str | None:
 
 def _safe_profile_url(value: Any, *, host_suffix: str | None = None) -> str | None:
     clean = _bounded_string(value, 2_048)
-    if clean is None:
+    if clean is None or is_placeholder_profile_url(clean):
         return None
     try:
         parsed = urlsplit(clean)

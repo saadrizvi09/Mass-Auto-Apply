@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .profile_urls import is_placeholder_profile_url
+
 
 def _validated_http_url(value: str | None, label: str) -> str | None:
     if not value:
@@ -121,7 +123,10 @@ class ProfileUpdate(StrictModel):
     @field_validator("linkedin_url", "github_url", "portfolio_url")
     @classmethod
     def validate_optional_url(cls, value: str | None) -> str | None:
-        return _validated_http_url(value, "URL")
+        validated = _validated_http_url(value, "URL")
+        if is_placeholder_profile_url(validated):
+            raise ValueError("Enter your actual profile URL instead of a placeholder")
+        return validated
 
 
 class UserSettingsUpdate(StrictModel):

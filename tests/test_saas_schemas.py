@@ -36,6 +36,14 @@ def test_profile_education_facts_are_bounded() -> None:
         ProfileUpdate(graduation_year=2101)
 
 
+def test_profile_urls_reject_template_placeholders() -> None:
+    with pytest.raises(ValidationError, match="actual profile URL"):
+        ProfileUpdate(linkedin_url="https://linkedin.com/in/CHANGE-ME")
+    assert ProfileUpdate(
+        linkedin_url="https://www.linkedin.com/in/saad-rizvi-447451256"
+    ).linkedin_url == "https://www.linkedin.com/in/saad-rizvi-447451256"
+
+
 def test_google_oauth_client_is_strict_and_secret_is_redacted_from_repr() -> None:
     credentials = GoogleOAuthClientUpsert(
         client_id="123456789-example.apps.googleusercontent.com",

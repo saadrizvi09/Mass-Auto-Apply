@@ -9,6 +9,8 @@ from typing import Any
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
+from .profile_urls import is_placeholder_profile_url
+
 
 MAX_PDF_PAGES = 50
 MAX_EXTRACTED_CHARACTERS = 250_000
@@ -134,6 +136,8 @@ def profile_suggestions(text: str) -> dict[str, Any]:
 
     for link in links:
         clean = link.rstrip(".,;:")
+        if is_placeholder_profile_url(clean):
+            continue
         lower = clean.lower()
         if "linkedin.com/in/" in lower and "linkedin_url" not in suggestions:
             suggestions["linkedin_url"] = clean

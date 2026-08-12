@@ -66,6 +66,19 @@ def test_profile_suggestions_are_conservative() -> None:
     }
 
 
+def test_profile_suggestions_skip_placeholder_links_and_use_real_annotation_target() -> None:
+    result = profile_suggestions(
+        "https://linkedin.com/in/CHANGE-ME "
+        "https://www.linkedin.com/in/saad-rizvi-447451256"
+    )
+    assert result["linkedin_url"] == (
+        "https://www.linkedin.com/in/saad-rizvi-447451256"
+    )
+    assert "linkedin_url" not in profile_suggestions(
+        "https://linkedin.com/in/CHANGE-ME"
+    )
+
+
 def test_pdf_annotation_profile_links_are_included_without_fetching(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

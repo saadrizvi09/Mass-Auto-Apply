@@ -1593,6 +1593,22 @@ function renderResumeSuggestions() {
   card.hidden = list.childElementCount === 0;
 }
 
+function isPlaceholderProfileUrl(value) {
+  try {
+    const placeholders = new Set([
+      "changeme", "insertlink", "inserturl", "replaceme",
+      "yourhandle", "yourname", "yourprofile", "yourusername",
+    ]);
+    return new URL(value).pathname
+      .split("/")
+      .filter(Boolean)
+      .map((segment) => decodeURIComponent(segment).toLowerCase().replace(/[^a-z0-9]/g, ""))
+      .some((segment) => placeholders.has(segment));
+  } catch (_error) {
+    return false;
+  }
+}
+
 function applyResumeSuggestions({ navigate = true, notify = true } = {}) {
   const map = {
     full_name: "profile-full-name",
@@ -1615,7 +1631,9 @@ function applyResumeSuggestions({ navigate = true, notify = true } = {}) {
   for (const [key, id] of Object.entries(map)) {
     const value = state.resumeSuggestions?.[key];
     const input = byId(id);
-    if (input && !input.value.trim() && value != null && value !== "") {
+    const mayReplacePlaceholder = ["linkedin_url", "github_url", "portfolio_url"].includes(key)
+      && isPlaceholderProfileUrl(input?.value || "");
+    if (input && (!input.value.trim() || mayReplacePlaceholder) && value != null && value !== "") {
       input.value = String(value);
       count += 1;
     }
