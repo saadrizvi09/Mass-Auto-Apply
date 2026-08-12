@@ -32,7 +32,7 @@ def test_ats_is_blocked_detects_visible_walls():
     assert b(_FakePage(body="Please Press & Hold to confirm you are human"))
     assert b(_FakePage(body="Checking your browser before accessing the site"))
     assert b(_FakePage(url="https://x.com/cdn-cgi/challenge-platform/h/g"))
-    assert b(_FakePage(url="https://ziprecruiter.com/_human/verify"))
+    assert b(_FakePage(url="https://jobs.example.com/_human/verify"))
 
 
 def test_ats_is_blocked_ignores_normal_form():
@@ -226,6 +226,38 @@ def test_skip_reason_drops_non_engineering_roles():
         assert _skip_reason(drop) == "off-target", drop
 
 
+def test_skip_reason_allow_swe_widens_to_software_roles():
+    """Cutshort + Instahyre (allow_swe=True) also keep general software-engineer /
+    software-development roles, including ML-adjacent titles that would otherwise be
+    off-target — while other platforms (default) stay AI-focused. Senior/intern gates stay."""
+    from app.integrations.platforms import _skip_reason
+    # ML-adjacent SWE titles: dropped by default (contain an off-target marker), kept with allow_swe
+    for t in ["Software Engineer, ML Platform", "SDE - Machine Learning",
+              "Software Developer, MLOps", "Backend Engineer - Deep Learning"]:
+        assert _skip_reason(t) == "off-target", t                     # AI-focused platforms drop
+        assert _skip_reason(t, allow_swe=True) is None, t             # Cutshort/Instahyre keep
+    # Plain SWE titles are kept either way
+    for t in ["Software Engineer", "Full Stack Developer", "SDE II"]:
+        assert _skip_reason(t, allow_swe=True) is None, t
+    # Remote-prefixed SWE titles are kept too (operator asked for remote SWE / software dev)
+    for t in ["Remote Software Engineer", "Remote Software Developer",
+              "Remote Backend Developer", "Software Engineer (Remote)"]:
+        assert _skip_reason(t, allow_swe=True) is None, t
+    # allow_swe does NOT override senior / intern gates
+    assert _skip_reason("Senior Software Engineer", allow_swe=True) == "senior-role"
+    assert _skip_reason("Software Engineer Intern", allow_swe=True) == "intern"
+    assert _skip_reason("Software Engineer Intern", allow_intern=True, allow_swe=True) is None
+    # allow_swe does not rescue a genuinely non-software role
+    assert _skip_reason("Data Scientist", allow_swe=True) == "off-target"
+
+
+def test_cutshort_default_skills_include_general_swe():
+    from app.integrations.platforms import _CUTSHORT_DEFAULT_SKILLS
+    for slug in ("software-engineer", "software-developer", "backend-developer",
+                 "full-stack-developer"):
+        assert slug in _CUTSHORT_DEFAULT_SKILLS, slug
+
+
 def test_wellfound_role_slug_defaults_to_ai():
     from app.integrations.platforms import _wellfound_role_slug
     assert _wellfound_role_slug("") == "ai-engineer"
@@ -249,7 +281,34 @@ def test_wellfound_blocked_detects_visa_banner():
     assert _wellfound_blocked(_P(
         "Ravenna Software does not offer visa sponsorship and requires all remote "
         "workers to be in-country. Your profile indicates you require sponsorship."))
+    # Newer wording (Pronexus, live 2026-06-25).
+    assert _wellfound_blocked(_P(
+        "Pronexus is not accepting applications from your current location due to "
+        "timezone or relocation constraints. If your location is incorrect, update your profile."))
     assert not _wellfound_blocked(_P("Cover Letter. Tell us why you're a great fit for this role."))
+
+
+def test_wellfound_us_pay_band_skips_big_usd_ranges():
+    """Big USD salary bands ($120k+ upper) signal US-in-country roles → skip, unless the
+    page allows India/worldwide. Stray single $ amounts (referral/funding) must not trip it."""
+    from app.integrations.platforms import _wellfound_us_pay_band
+
+    class _P:
+        def __init__(self, body):
+            self._b = body
+        def inner_text(self, _sel):
+            return self._b
+
+    assert _wellfound_us_pay_band(_P("Software Engineer $170k – $250k. Full Time."))
+    assert _wellfound_us_pay_band(_P("Salary $170,000 - $250,000 per year."))
+    assert _wellfound_us_pay_band(_P("Backend Engineer $120k to $160k."))
+    # below the threshold -> kept (global-remote comp band)
+    assert not _wellfound_us_pay_band(_P("Engineer $60k - $90k remote."))
+    # high band BUT worldwide/India allowed -> kept (ok-marker veto)
+    assert not _wellfound_us_pay_band(_P("$170k – $250k. Hires remotely Worldwide."))
+    assert not _wellfound_us_pay_band(_P("$180k – $220k. Remote in India."))
+    # no range, just stray dollar amounts -> not a band
+    assert not _wellfound_us_pay_band(_P("Refer a friend, earn $200. We raised $10,000,000."))
 
 
 def test_wellfound_location_restricted_filters_geo_locked_roles():
@@ -268,6 +327,9 @@ def test_wellfound_location_restricted_filters_geo_locked_roles():
         "AI Engineer. Remote (US). Must be authorized to work in the United States."))
     assert _wellfound_location_restricted(_P(
         "Software Engineer. United States only. US citizen or green card required."))
+    # Wellfound location label + relocation lock (Pronexus, live 2026-06-25).
+    assert _wellfound_location_restricted(_P(
+        "Software Engineer. $170k-$250k. Hires remotely in United States. Relocation Not Allowed."))
     # US company but explicitly hires worldwide / India -> NOT restricted (ok-marker vetoes).
     assert not _wellfound_location_restricted(_P(
         "Remote (Worldwide). We're a US company hiring globally. US time-zone overlap nice."))

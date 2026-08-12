@@ -92,6 +92,86 @@
       <button id="btn-resume" class="link-btn">resume sending</button>
     </div>
 
+    <!-- ===== Job platforms ===== -->
+    <section class="panel aac platform-panel">
+      <div class="panel-head">
+        <h2>Job platforms</h2>
+        <span class="panel-hint">Run low-volume autonomous applies from your logged-in Chrome. Each run stops on any security check.</span>
+      </div>
+      <div class="aac-grid platform-grid">
+
+        <div class="aac-card" data-platform="yc">
+          <div class="aac-card-head">
+            <span class="aac-ico aac-ico-yc">Y</span>
+            <div class="aac-card-title">
+              <strong>Y Combinator</strong>
+              <span class="aac-sub">Work at a Startup. Applies with a per-company message.</span>
+            </div>
+            <span class="aac-badge aac-badge-warn" title="Automation is against the platform's ToS - account risk.">ToS risk</span>
+          </div>
+          <div class="aac-actions">
+            <input type="text" class="aac-q" data-q="yc" placeholder="role (e.g. ai ml engineer)" />
+            <input type="number" class="aac-n" data-n="yc" min="1" max="10" placeholder="#" title="How many to apply to (blank = daily cap)" />
+            <button type="button" class="btn-find aac-run" data-run="yc">Auto-apply</button>
+          </div>
+          <div class="aac-result hidden" data-result="yc"></div>
+        </div>
+
+        <div class="aac-card" data-platform="instahyre">
+          <div class="aac-card-head">
+            <span class="aac-ico aac-ico-ih">ih</span>
+            <div class="aac-card-title">
+              <strong>Instahyre</strong>
+              <span class="aac-sub">India recruiter feed. One-click "I'm Interested"; AI/software only.</span>
+            </div>
+            <span class="aac-badge aac-badge-warn" title="ToS-restricted. Stops on any security check.">ToS risk</span>
+          </div>
+          <div class="aac-actions">
+            <input type="text" class="aac-q" data-q="instahyre" placeholder="feed is profile-targeted - query unused" disabled />
+            <input type="number" class="aac-n" data-n="instahyre" min="1" max="15" placeholder="#" title="How many to apply to (blank = daily cap)" />
+            <button type="button" class="btn-find aac-run" data-run="instahyre">Auto-apply</button>
+          </div>
+          <div class="aac-result hidden" data-result="instahyre"></div>
+        </div>
+
+        <div class="aac-card" data-platform="wellfound">
+          <div class="aac-card-head">
+            <span class="aac-ico aac-ico-wf">wf</span>
+            <div class="aac-card-title">
+              <strong>Wellfound</strong>
+              <span class="aac-sub">Ex-AngelList startups. Worldwide-remote first; AI/software only.</span>
+            </div>
+            <span class="aac-badge aac-badge-warn" title="ToS-restricted + Cloudflare. Stops on any challenge.">ToS risk</span>
+          </div>
+          <div class="aac-actions">
+            <input type="text" class="aac-q" data-q="wellfound" placeholder="blank = ai-engineer, or e.g. software engineer, backend" />
+            <input type="number" class="aac-n" data-n="wellfound" min="1" max="10" placeholder="#" title="How many to apply to (blank = daily cap)" />
+            <button type="button" class="btn-find aac-run" data-run="wellfound">Auto-apply</button>
+          </div>
+          <div class="aac-result hidden" data-result="wellfound"></div>
+        </div>
+
+        <div class="aac-card" data-platform="cutshort">
+          <div class="aac-card-head">
+            <span class="aac-ico aac-ico-cs">cs</span>
+            <div class="aac-card-title">
+              <strong>Cutshort</strong>
+              <span class="aac-sub">Message + screening. Video-interview jobs flagged manual.</span>
+            </div>
+            <span class="aac-badge aac-badge-warn" title="ToS-restricted + weekly cap + captcha.">ToS risk</span>
+          </div>
+          <div class="aac-actions">
+            <input type="text" class="aac-q" data-q="cutshort" placeholder="blank = all roles, or e.g. backend, fastapi" />
+            <input type="number" class="aac-n" data-n="cutshort" min="1" max="8" placeholder="#" title="How many to apply to (blank = daily cap)" />
+            <button type="button" class="btn-find aac-run" data-run="cutshort">Auto-apply</button>
+          </div>
+          <div class="aac-result hidden" data-result="cutshort"></div>
+        </div>
+
+      </div>
+      <p class="li-hint">One-time login: <code>py -3.11 formtool.py platlogin &lt;yc|instahyre|wellfound|cutshort&gt;</code>.</p>
+    </section>
+
     <!-- ===== Import from file ===== -->
     <section class="panel">
       <div class="panel-head">
@@ -123,6 +203,8 @@
         <h2>Paste &amp; apply — emails, form links, anything</h2>
         <span class="panel-hint">Dump referral emails or Google Form links; it splits them into jobs &amp; auto-fills the forms</span>
         <span class="spacer"></span>
+        <button id="btn-digest-hunt" class="link-btn"
+          title="Sweep public Telegram job channels for new Referral-Alert digests matching your roles/batch and add them as jobs">🔭 Hunt Telegram digests</button>
         <button id="btn-ref-scan" class="link-btn" title="Search Gmail for referral digests (real mode only)">Scan Gmail</button>
       </div>
       <div class="profile-bar">
@@ -232,6 +314,9 @@
       </button>
     </section>
 
+    <!-- ===== Status toast ===== -->
+    <div id="status-msg" class="status-msg" role="status"></div>
+
     <!-- ===== Auto-Apply Center ===== -->
     <section class="panel aac">
       <div class="panel-head">
@@ -267,105 +352,7 @@
           for you to review + Submit. Neither <b>Assisted</b> nor <b>Hard apply</b> ever submits for you.
         </p>
       </div>
-
-      <!-- Other platforms -->
-      <div class="aac-grid">
-
-        <div class="aac-card" data-platform="yc">
-          <div class="aac-card-head">
-            <span class="aac-ico aac-ico-yc">Y</span>
-            <div class="aac-card-title">
-              <strong>Y Combinator</strong>
-              <span class="aac-sub">Work at a Startup — applies with a per-company message.</span>
-            </div>
-            <span class="aac-badge aac-badge-warn" title="Automation is against the platform's ToS — account risk.">ToS risk</span>
-          </div>
-          <div class="aac-actions">
-            <input type="text" class="aac-q" data-q="yc" placeholder="role (e.g. ai ml engineer)" />
-            <input type="number" class="aac-n" data-n="yc" min="1" max="10" placeholder="#" title="How many to apply to (blank = daily cap)" />
-            <button type="button" class="btn-find aac-run" data-run="yc">Auto-apply</button>
-          </div>
-          <div class="aac-result hidden" data-result="yc"></div>
-        </div>
-
-        <div class="aac-card" data-platform="cutshort">
-          <div class="aac-card-head">
-            <span class="aac-ico aac-ico-cs">cs</span>
-            <div class="aac-card-title">
-              <strong>Cutshort</strong>
-              <span class="aac-sub">Message + screening. Video-interview jobs flagged manual.</span>
-            </div>
-            <span class="aac-badge aac-badge-warn" title="ToS-restricted + ~15/week cap + captcha.">ToS risk</span>
-          </div>
-          <div class="aac-actions">
-            <input type="text" class="aac-q" data-q="cutshort" placeholder="blank = all roles, or e.g. backend, fastapi" />
-            <input type="number" class="aac-n" data-n="cutshort" min="1" max="8" placeholder="#" title="How many to apply to (blank = daily cap)" />
-            <button type="button" class="btn-find aac-run" data-run="cutshort">Auto-apply</button>
-          </div>
-          <div class="aac-result hidden" data-result="cutshort"></div>
-        </div>
-
-        <div class="aac-card" data-platform="instahyre">
-          <div class="aac-card-head">
-            <span class="aac-ico aac-ico-ih">ih</span>
-            <div class="aac-card-title">
-              <strong>Instahyre</strong>
-              <span class="aac-sub">India recruiter feed. One-click "I'm Interested"; AI/software only.</span>
-            </div>
-            <span class="aac-badge aac-badge-warn" title="ToS-restricted. Stops on any security check.">ToS risk</span>
-          </div>
-          <div class="aac-actions">
-            <input type="text" class="aac-q" data-q="instahyre" placeholder="feed is profile-targeted — query unused" disabled />
-            <input type="number" class="aac-n" data-n="instahyre" min="1" max="15" placeholder="#" title="How many to apply to (blank = daily cap)" />
-            <button type="button" class="btn-find aac-run" data-run="instahyre">Auto-apply</button>
-          </div>
-          <div class="aac-result hidden" data-result="instahyre"></div>
-        </div>
-
-        <div class="aac-card" data-platform="wellfound">
-          <div class="aac-card-head">
-            <span class="aac-ico aac-ico-wf">wf</span>
-            <div class="aac-card-title">
-              <strong>Wellfound</strong>
-              <span class="aac-sub">Ex-AngelList startups. Worldwide-remote first; AI/software only.</span>
-            </div>
-            <span class="aac-badge aac-badge-warn" title="ToS-restricted + Cloudflare. Stops on any challenge.">ToS risk</span>
-          </div>
-          <div class="aac-actions">
-            <input type="text" class="aac-q" data-q="wellfound" placeholder="blank = ai-engineer, or e.g. software engineer, backend" />
-            <input type="number" class="aac-n" data-n="wellfound" min="1" max="10" placeholder="#" title="How many to apply to (blank = daily cap)" />
-            <button type="button" class="btn-find aac-run" data-run="wellfound">Auto-apply</button>
-          </div>
-          <div class="aac-result hidden" data-result="wellfound"></div>
-        </div>
-
-        <div class="aac-card" data-platform="ziprecruiter">
-          <div class="aac-card-head">
-            <span class="aac-ico aac-ico-zr">ZR</span>
-            <div class="aac-card-title">
-              <strong>ZipRecruiter</strong>
-              <span class="aac-sub">1-Click only. Stops instantly on Press-&-Hold.</span>
-            </div>
-            <span class="aac-badge aac-badge-danger" title="PerimeterX — frequently blocked; not reliable.">Fragile</span>
-          </div>
-          <div class="aac-actions">
-            <input type="text" class="aac-q" data-q="ziprecruiter" placeholder="search (e.g. backend engineer)" />
-            <input type="number" class="aac-n" data-n="ziprecruiter" min="1" max="5" placeholder="#" title="How many to apply to (blank = daily cap)" />
-            <button type="button" class="btn-find aac-run" data-run="ziprecruiter">Auto-apply</button>
-          </div>
-          <div class="aac-result hidden" data-result="ziprecruiter"></div>
-        </div>
-
-      </div>
-      <p class="li-hint">
-        Each platform needs a one-time login: <code>py -3.11 formtool.py platlogin &lt;yc|cutshort|ziprecruiter|wellfound|instahyre&gt;</code>.
-        These three <b>prohibit automation in their ToS</b> (account risk you've accepted) — every run is low-volume and
-        <b>stops on any captcha/security check</b>. First runs validate the page layout live.
-      </p>
     </section>
-
-    <!-- ===== Status toast ===== -->
-    <div id="status-msg" class="status-msg" role="status"></div>
 
     <!-- ===== Review panel (drafts) ===== -->
     <section id="review-panel" class="panel review-panel hidden">
@@ -376,26 +363,6 @@
         <button id="btn-send-approved" class="btn-primary">Send approved (0)</button>
       </div>
       <div id="review-list" class="review-list"></div>
-    </section>
-
-    <!-- ===== Applications table ===== -->
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Applications</h2>
-        <span id="apps-count" class="count-pill">0</span>
-      </div>
-      <div class="table-wrap">
-        <table id="apps-table">
-          <thead>
-            <tr>
-              <th>Company</th><th>Role</th><th>Status</th><th>Last checked</th><th>Reply snippet</th>
-            </tr>
-          </thead>
-          <tbody id="apps-body">
-            <tr><td colspan="5" class="empty">No applications yet — start with ① Find Jobs.</td></tr>
-          </tbody>
-        </table>
-      </div>
     </section>
 
     <footer class="foot">AutoApply · local only (127.0.0.1) · a supporting channel</footer>

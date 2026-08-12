@@ -31,6 +31,7 @@ from .logging_setup import log_event, setup_logging
 from .profile import load_profile, missing_required
 from .services import (
     contacts,
+    digest_hunter,
     discovery,
     drafting,
     forms,
@@ -47,7 +48,9 @@ LAST_SEND: dict = {"running": False, "result": None}
 LAST_LI_APPLY: dict = {"running": False, "result": None}
 # Tracks the most recent background form-fill run.
 LAST_FILL: dict = {"running": False, "result": None}
-# Tracks the most recent background platform (YC/Cutshort/ZipRecruiter) apply run.
+# Tracks the most recent background Telegram digest hunt.
+LAST_HUNT: dict = {"running": False, "result": None}
+# Tracks the most recent background external-platform apply run.
 LAST_PLATFORM: dict = {"running": False, "result": None, "platform": None}
 
 scheduler = BackgroundScheduler()
@@ -290,7 +293,7 @@ def api_forms() -> dict:
 def _run_fill() -> None:
     LAST_FILL["running"] = True
     try:
-        LAST_FILL["result"] = forms.fill_pending()
+        LAST_FILL["result"] = browser.run_sync_off_loop(forms.fill_pending)
     finally:
         LAST_FILL["running"] = False
 
@@ -308,7 +311,7 @@ def api_forms_fill(background: BackgroundTasks) -> dict:
 def _run_prefill() -> None:
     LAST_FILL["running"] = True
     try:
-        LAST_FILL["result"] = forms.build_prefill_links()
+        LAST_FILL["result"] = browser.run_sync_off_loop(forms.build_prefill_links)
     finally:
         LAST_FILL["running"] = False
 
@@ -323,6 +326,31 @@ def api_forms_prefill(background: BackgroundTasks) -> dict:
             "message": "Building pre-filled links - the cards will show 'Open pre-filled form' shortly."}
 
 
+def _run_hunt() -> None:
+    LAST_HUNT["running"] = True
+    try:
+        LAST_HUNT["result"] = digest_hunter.hunt(ingest=True)
+    except Exception as e:  # noqa: BLE001 - surface the error to the dashboard
+        LAST_HUNT["result"] = {"message": f"Hunt failed: {e}"}
+    finally:
+        LAST_HUNT["running"] = False
+
+
+@app.post("/api/digests/hunt")
+def api_digests_hunt(background: BackgroundTasks) -> dict:
+    """Sweep public Telegram job channels for new matching digests and ingest them."""
+    if LAST_HUNT["running"]:
+        return {"started": False, "message": "A digest hunt is already running."}
+    background.add_task(_run_hunt)
+    return {"started": True, "message": "Hunting Telegram job channels…"}
+
+
+@app.get("/api/digests/status")
+def api_digests_status() -> dict:
+    """Poll the state of the last digest hunt."""
+    return LAST_HUNT
+
+
 class SubmitForm(BaseModel):
     application_id: int
 
@@ -330,7 +358,7 @@ class SubmitForm(BaseModel):
 @app.post("/api/forms/submit")
 def api_forms_submit(req: SubmitForm) -> dict:
     """Operator-approved submit of one reviewed form (DRY_RUN simulates)."""
-    return forms.submit_form(req.application_id)
+    return browser.run_sync_off_loop(forms.submit_form, req.application_id)
 
 
 @app.post("/api/forms/mark-submitted")
@@ -366,7 +394,7 @@ def api_linkedin_targets() -> dict:
 def _run_li_apply(limit: int) -> None:
     LAST_LI_APPLY["running"] = True
     try:
-        LAST_LI_APPLY["result"] = linkedin_apply.apply_assisted(limit=limit)
+        LAST_LI_APPLY["result"] = browser.run_sync_off_loop(linkedin_apply.apply_assisted, limit=limit)
     finally:
         LAST_LI_APPLY["running"] = False
 
@@ -385,7 +413,7 @@ def api_linkedin_apply(req: LinkedInApply, background: BackgroundTasks) -> dict:
 def _run_li_autoapply() -> None:
     LAST_LI_APPLY["running"] = True
     try:
-        LAST_LI_APPLY["result"] = linkedin_apply.autoapply()
+        LAST_LI_APPLY["result"] = browser.run_sync_off_loop(linkedin_apply.autoapply)
     finally:
         LAST_LI_APPLY["running"] = False
 
@@ -427,7 +455,7 @@ def api_linkedin_stop() -> dict:
     return {"ok": True, "message": "Stop requested — the agent will halt after the current job."}
 
 
-# --- Other platforms: YC / Cutshort / ZipRecruiter (autonomous, fragile) ---------
+# --- Other platforms: YC / Cutshort / Wellfound / Instahyre ----------------------
 
 @app.get("/api/platforms/status")
 def api_platforms_status() -> dict:
@@ -439,34 +467,31 @@ def api_platforms_status() -> dict:
 
 
 class PlatformApply(BaseModel):
-    platform: str                 # yc | cutshort | ziprecruiter | wellfound | instahyre
+    platform: str                 # yc | cutshort | wellfound | instahyre
     query: str = ""               # role / skill / search keywords
-    location: str = ""            # ZipRecruiter location (e.g. "Remote")
     remote: bool = True
     limit: int | None = None      # cap this run (None = up to the daily cap)
 
 
-def _run_platform_apply(platform: str, query: str, location: str, remote: bool,
-                        limit: int | None) -> None:
+def _run_platform_apply(platform: str, query: str, remote: bool, limit: int | None) -> None:
     LAST_PLATFORM["running"] = True
     LAST_PLATFORM["platform"] = platform
     try:
-        LAST_PLATFORM["result"] = platform_apply.autoapply(platform, query, location, remote, limit)
+        LAST_PLATFORM["result"] = platform_apply.autoapply(platform, query, remote, limit)
     finally:
         LAST_PLATFORM["running"] = False
 
 
 @app.post("/api/platforms/autoapply")
 def api_platforms_autoapply(req: PlatformApply, background: BackgroundTasks) -> dict:
-    """AUTONOMOUS apply on YC / Cutshort / ZipRecruiter (ToS-restricted; stops on any
+    """AUTONOMOUS apply on a supported external platform (ToS-restricted; stops on any
     bot-wall). Needs a one-time login via  formtool.py platlogin <platform>."""
     if LAST_PLATFORM["running"]:
         return {"started": False, "message": "A platform apply run is already in progress."}
-    if req.platform not in ("yc", "cutshort", "ziprecruiter", "wellfound", "instahyre"):
+    if req.platform not in ("yc", "cutshort", "wellfound", "instahyre"):
         return {"started": False, "message": f"Unknown platform '{req.platform}'."}
     limit = req.limit if (req.limit and req.limit > 0) else None
-    background.add_task(_run_platform_apply, req.platform, req.query, req.location,
-                        req.remote, limit)
+    background.add_task(_run_platform_apply, req.platform, req.query, req.remote, limit)
     cap_note = f"up to {limit}" if limit else "up to the daily cap"
     return {"started": True,
             "message": f"Auto-applying on {req.platform} ({cap_note}) in the background — "

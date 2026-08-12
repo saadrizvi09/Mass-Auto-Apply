@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Terms of use for AutoApply Cloud." />
+    <meta name="theme-color" content="#101c2c" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'"
+    />
+    <title>Terms of Use — AutoApply Cloud</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="legal-page">
+    <a class="skip-link" href="#legal-content">Skip to main content</a>
+    <header class="legal-header">
+      <a class="brand" href="/" aria-label="AutoApply Cloud home">
+        <span class="brand-mark" aria-hidden="true">A</span>
+        <span><strong>AutoApply</strong><small>Cloud</small></span>
+      </a>
+      <a class="button button-small button-ghost" href="/">Back to AutoApply</a>
+    </header>
+
+    <main id="legal-content" class="legal-main">
+      <section class="legal-hero">
+        <p class="eyebrow">Working agreement</p>
+        <h1>Terms of Use</h1>
+        <p>Effective date: [REQUIRED BEFORE PUBLIC LAUNCH]</p>
+      </section>
+
+      <article class="legal-content">
+        <aside class="legal-callout" aria-label="Operator launch blocker">
+          <strong>Operator launch blocker.</strong> These are product-behavior template terms,
+          not launch-ready legal terms. Before public launch, the operator must supply and
+          review its legal name/entity, postal address, active support/legal contacts,
+          governing law and forum where appropriate, paid-plan terms if any, required
+          jurisdiction-specific provisions, and the actual effective date. The repository
+          intentionally does not invent them.
+        </aside>
+        <p>
+          These terms govern your use of this AutoApply Cloud deployment. By creating an
+          account or using the service, you agree to them and to the Privacy Notice. If you use
+          the service for an organization, you represent that you can accept these terms for it.
+        </p>
+
+        <h2>What AutoApply provides</h2>
+        <p>
+          AutoApply is a review-first workspace for organizing job opportunities, preparing
+          application material, drafting outreach, sending user-approved Gmail messages, and
+          opening supported manual or managed-browser handoffs. It is an assistive tool, not an
+          employer, recruiter, employment agency, or guarantee of any application outcome.
+        </p>
+
+        <h2>Your account and information</h2>
+        <p>
+          You must provide accurate account information, keep your password and connected
+          accounts secure, and promptly report suspected unauthorized access. You are responsible
+          for everything submitted, approved, or sent from your account. Do not use another
+          person's credentials, résumé, identity, or provider account without permission.
+        </p>
+
+        <h2>Review-first responsibility</h2>
+        <p>
+          Generated drafts and extracted résumé details can be incomplete or wrong. You must
+          review facts, recipients, attachments, tone, eligibility statements, and application
+          answers before approval or submission. You remain the sender and applicant of record
+          and are responsible for complying with employer instructions and applicable law.
+        </p>
+
+        <h2>Acceptable use</h2>
+        <p>You may not use the service to:</p>
+        <ul>
+          <li>send spam, harassment, deceptive messages, malware, or unlawful content;</li>
+          <li>misrepresent qualifications, identity, work authorization, or another material fact;</li>
+          <li>circumvent access controls, CAPTCHA, rate limits, robots rules, or provider safeguards;</li>
+          <li>scrape or automate a site in violation of its terms, or continue after a site requires manual action;</li>
+          <li>probe, disrupt, overload, reverse engineer, or gain unauthorized access to the service or another account; or</li>
+          <li>infringe privacy, confidentiality, intellectual-property, employment, anti-discrimination, export-control, or other legal rights.</li>
+        </ul>
+        <p>
+          The service may enforce daily sending limits, duplicate-recipient windows, review
+          gates, and manual-handoff requirements even if you request otherwise.
+        </p>
+
+        <h2>Connections and third-party services</h2>
+        <p>
+          Gmail, Groq, Supabase, LinkedIn, managed-browser services, job boards, and employer
+          sites are third-party services with separate terms and availability. You authorize
+          only the scopes shown during a connection flow and may disconnect them at any time.
+          Gmail normally uses the deployment's platform-managed OAuth client. If you choose the
+          advanced user-managed option, you are responsible for the Google Cloud project, Web
+          OAuth client credentials, consent configuration, test-user access, quotas, verification,
+          charges if any, and compliance with Google's terms. A Google Cloud API key is not a
+          substitute for a Web OAuth client ID and secret. Keep your client secret secure.
+          AutoApply does not collect or store your LinkedIn password. LinkedIn application
+          activity is manual or requires an official partner integration; LinkedIn login is not
+          presented as authorization for Easy Apply, and prohibited or unsupported LinkedIn
+          automation is not offered. Unsupported job-site actions remain manual. You must not use
+          AutoApply to bypass a provider's rules.
+        </p>
+
+        <h2>Gmail and outreach</h2>
+        <p>
+          Connecting Gmail authorizes the service to perform only the displayed Gmail operations.
+          Both the platform-managed and advanced user-managed paths use AutoApply's one fixed
+          callback and the displayed identity plus <code>gmail.send</code> scopes. If your Google
+          OAuth project's External audience is in Testing, you must add the Gmail account as a
+          test user. Because this service requests <code>gmail.send</code>, that Testing grant and
+          its refresh token expire seven days after consent and you will need to reconnect. Before
+          offering your own client for public production use, you are responsible for publishing
+          it and completing Google's applicable brand/domain and sensitive-scope verification.
+        </p>
+        <p>
+          User-managed OAuth client credentials are encrypted in server-only storage and used by
+          the trusted backend for authorization and token refresh. AutoApply does not return the
+          saved secret to the browser. You must disconnect Gmail before replacing or deleting
+          those credentials. Disconnect removes AutoApply's local Gmail token connection and
+          attempts Google revocation, but it does not delete your separate client configuration
+          unless you request that after disconnect, and it does not remove or rotate the OAuth
+          client in Google Cloud.
+        </p>
+        <p>
+          A message is sent only after the application's approval and send workflow is completed.
+          You are responsible for recipient consent, message accuracy, anti-spam compliance, and
+          any consequences of sending. Delivery is not guaranteed. The service may retain
+          pseudonymous hashes of the connected Google account identifier and recipient to enforce
+          provider-account caps and duplicate-recipient safeguards, including after account
+          deletion/recreation. Their active use expires no later than 90 days after creation (and
+          therefore no later than 90 days after account deletion). Those records contain no
+          plaintext recipient, message, token, or AutoApply user ID. Expired hashes stop affecting
+          those controls immediately. Hourly and send-reservation cleanup physically deletes them;
+          a failed hourly job can delay that physical deletion and is monitored by the operator.
+        </p>
+
+        <h2>Your Groq key</h2>
+        <p>
+          If you use your own Groq API key, you are responsible for keeping it secure, following
+          Groq's terms, monitoring its use, and paying any provider charges. The key is saved in
+          a user-namespaced area of the browser profile you use, not your AutoApply account.
+          Ordinary sign-out preserves it; explicit key removal, successful account deletion, or
+          clearing browser site data removes it. Removing it from AutoApply does not revoke it at
+          Groq; rotate or revoke it with Groq when appropriate.
+        </p>
+
+        <h2>Your content</h2>
+        <p>
+          You retain ownership of content you submit. You grant the deployment operator and its
+          service providers a limited permission to host, process, transmit, and format that
+          content only as needed to provide, secure, and maintain the service. You represent that
+          you have the rights needed to provide the content and request those operations.
+        </p>
+
+        <h2>Availability, changes, and suspension</h2>
+        <p>
+          Features may change, pause, or stop, and third-party integrations may become unavailable.
+          The operator may suspend or terminate access to protect users or providers, comply with
+          law, address nonpayment where applicable, or respond to a material breach of these terms.
+          You may stop using the service and request account deletion at any time. Deleting one
+          résumé removes that résumé's private object and metadata, not existing application or
+          send history. Account deletion removes tenant workspace data subject to the bounded
+          pseudonymous Gmail abuse-prevention retention described above.
+        </p>
+
+        <h2>No employment or professional advice</h2>
+        <p>
+          Suggestions, rankings, and drafts are informational and may be generated by automated
+          systems. They are not legal, immigration, financial, career, or employment advice. The
+          service does not promise interviews, offers, response rates, message delivery, or the
+          accuracy or availability of any external listing.
+        </p>
+
+        <h2>Disclaimers and liability</h2>
+        <p>
+          To the extent permitted by law, the service is provided “as is” and “as available,”
+          without warranties of merchantability, fitness for a particular purpose, non-infringement,
+          or uninterrupted operation. The deployment operator is not liable for indirect,
+          incidental, special, consequential, or punitive damages, lost opportunities, lost data,
+          provider actions, or reliance on generated content. Any mandatory consumer rights in
+          your jurisdiction continue to apply.
+        </p>
+
+        <h2>Governing terms and contact</h2>
+        <ul>
+          <li>Operator/legal entity: [REQUIRED BEFORE PUBLIC LAUNCH]</li>
+          <li>Postal address: [REQUIRED BEFORE PUBLIC LAUNCH]</li>
+          <li>Support and legal-notice contact: [REQUIRED BEFORE PUBLIC LAUNCH]</li>
+          <li>Governing law/forum: [REQUIRED BEFORE PUBLIC LAUNCH, IF APPLICABLE]</li>
+          <li>Paid plan/refund terms: [REQUIRED BEFORE PUBLIC LAUNCH IF THE SERVICE IS PAID]</li>
+        </ul>
+        <p>
+          These placeholders make this page a launch blocker. If a mandatory local rule conflicts
+          with the final terms, that rule controls only to the required extent.
+        </p>
+
+        <h2>Changes to these terms</h2>
+        <p>
+          The operator may update these terms as the service or applicable requirements change.
+          The effective date will be revised, and material changes should be communicated through
+          the service. Continuing to use AutoApply after revised terms take effect constitutes
+          acceptance where permitted by law.
+        </p>
+      </article>
+    </main>
+
+    <footer class="legal-footer">
+      <span>AutoApply Cloud</span>
+      <nav aria-label="Legal navigation"><a href="/privacy.html">Privacy Notice</a><a href="/">Home</a></nav>
+    </footer>
+  </body>
+</html>

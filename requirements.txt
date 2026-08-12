@@ -1,19 +1,13 @@
-# AutoApply — pinned stack (Python 3.11)
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-apscheduler==3.11.0
-sqlmodel==0.0.22
-requests==2.32.3
+# AutoApply Cloud — Vercel/API runtime
+# Keep this list aligned with the [project.dependencies] section in pyproject.toml.
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn[standard]==0.35.0
+httpx==0.28.1
+requests==2.34.2
+pydantic==2.11.9
+cryptography==50.0.0
+pypdf==6.15.0
 beautifulsoup4==4.12.3
-openai==1.59.6
-google-auth==2.37.0
-google-auth-oauthlib==1.2.1
-google-api-python-client==2.157.0
-python-dotenv==1.0.1
-python-multipart==0.0.20
 openpyxl==3.1.5
-playwright==1.49.1          # browser engine for auto-filling Google Forms
-pypdf==5.1.0                # read cv.pdf to auto-fill the applicant profile
-
-# dev / tests
-pytest==8.3.4
+python-multipart==0.0.32

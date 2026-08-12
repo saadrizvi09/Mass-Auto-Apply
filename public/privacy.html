@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Privacy notice for AutoApply Cloud." />
+    <meta name="theme-color" content="#101c2c" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'"
+    />
+    <title>Privacy Notice — AutoApply Cloud</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="legal-page">
+    <a class="skip-link" href="#legal-content">Skip to main content</a>
+    <header class="legal-header">
+      <a class="brand" href="/" aria-label="AutoApply Cloud home">
+        <span class="brand-mark" aria-hidden="true">A</span>
+        <span><strong>AutoApply</strong><small>Cloud</small></span>
+      </a>
+      <a class="button button-small button-ghost" href="/">Back to AutoApply</a>
+    </header>
+
+    <main id="legal-content" class="legal-main">
+      <section class="legal-hero">
+        <p class="eyebrow">Your data, explained</p>
+        <h1>Privacy Notice</h1>
+        <p>Effective date: [REQUIRED BEFORE PUBLIC LAUNCH]</p>
+      </section>
+
+      <article class="legal-content">
+        <aside class="legal-callout" aria-label="Operator launch blocker">
+          <strong>Operator launch blocker.</strong> This is a product-behavior template,
+          not a finished privacy notice. Before public launch, the operator must identify
+          its legal name/entity, postal address, active privacy and support contacts,
+          processing locations/providers, applicable user-rights notices, retention/legal
+          bases where required, and the real effective date. Those facts are intentionally
+          not guessed in this repository and require operator review.
+        </aside>
+        <p>
+          This notice explains how the operator of this AutoApply Cloud deployment collects,
+          uses, shares, and retains information. AutoApply is a review-first job-search
+          workspace: it stores the information you choose to provide and connects to external
+          services only when you ask it to.
+        </p>
+
+        <h2>Information we collect</h2>
+        <ul>
+          <li><strong>Account information:</strong> your email address, authentication records, and account identifiers managed through Supabase Auth.</li>
+          <li><strong>Applicant information:</strong> profile details, skills, education, preferences, résumé PDFs, and résumé-derived suggestions.</li>
+          <li><strong>Job-search information:</strong> job descriptions, company and contact details, application links, drafts, approvals, send history, and status updates.</li>
+          <li><strong>Connection information:</strong> connection status, authorized scopes, provider account metadata, encrypted OAuth tokens, encrypted user-supplied Google Web OAuth client credentials, or opaque managed-browser context identifiers when a supported connection is enabled.</li>
+          <li><strong>Operational information:</strong> automation job states, audit events, request identifiers, security events, Turnstile challenge results, and limited technical logs needed to operate and protect the service.</li>
+          <li><strong>Gmail abuse-prevention records:</strong> domain-separated SHA-256 hashes of the Google provider account identifier and normalized recipient, a random event identifier, outcome, and expiry. These rows contain no AutoApply user ID, plaintext email address, message, or OAuth token.</li>
+        </ul>
+
+        <h2>Your Groq API key</h2>
+        <p>
+          Your Groq API key is stored only in this browser's local storage. AutoApply sends it
+          to its backend in a request header only when you validate the key or request an
+          AI-assisted operation. The application is designed not to save the key in its
+          database, logs, analytics, or synced account data. Anyone with access to this browser
+          profile may be able to use or remove the locally stored key. You can delete it at any
+          time from <strong>Profile</strong>, and you should remove it before using a shared
+          device. Ordinary sign-out deliberately preserves the key for that user on that browser.
+          Explicit key removal, successful account deletion, clearing site data, or deleting the
+          browser profile removes it. The application namespaces keys by user so another signed-in
+          AutoApply user is not shown your key.
+        </p>
+
+        <h2>Your Google OAuth client credentials</h2>
+        <p>
+          Most users connect Gmail with the deployment's platform-managed Google OAuth
+          client and do not provide Google Cloud credentials. If you choose the advanced
+          user-managed option, you provide a Google <strong>Web application</strong> OAuth
+          client ID and client secret from a project you control. A Google Cloud API key is
+          not sufficient and is not accepted as Gmail authorization.
+        </p>
+        <p>
+          AutoApply sends the ID and secret to its authenticated backend, encrypts both before
+          database storage, and stores only ciphertext in a table restricted to the trusted
+          service role. The saved secret and ciphertext are not returned to your browser,
+          placed in local storage, or exposed through browser database policies. The trusted
+          server can decrypt them only when needed to create or refresh the Gmail connection.
+          Connection status may show a masked client-ID hint. You must disconnect Gmail before
+          replacing or deleting this saved client so an existing refresh token cannot be
+          silently moved to different client credentials.
+        </p>
+
+        <h2>How we use information</h2>
+        <p>We use information to:</p>
+        <ul>
+          <li>authenticate you and keep each account's workspace separated;</li>
+          <li>store and parse résumés, maintain your job pipeline, and generate requested drafts;</li>
+          <li>send an approved message through a connection you authorized;</li>
+          <li>prepare supported application handoffs and show durable task progress;</li>
+          <li>enforce review, send-rate, duplicate-recipient, and security safeguards; and</li>
+          <li>diagnose failures, prevent abuse, and improve reliability.</li>
+        </ul>
+
+        <h2>When information is shared</h2>
+        <p>
+          Information is disclosed only as needed to operate the service or perform an action
+          you request. Service providers may include Supabase for authentication, database, and
+          private file storage; Vercel for application hosting and request execution; Groq for
+          AI requests made with your key; Google for Gmail authorization, token exchange or
+          refresh using the OAuth client you selected, and approved sends;
+          Cloudflare for Turnstile bot challenges; and a managed-browser provider when you
+          explicitly start a supported browser handoff.
+          Each provider processes information under its own terms and privacy practices.
+        </p>
+        <p>
+          AutoApply does not sell personal information. It does not ask you to provide your
+          LinkedIn password and does not store LinkedIn credentials. LinkedIn application activity
+          is manual/partner-only: the product does not claim that LinkedIn login authorizes Easy
+          Apply automation, and prohibited or unsupported automation is not offered.
+        </p>
+
+        <h2>Browser storage and cookies</h2>
+        <p>
+          Supabase stores authentication session material in your browser so you can remain
+          signed in. AutoApply also uses local storage for your Groq key and limited interface
+          preferences; it does not persist a Google OAuth client secret there. Signing out
+          removes the AutoApply authentication session but does not
+          remove the user-namespaced Groq key. Remove that key explicitly before using a shared
+          device. Account deletion attempts to remove it; clearing site data or deleting the
+          browser profile removes browser-held values independently of the service.
+        </p>
+
+        <h2>Retention and deletion</h2>
+        <p>
+          Workspace records are retained while your account is active and for any limited period
+          required for security, dispute resolution, or legal compliance. Deleting a résumé
+          removes that résumé's database metadata and private Storage object; it does not delete
+          existing jobs, applications, drafts, send history, or audit history. Disconnecting Gmail
+          serializes against pending OAuth callbacks, deletes the local connection/token rows, and
+          makes a best-effort Google revocation request. If Google does not confirm revocation,
+          remove AutoApply from Google Account settings as an additional safeguard. Disconnect
+          does not itself delete a separately saved user-managed OAuth client; after disconnect,
+          you may keep it for a later connection or delete it with the advanced connection
+          control. Replacing or deleting it while Gmail is connected is blocked. Account deletion
+          removes it with the rest of the tenant's server-side secret records.
+        </p>
+        <p>
+          Account deletion removes tenant workspace rows, private résumé objects, and supported
+          provider connections. To prevent deletion/recreation from evading Gmail caps or
+          duplicate-recipient protection, pseudonymous provider-account/recipient hash rows may
+          remain after deletion. Their active use expires no later than 90 days from creation (and
+          therefore no later than 90 days after account deletion), and normally sooner with the
+          configured duplicate window. Expired rows immediately stop affecting caps or duplicate
+          checks. An hourly database job and the next send-reservation path physically delete
+          expired rows; a failed cron run can delay physical deletion and is an operator-monitored
+          condition. The rows cannot be read by browser users.
+        </p>
+        <p>
+          To request account access, correction, export, or deletion, use the product controls
+          and contact [OPERATOR PRIVACY EMAIL — REQUIRED BEFORE PUBLIC LAUNCH]. The operator must
+          verify and publish a working contact and any location-specific request instructions
+          before opening the service to the public.
+        </p>
+
+        <h2>Security</h2>
+        <p>
+          AutoApply uses authenticated API requests, row-level account isolation, private résumé
+          storage, encryption for stored provider tokens and user-managed OAuth client
+          credentials, restricted OAuth scopes, and redaction controls. No internet service can
+          promise absolute security. Protect your password,
+          sign out of shared devices, and disconnect a provider if you believe access has been
+          compromised.
+        </p>
+
+        <h2>Your choices</h2>
+        <p>
+          You decide what profile and job information to provide, whether to upload a résumé,
+          whether to save a Groq key in a browser, whether to use the deployment's Google OAuth
+          client or save your own, and whether to connect Gmail or another supported provider.
+          You can edit drafts before approval, decline to send, use a manual handoff, disconnect
+          services, and delete stored resources through the workspace.
+        </p>
+
+        <h2>Age, international use, and changes</h2>
+        <p>
+          The service is intended for people who are legally able to seek work and enter into
+          these terms; it is not directed to children. Depending on your location and the
+          operator's providers, information may be processed in another country. We may update
+          this notice as the product or applicable requirements change. A revised effective date
+          will be shown here, and material changes should be communicated through the service.
+        </p>
+
+        <h2>Contact</h2>
+        <ul>
+          <li>Operator/legal entity: [REQUIRED BEFORE PUBLIC LAUNCH]</li>
+          <li>Postal address: [REQUIRED BEFORE PUBLIC LAUNCH]</li>
+          <li>Privacy email: [REQUIRED BEFORE PUBLIC LAUNCH]</li>
+          <li>Support email or help URL: [REQUIRED BEFORE PUBLIC LAUNCH]</li>
+        </ul>
+      </article>
+    </main>
+
+    <footer class="legal-footer">
+      <span>AutoApply Cloud</span>
+      <nav aria-label="Legal navigation"><a href="/terms.html">Terms of Use</a><a href="/">Home</a></nav>
+    </footer>
+  </body>
+</html>

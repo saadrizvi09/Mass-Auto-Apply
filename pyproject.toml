@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoapply-cloud"
+version = "2.0.0"
+description = "Multi-user job application workspace for Vercel and Supabase"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.141.1",
+  "starlette==1.6.0",
+  "uvicorn[standard]==0.35.0",
+  "httpx==0.28.1",
+  "requests==2.34.2",
+  "pydantic==2.11.9",
+  "cryptography==50.0.0",
+  "pypdf==6.15.0",
+  "beautifulsoup4==4.12.3",
+  "openpyxl==3.1.5",
+  "python-multipart==0.0.32",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.0.3"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.vercel]
+entrypoint = "app.saas_main:app"

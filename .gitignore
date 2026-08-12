@@ -1,7 +1,15 @@
 # Secrets & local-only artifacts (NEVER commit)
 .env
+.env.*
+!.env.example
+.vercel/
 credentials.json
 token.json
+client_secret_*.json
+*.pem
+*.key
+*.p12
+*.pfx
 jobs.db
 jobs.db-wal
 jobs.db-shm
@@ -34,3 +42,18 @@ __pycache__/
 Thumbs.db
 .idea/
 .vscode/
+.claude/
+.tools/
+digest_seen.json
+.macos_browser_profile_ready
+.browser_profile.windows-backup*/
+.venv.windows-backup*/
+.venv-saas/
+.worker-state/
+frontend/node_modules/
+build/
+dist/
+out/
+page.html
+*.egg-info/
+frontend/node_modules/

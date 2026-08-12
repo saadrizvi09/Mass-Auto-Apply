@@ -18,7 +18,21 @@ from ..config import ROOT, settings
 from ..logging_setup import log_event
 
 
+# Optional per-run override so autonomous apply can upload a JD-TAILORED resume
+# (produced by app/services/resume_tailor.py) instead of the default cv.pdf.
+_CV_OVERRIDE: str | None = None
+
+
+def set_cv_override(path: str | None) -> None:
+    """Point all resume uploads at a specific PDF (e.g. a per-job tailored one).
+    Pass None to reset to the default cv_path. Affects external-ATS, LinkedIn, and forms."""
+    global _CV_OVERRIDE
+    _CV_OVERRIDE = str(path) if path else None
+
+
 def _cv_abspath() -> str:
+    if _CV_OVERRIDE and os.path.exists(_CV_OVERRIDE):
+        return _CV_OVERRIDE
     p = settings.cv_path
     path = ROOT / p if not os.path.isabs(p) else p
     return str(path) if os.path.exists(path) else ""
@@ -86,6 +100,33 @@ def _ensure_proactor_loop_policy() -> None:
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     except Exception:  # noqa: BLE001
         pass
+
+
+def run_sync_off_loop(fn, *args, **kwargs):
+    """Run a sync-Playwright function in a dedicated fresh thread.
+
+    Playwright's SYNC API refuses to start when the current thread has a running asyncio
+    event loop — exactly the case inside FastAPI request/background handlers, which raises
+    "It looks like you are using Playwright Sync API inside the asyncio loop." A brand-new
+    thread has no event loop, so the browser starts cleanly there. CLI/standalone callers
+    work too (a fresh thread is harmless). Returns fn's result or re-raises its exception.
+    """
+    import threading
+
+    box: dict = {}
+
+    def _runner():
+        try:
+            box["result"] = fn(*args, **kwargs)
+        except BaseException as e:  # noqa: BLE001 - propagate to the caller
+            box["error"] = e
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
 
 
 @contextmanager
@@ -229,19 +270,31 @@ def read_form_full(url: str) -> dict:
                 last_err = "couldn't read the form structure (form not fully loaded)"
                 continue  # retry once
             data = json.loads(m.group(1))
-            if len(data) > 1 and len(data[1]) > 8:
-                result["title"] = data[1][8] or ""
-            for it in (data[1][1] or []):
-                if not it[4]:
-                    continue  # section header / image, no answerable entry
-                sub = it[4][0]
-                result["fields"].append({
-                    "title": (it[1] or "").strip(),
-                    "type": _FBTYPE.get(it[3], "OTHER"),
-                    "entry_id": sub[0],
-                    "options": [o[0] for o in (sub[1] or []) if o and o[0]],
-                    "required": bool(sub[2]) if len(sub) > 2 else False,
-                })
+            # Google Forms blob shape: data[1] is the form body; data[1][1] is the
+            # question list and data[1][8] the title. Non-Forms pages (a company ATS
+            # like Greenhouse/Lever/Ashby) can carry the marker but NOT this shape —
+            # fail cleanly instead of an IndexError so the card shows a useful reason.
+            body = data[1] if isinstance(data, list) and len(data) > 1 else None
+            if not isinstance(body, list) or len(body) < 2 or not isinstance(body[1], list):
+                result["error"] = ("not a Google Form — can't pre-fill; "
+                                   "open the form and apply directly")
+                return result
+            if len(body) > 8:
+                result["title"] = body[8] or ""
+            for it in (body[1] or []):
+                try:
+                    if not it[4]:
+                        continue  # section header / image, no answerable entry
+                    sub = it[4][0]
+                    result["fields"].append({
+                        "title": (it[1] or "").strip(),
+                        "type": _FBTYPE.get(it[3], "OTHER"),
+                        "entry_id": sub[0],
+                        "options": [o[0] for o in (sub[1] or []) if o and o[0]],
+                        "required": bool(sub[2]) if len(sub) > 2 else False,
+                    })
+                except (IndexError, TypeError, KeyError):
+                    continue  # malformed question entry — skip it, keep the rest
             return result
         except Exception as e:  # noqa: BLE001
             last_err = str(e) or type(e).__name__

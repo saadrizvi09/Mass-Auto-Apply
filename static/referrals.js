@@ -181,6 +181,37 @@
     refreshForms();
   }
 
+  async function huntDigests() {
+    const btn = $("btn-digest-hunt");
+    btn.disabled = true;
+    const old = btn.textContent;
+    btn.textContent = "Hunting…";
+    setMsg("Sweeping Telegram job channels…");
+    const res = await postJSON("/api/digests/hunt", {});
+    if (!res.started) {
+      setMsg(res.message || "Already running.", "err");
+      btn.disabled = false;
+      btn.textContent = old;
+      return;
+    }
+    // Poll until the background hunt finishes, then show its summary.
+    const poll = setInterval(async () => {
+      let st;
+      try {
+        st = await fetch("/api/digests/status").then((r) => r.json());
+      } catch {
+        return;
+      }
+      if (!st.running) {
+        clearInterval(poll);
+        btn.disabled = false;
+        btn.textContent = old;
+        setMsg((st.result && st.result.message) || "Hunt finished.", "ok");
+        refreshForms();
+      }
+    }, 3000);
+  }
+
   async function prefillForms() {
     $("btn-forms-prefill").disabled = true;
     $("btn-forms-prefill").textContent = "Building…";
@@ -224,6 +255,7 @@
   function init() {
     $("btn-ref-parse").addEventListener("click", parseDigest);
     $("btn-ref-scan").addEventListener("click", scanGmail);
+    $("btn-digest-hunt").addEventListener("click", huntDigests);
     $("btn-forms-prefill").addEventListener("click", prefillForms);
     $("btn-read-resume").addEventListener("click", readResume);
     refreshProfile();

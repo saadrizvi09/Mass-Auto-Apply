@@ -1,0 +1,1316 @@
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from app.saas.browser import BrowserbaseClient, BrowserbaseError, TrustedBrowserSession
+from app.saas.crypto import TokenCipher
+from worker.browser_runtime import (
+    ApprovalSnapshot,
+    BrowserRuntime,
+    ManagedBrowserError,
+    ManagedBrowserJobHandler,
+    ResolvedBrowserTask,
+    SupabaseTenantResources,
+)
+from worker.providers import ADAPTERS, get_adapter
+from worker.providers.base import (
+    bind_schema_to_target,
+    canonical_form_target,
+    safe_form_url,
+    scan_form,
+)
+from worker.providers.base import ProviderResult
+from worker.handlers import handle_job
+
+
+USER_ID = "00000000-0000-0000-0000-000000000002"
+APPLICATION_ID = "00000000-0000-0000-0000-000000000003"
+JOB_ID = "00000000-0000-0000-0000-000000000004"
+REVISION_ID = "00000000-0000-0000-0000-000000000005"
+
+
+class FakeResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.status_code = 200
+        self.content = b"json"
+        self._payload = payload
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class FakeHttp:
+    def __init__(self, connect_url: str) -> None:
+        self.connect_url = connect_url
+        self.calls: list[dict[str, Any]] = []
+
+    def request(self, *_args: Any, **_kwargs: Any) -> FakeResponse:
+        self.calls.append(dict(_kwargs))
+        return FakeResponse(
+            {
+                "id": "session-1",
+                "status": "RUNNING",
+                "connectUrl": self.connect_url,
+            }
+        )
+
+
+def test_worker_only_browserbase_session_hides_and_validates_cdp_credential() -> None:
+    secret_url = "wss://connect.browserbase.com?sessionId=one&token=secret"
+    client = BrowserbaseClient("secret", "project", http=FakeHttp(secret_url))
+
+    public = client.create_session("context-1")
+    trusted = client.create_session_for_worker("context-1")
+
+    assert "connect" not in public
+    assert trusted.connect_url == secret_url
+    assert secret_url not in repr(trusted)
+
+    untrusted = BrowserbaseClient(
+        "secret",
+        "project",
+        http=FakeHttp("wss://attacker.example/cdp?token=secret"),
+    )
+    with pytest.raises(BrowserbaseError) as error:
+        untrusted.create_session_for_worker("context-1")
+    assert error.value.code == "browserbase_invalid_response"
+
+
+def test_ephemeral_worker_session_does_not_attach_a_persistent_context() -> None:
+    http = FakeHttp("wss://connect.browserbase.com?sessionId=one&token=secret")
+    client = BrowserbaseClient("secret", "project", http=http)
+
+    session = client.create_ephemeral_session_for_worker(timeout_seconds=300)
+
+    assert session.context_id is None
+    assert "browserSettings" not in http.calls[0]["json"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "allowed_url"),
+    [
+        ("google_forms", "https://docs.google.com/forms/d/e/abc/viewform"),
+        ("google_forms", "https://forms.gle/abc123"),
+        ("greenhouse", "https://job-boards.greenhouse.io/acme/jobs/1"),
+        ("greenhouse", "https://job-boards.eu.greenhouse.io/acme/jobs/1"),
+        ("lever", "https://jobs.lever.co/acme/role/apply"),
+        ("ashby", "https://jobs.ashbyhq.com/acme/role/application"),
+        ("yc", "https://www.workatastartup.com/jobs/1"),
+        ("wellfound", "https://wellfound.com/jobs/1"),
+        ("cutshort", "https://cutshort.io/job/one"),
+        ("instahyre", "https://www.instahyre.com/candidate/opportunities/"),
+    ],
+)
+def test_every_managed_provider_has_a_strict_https_host_policy(
+    provider: str, allowed_url: str
+) -> None:
+    adapter = get_adapter(provider)
+    assert adapter is not None and adapter.allows_url(allowed_url)
+    assert not adapter.allows_url(allowed_url.replace("https://", "http://"))
+    assert not adapter.allows_url("https://attacker.example/redirect")
+    assert not adapter.allows_url("https://docs.google.com.attacker.example/forms/one")
+    assert not adapter.allows_url("https://user:password@docs.google.com/forms/one")
+
+
+def test_google_forms_policy_scopes_short_links_without_opening_all_google_docs() -> None:
+    adapter = get_adapter("google_forms")
+    assert adapter is not None
+    assert adapter.allows_url("https://forms.gle/abc123")
+    assert adapter.allows_url("https://docs.google.com/forms/d/e/abc/viewform")
+    assert not adapter.allows_url("https://docs.google.com/document/d/private")
+
+
+def test_worker_registry_contains_no_ziprecruiter_adapter() -> None:
+    assert set(ADAPTERS) == {
+        "google_forms",
+        "greenhouse",
+        "lever",
+        "ashby",
+        "yc",
+        "wellfound",
+        "cutshort",
+        "instahyre",
+    }
+
+
+def test_persisted_form_url_strips_credentials_query_and_fragment() -> None:
+    assert safe_form_url(
+        "https://user:password@jobs.lever.co/acme/role?token=secret#private"
+    ) == "https://jobs.lever.co/acme/role"
+
+
+def test_greenhouse_target_preserves_identity_query_but_removes_tracking() -> None:
+    target = canonical_form_target(
+        "greenhouse",
+        "https://boards.greenhouse.io/embed/job_app?gh_src=tracking&token=6778798&for=Acme#private",
+    )
+    assert target == "https://boards.greenhouse.io/embed/job_app?for=Acme&token=6778798"
+
+
+def test_schema_approval_hash_is_bound_to_canonical_form_identity() -> None:
+    schema = asyncio.run(scan_form(FakePage(  # type: ignore[name-defined]
+        "https://boards.greenhouse.io/embed/job_app?token=one", _fields()  # type: ignore[name-defined]
+    )))
+    first = bind_schema_to_target(
+        schema, "https://boards.greenhouse.io/embed/job_app?token=one"
+    )
+    second = bind_schema_to_target(
+        schema, "https://boards.greenhouse.io/embed/job_app?token=two"
+    )
+    assert first.schema_hash != second.schema_hash
+
+
+class FakeControl:
+    def __init__(self) -> None:
+        self.filled: str | None = None
+        self.files: str | None = None
+        self.checked: bool | None = None
+        self.selected: str | None = None
+        self.clicks = 0
+        self.on_click: Any = None
+        self.click_error: Exception | None = None
+
+    async def fill(self, value: str) -> None:
+        self.filled = value
+
+    async def set_input_files(self, value: str) -> None:
+        self.files = value
+
+    async def set_checked(self, value: bool) -> None:
+        self.checked = value
+
+    async def check(self) -> None:
+        self.checked = True
+
+    async def select_option(self, *, label: str) -> None:
+        self.selected = label
+
+    async def is_visible(self) -> bool:
+        return True
+
+    async def is_enabled(self) -> bool:
+        return True
+
+    async def click(self) -> None:
+        self.clicks += 1
+        if self.on_click is not None:
+            self.on_click()
+        if self.click_error is not None:
+            raise self.click_error
+
+
+class FakeLocator:
+    def __init__(
+        self,
+        controls: list[FakeControl] | None = None,
+        *,
+        body: str = "",
+    ) -> None:
+        self.controls = controls or []
+        self.body = body
+
+    async def count(self) -> int:
+        return len(self.controls)
+
+    def nth(self, index: int) -> FakeControl:
+        return self.controls[index]
+
+    async def inner_text(self, **_kwargs: Any) -> str:
+        return self.body
+
+
+class FakeFormRoot:
+    def __init__(self, page: "FakePage") -> None:
+        self.page = page
+
+    async def is_visible(self) -> bool:
+        return True
+
+    async def inner_text(self, **_kwargs: Any) -> str:
+        return self.page.body
+
+    async def evaluate(self, _script: str) -> list[dict[str, Any]]:
+        return self.page.fields
+
+    def locator(self, selector: str) -> FakeLocator:
+        if "input:not" in selector:
+            return FakeLocator(self.page.controls)
+        if 'input[type="file"]' in selector:
+            return FakeLocator(
+                [
+                    control
+                    for control, field in zip(self.page.controls, self.page.fields)
+                    if field.get("kind") == "file"
+                ]
+            )
+        if 'input[type="email"]' in selector:
+            return FakeLocator(
+                [
+                    control
+                    for control, field in zip(self.page.controls, self.page.fields)
+                    if field.get("kind") == "email"
+                ]
+            )
+        if "submit" in selector.lower():
+            return FakeLocator(self.page.submit_controls)
+        return FakeLocator()
+
+
+class FakeRootCollection:
+    def __init__(self, roots: list[FakeFormRoot]) -> None:
+        self.roots = roots
+
+    async def count(self) -> int:
+        return len(self.roots)
+
+    def nth(self, index: int) -> FakeFormRoot:
+        return self.roots[index]
+
+
+class FakePage:
+    def __init__(
+        self,
+        url: str,
+        fields: list[dict[str, Any]],
+        *,
+        body: str = "Application form",
+        checkpoint_count: int = 0,
+        submit_count: int = 0,
+        confirmed_url: str | None = None,
+        confirmed_body: str | None = None,
+        redirect_url: str | None = None,
+    ) -> None:
+        self.url = url
+        self.target_url = url
+        self.fields = fields
+        self.body = body
+        self.checkpoint_count = checkpoint_count
+        self.controls = [FakeControl() for _ in fields]
+        self.submit_controls = [FakeControl() for _ in range(submit_count)]
+        self.redirect_url = redirect_url
+        self.main_frame = object()
+        self.route_handler: Any = None
+        self.unroute_behaviors: list[str] = []
+        for control in self.submit_controls:
+            control.on_click = lambda: self._confirm(confirmed_url, confirmed_body)
+
+    def _confirm(self, url: str | None, body: str | None) -> None:
+        if url is not None:
+            self.url = url
+        if body is not None:
+            self.body = body
+
+    async def route(self, _pattern: str, handler: Any) -> None:
+        self.route_handler = handler
+
+    async def unroute_all(self, *, behavior: str) -> None:
+        self.unroute_behaviors.append(behavior)
+
+    async def goto(self, url: str, **_kwargs: Any) -> None:
+        self.url = self.redirect_url or url
+
+    async def evaluate(self, _script: str) -> list[dict[str, Any]]:
+        return self.fields
+
+    def locator(self, selector: str) -> FakeLocator:
+        if "form" in selector.lower() or '[role="dialog"]' in selector.lower():
+            return FakeRootCollection([FakeFormRoot(self)])  # type: ignore[return-value]
+        if selector == "body":
+            return FakeLocator(body=self.body)
+        if "recaptcha" in selector:
+            return FakeLocator([FakeControl()] * self.checkpoint_count)
+        if "input:not" in selector:
+            return FakeLocator(self.controls)
+        if "submit" in selector.lower():
+            return FakeLocator(self.submit_controls)
+        return FakeLocator()
+
+    async def wait_for_load_state(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def wait_for_timeout(self, _milliseconds: int) -> None:
+        return None
+
+
+def _runtime_schema(page: FakePage, provider: str = "greenhouse") -> Any:
+    return bind_schema_to_target(
+        asyncio.run(scan_form(page)),
+        canonical_form_target(provider, page.url),
+    )
+
+
+def _fields() -> list[dict[str, Any]]:
+    return [
+        {
+            "dom_index": 0,
+            "key": "email",
+            "label": "Email address",
+            "kind": "email",
+            "required": True,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": "",
+        },
+        {
+            "dom_index": 1,
+            "key": "private_note",
+            "label": "Optional note",
+            "kind": "textarea",
+            "required": False,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": "",
+        },
+    ]
+
+
+def _task(
+    phase: str,
+    schema_hash: str | None,
+    *,
+    answers: dict[str, Any] | None = None,
+) -> ResolvedBrowserTask:
+    approval = None
+    if phase != "scan" and schema_hash:
+        approval = ApprovalSnapshot(
+            id=REVISION_ID,
+            revision=1,
+            schema_hash=schema_hash,
+            answers=answers or {},
+        )
+    return ResolvedBrowserTask(
+        job_id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="greenhouse",
+        phase=phase,  # type: ignore[arg-type]
+        target_url="https://job-boards.greenhouse.io/acme/jobs/1",
+        context_id="context-1",
+        approval=approval,
+    )
+
+
+class UnusedBrowserbase:
+    pass
+
+
+def test_prefill_uses_only_exact_approved_answers_and_never_submits() -> None:
+    page = FakePage(_task("scan", None).target_url, _fields(), submit_count=1)
+    schema = _runtime_schema(page)
+    runtime = BrowserRuntime(UnusedBrowserbase())  # type: ignore[arg-type]
+    task = _task(
+        "prefill",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+
+    result = asyncio.run(runtime._run_page(page, get_adapter("greenhouse"), task, None))  # type: ignore[arg-type]
+
+    assert result.code == "review_required"
+    assert result.status == "needs_attention"
+    assert page.controls[0].filled == "candidate@example.com"
+    assert page.controls[1].filled is None
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_resume_is_uploaded_only_to_explicit_resume_or_cv_field() -> None:
+    fields = _fields() + [
+        {
+            "dom_index": 2,
+            "key": "resume_file",
+            "label": "Resume / CV",
+            "kind": "file",
+            "required": True,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": ".pdf",
+        },
+        {
+            "dom_index": 3,
+            "key": "work_sample",
+            "label": "Optional work sample",
+            "kind": "file",
+            "required": False,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": ".pdf",
+        },
+    ]
+    page = FakePage(_task("scan", None).target_url, fields)
+    schema = _runtime_schema(page)
+    task = _task(
+        "prefill",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    runtime = BrowserRuntime(UnusedBrowserbase())  # type: ignore[arg-type]
+
+    result = asyncio.run(
+        runtime._run_page(
+            page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            task,
+            "/tmp/tenant-resume.pdf",
+        )
+    )
+
+    assert result.code == "review_required"
+    assert page.controls[2].files == "/tmp/tenant-resume.pdf"
+    assert page.controls[3].files is None
+
+
+def test_grouped_checkbox_answer_must_match_at_least_one_captured_option() -> None:
+    fields = _fields()[:1] + [
+        {
+            "dom_index": index,
+            "key": "skills",
+            "label": "Choose skills",
+            "kind": "checkbox",
+            "required": True,
+            "disabled": False,
+            "answered": False,
+            "options": [option],
+            "option_label": option,
+            "accept": "",
+        }
+        for index, option in enumerate(("Python", "SQL"), start=1)
+    ]
+    page = FakePage(_task("scan", None).target_url, fields)
+    schema = _runtime_schema(page)
+    assert schema.public_fields[1:] == [
+        {
+            "key": "skills",
+            "label": "Choose skills",
+            "kind": "checkbox",
+            "type": "multiselect",
+            "required": True,
+            "disabled": False,
+            "prefilled": False,
+            "options": ["Python", "SQL"],
+            "accepts_resume": False,
+        }
+    ]
+    task = _task(
+        "prefill",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com", "skills": ["Rust"]},
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            task,
+            None,
+        )
+    )
+
+    assert result.code == "required_answers_missing"
+    assert result.missing_required == ("Choose skills",)
+
+
+def test_provider_prefilled_value_must_be_overwritten_by_an_exact_approved_answer() -> None:
+    fields = _fields()
+    fields[1]["answered"] = True
+    page = FakePage(_task("scan", None).target_url, fields, submit_count=1)
+    schema = _runtime_schema(page)
+    task = _task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            task,
+            None,
+        )
+    )
+
+    assert result.code == "required_answers_missing"
+    assert result.missing_required == ("Optional note",)
+    assert page.submit_controls[0].clicks == 0
+
+    approved_page = FakePage(_task("scan", None).target_url, fields)
+    approved_schema = _runtime_schema(approved_page)
+    approved_task = _task(
+        "prefill",
+        approved_schema.schema_hash,
+        answers={
+            "Email address": "candidate@example.com",
+            "Optional note": "Reviewed replacement",
+        },
+    )
+    approved_result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            approved_page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            approved_task,
+            None,
+        )
+    )
+    assert approved_result.code == "review_required"
+    assert approved_page.controls[1].filled == "Reviewed replacement"
+
+
+def test_changed_schema_blocks_all_filling_and_submission() -> None:
+    page = FakePage(_task("scan", None).target_url, _fields(), submit_count=1)
+    task = _task(
+        "submit",
+        "a" * 64,
+        answers={"Email address": "candidate@example.com"},
+    )
+    runtime = BrowserRuntime(UnusedBrowserbase())  # type: ignore[arg-type]
+
+    result = asyncio.run(runtime._run_page(page, get_adapter("greenhouse"), task, None))  # type: ignore[arg-type]
+
+    assert result.code == "form_schema_changed"
+    assert page.controls[0].filled is None
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_listing_search_form_is_never_treated_as_an_application_or_submitted() -> None:
+    fields = [
+        {
+            "dom_index": 0,
+            "key": "query",
+            "label": "Search jobs",
+            "kind": "text",
+            "required": False,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": "",
+        }
+    ]
+    page = FakePage(
+        _task("scan", None).target_url,
+        fields,
+        body="Search jobs by keyword and location",
+        submit_count=1,
+    )
+    runtime = BrowserRuntime(UnusedBrowserbase())  # type: ignore[arg-type]
+
+    result = asyncio.run(
+        runtime._run_page(
+            page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            _task("scan", None),
+            None,
+        )
+    )
+
+    assert result.code == "application_form_not_found"
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_checkpoint_never_enters_fill_or_submit() -> None:
+    page = FakePage(
+        _task("scan", None).target_url,
+        _fields(),
+        body="Complete the CAPTCHA to continue",
+        checkpoint_count=1,
+        submit_count=1,
+    )
+    runtime = BrowserRuntime(UnusedBrowserbase())  # type: ignore[arg-type]
+
+    result = asyncio.run(
+        runtime._run_page(page, get_adapter("greenhouse"), _task("scan", None), None)  # type: ignore[arg-type]
+    )
+
+    assert result.code == "security_checkpoint"
+    assert all(control.filled is None for control in page.controls)
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_passive_captcha_allows_scan_but_blocks_submit() -> None:
+    scan_page = FakePage(
+        _task("scan", None).target_url,
+        _fields(),
+        checkpoint_count=1,
+        submit_count=1,
+    )
+    runtime = BrowserRuntime(UnusedBrowserbase())  # type: ignore[arg-type]
+
+    scan_result = asyncio.run(
+        runtime._run_page(
+            scan_page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            _task("scan", None),
+            None,
+        )
+    )
+    assert scan_result.code == "application_form_scanned"
+
+    prefill_page = FakePage(
+        _task("scan", None).target_url,
+        _fields(),
+        checkpoint_count=1,
+        submit_count=1,
+    )
+    prefill_schema = _runtime_schema(prefill_page)
+    prefill_result = asyncio.run(
+        runtime._run_page(
+            prefill_page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            _task(
+                "prefill",
+                prefill_schema.schema_hash,
+                answers={"Email address": "candidate@example.com"},
+            ),
+            None,
+        )
+    )
+    assert prefill_result.code == "review_required"
+    assert prefill_page.controls[0].filled == "candidate@example.com"
+    assert prefill_page.submit_controls[0].clicks == 0
+
+    submit_page = FakePage(
+        _task("scan", None).target_url,
+        _fields(),
+        checkpoint_count=1,
+        submit_count=1,
+    )
+    schema = _runtime_schema(submit_page)
+    submit_result = asyncio.run(
+        runtime._run_page(
+            submit_page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            _task(
+                "submit",
+                schema.schema_hash,
+                answers={"Email address": "candidate@example.com"},
+            ),
+            None,
+        )
+    )
+    assert submit_result.code == "security_checkpoint"
+    assert all(control.filled is None for control in submit_page.controls)
+    assert submit_page.submit_controls[0].clicks == 0
+
+
+def test_google_forms_login_redirect_is_needs_attention_not_cross_host_navigation() -> None:
+    target = "https://docs.google.com/forms/d/e/abc/viewform"
+    page = FakePage(
+        target,
+        _fields(),
+        redirect_url="https://accounts.google.com/ServiceLogin?continue=secret",
+    )
+    task = ResolvedBrowserTask(
+        job_id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="google_forms",
+        phase="scan",
+        target_url=target,
+        context_id=None,
+    )
+    runtime = BrowserRuntime(UnusedBrowserbase())  # type: ignore[arg-type]
+
+    result = asyncio.run(
+        runtime._run_page(page, get_adapter("google_forms"), task, None)  # type: ignore[arg-type]
+    )
+
+    assert result.code == "provider_login_required"
+    assert "accounts.google.com" not in result.form_url
+
+
+@pytest.mark.parametrize(
+    ("confirmed_url", "confirmed_body", "expected_code", "expected_state"),
+    [
+        (
+            "https://job-boards.greenhouse.io/acme/jobs/1/confirmation",
+            "Thank you for applying",
+            "application_submitted",
+            "confirmed",
+        ),
+        (
+            "https://job-boards.greenhouse.io/acme/jobs/1",
+            "Application form",
+            "submission_unconfirmed",
+            "uncertain",
+        ),
+    ],
+)
+def test_submit_result_requires_clear_provider_confirmation(
+    confirmed_url: str,
+    confirmed_body: str,
+    expected_code: str,
+    expected_state: str,
+) -> None:
+    page = FakePage(
+        _task("scan", None).target_url,
+        _fields(),
+        submit_count=1,
+        confirmed_url=confirmed_url,
+        confirmed_body=confirmed_body,
+    )
+    schema = _runtime_schema(page)
+    task = _task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    runtime = BrowserRuntime(UnusedBrowserbase())  # type: ignore[arg-type]
+
+    result = asyncio.run(runtime._run_page(page, get_adapter("greenhouse"), task, None))  # type: ignore[arg-type]
+
+    assert result.code == expected_code
+    assert result.submission_state == expected_state
+    assert page.submit_controls[0].clicks == 1
+
+
+def test_submit_refuses_final_click_when_lease_check_fails() -> None:
+    page = FakePage(
+        _task("scan", None).target_url,
+        _fields(),
+        submit_count=1,
+    )
+    schema = _runtime_schema(page)
+    task = _task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    runtime = BrowserRuntime(UnusedBrowserbase())  # type: ignore[arg-type]
+
+    async def lost_lease() -> bool:
+        return False
+
+    with pytest.raises(ManagedBrowserError) as error:
+        asyncio.run(
+            runtime._run_page(
+                page,
+                get_adapter("greenhouse"),  # type: ignore[arg-type]
+                task,
+                None,
+                lost_lease,
+            )
+        )
+
+    assert error.value.code == "automation_lease_lost"
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_submit_click_error_is_ambiguous_and_never_raises_into_retry_path() -> None:
+    page = FakePage(
+        _task("scan", None).target_url,
+        _fields(),
+        submit_count=1,
+    )
+    page.submit_controls[0].click_error = TimeoutError("provider response hidden")
+    schema = _runtime_schema(page)
+    task = _task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            task,
+            None,
+        )
+    )
+
+    assert result.status == "needs_attention"
+    assert result.code == "submission_click_unconfirmed"
+    assert result.submission_state == "uncertain"
+    assert page.submit_controls[0].clicks == 1
+
+
+class FakeRoute:
+    def __init__(self, url: str, page: FakePage) -> None:
+        self.request = SimpleNamespace(
+            url=url,
+            frame=page.main_frame,
+            is_navigation_request=lambda: True,
+        )
+        self.aborted = False
+        self.continued = False
+
+    async def abort(self, _reason: str) -> None:
+        self.aborted = True
+
+    async def continue_(self) -> None:
+        self.continued = True
+
+
+class TargetClosedError(RuntimeError):
+    pass
+
+
+class ClosingRoute(FakeRoute):
+    async def continue_(self) -> None:
+        raise TargetClosedError("Target page, context or browser has been closed")
+
+
+class BrokenRoute(FakeRoute):
+    async def continue_(self) -> None:
+        raise RuntimeError("routing backend failed")
+
+
+def test_navigation_guard_aborts_cross_host_redirects() -> None:
+    page = FakePage(_task("scan", None).target_url, _fields())
+    adapter = get_adapter("greenhouse")
+    assert adapter is not None
+    asyncio.run(BrowserRuntime._install_navigation_guard(page, adapter))
+
+    blocked = FakeRoute("https://attacker.example/collect", page)
+    allowed = FakeRoute("https://job-boards.greenhouse.io/acme/jobs/1", page)
+    asyncio.run(page.route_handler(blocked))
+    asyncio.run(page.route_handler(allowed))
+
+    assert blocked.aborted and not blocked.continued
+    assert allowed.continued and not allowed.aborted
+
+
+def test_navigation_guard_ignores_page_close_race() -> None:
+    page = FakePage(_task("scan", None).target_url, _fields())
+    adapter = get_adapter("greenhouse")
+    assert adapter is not None
+    asyncio.run(BrowserRuntime._install_navigation_guard(page, adapter))
+
+    closing = ClosingRoute("https://job-boards.greenhouse.io/acme/jobs/1", page)
+    asyncio.run(page.route_handler(closing))
+
+
+def test_navigation_guard_propagates_unrelated_route_failures() -> None:
+    page = FakePage(_task("scan", None).target_url, _fields())
+    adapter = get_adapter("greenhouse")
+    assert adapter is not None
+    asyncio.run(BrowserRuntime._install_navigation_guard(page, adapter))
+
+    broken = BrokenRoute("https://job-boards.greenhouse.io/acme/jobs/1", page)
+    with pytest.raises(RuntimeError, match="routing backend failed"):
+        asyncio.run(page.route_handler(broken))
+
+
+class FakeBrowser:
+    def __init__(self, page: FakePage) -> None:
+        self.contexts = [SimpleNamespace(pages=[page])]
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakeChromium:
+    def __init__(self, browser: FakeBrowser) -> None:
+        self.browser = browser
+        self.connections: list[tuple[str, int]] = []
+
+    async def connect_over_cdp(self, url: str, *, timeout: int) -> FakeBrowser:
+        self.connections.append((url, timeout))
+        return self.browser
+
+
+class FakePlaywrightManager:
+    def __init__(self, chromium: FakeChromium) -> None:
+        self.playwright = SimpleNamespace(chromium=chromium)
+
+    async def __aenter__(self) -> Any:
+        return self.playwright
+
+    async def __aexit__(self, *_args: Any) -> None:
+        return None
+
+
+class FakeBrowserbase:
+    def __init__(self) -> None:
+        self.created: list[tuple[str, bool]] = []
+        self.ephemeral: list[bool] = []
+        self.timeouts: list[int | None] = []
+        self.released: list[str] = []
+
+    def create_session_for_worker(
+        self,
+        context_id: str,
+        *,
+        keep_alive: bool = False,
+        timeout_seconds: int | None = None,
+        **_kwargs: Any,
+    ) -> TrustedBrowserSession:
+        self.created.append((context_id, keep_alive))
+        self.timeouts.append(timeout_seconds)
+        return TrustedBrowserSession(
+            id="session-one",
+            context_id=context_id,
+            connect_url="wss://connect.browserbase.com?sessionId=one&token=secret",
+        )
+
+    def create_ephemeral_session_for_worker(
+        self,
+        *,
+        keep_alive: bool = False,
+        timeout_seconds: int | None = None,
+        **_kwargs: Any,
+    ) -> TrustedBrowserSession:
+        self.ephemeral.append(keep_alive)
+        self.timeouts.append(timeout_seconds)
+        return TrustedBrowserSession(
+            id="session-one",
+            context_id=None,
+            connect_url="wss://connect.browserbase.com?sessionId=one&token=secret",
+        )
+
+    def release_session(self, session_id: str) -> dict[str, Any]:
+        self.released.append(session_id)
+        return {"id": session_id, "released": True}
+
+    def get_session_live_view(self, session_id: str) -> dict[str, str]:
+        return {
+            "session_id": session_id,
+            "live_view_url": "https://www.browserbase.com/sessions/session-one",
+        }
+
+
+def test_runtime_connects_playwright_over_trusted_cdp_and_releases_scan_session() -> None:
+    page = FakePage(_task("scan", None).target_url, _fields())
+    browser = FakeBrowser(page)
+    chromium = FakeChromium(browser)
+    browserbase = FakeBrowserbase()
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(chromium),
+    )
+
+    execution = asyncio.run(runtime.execute(_task("scan", None), resume_path=None))
+
+    assert execution.result.code == "application_form_scanned"
+    assert chromium.connections == [
+        ("wss://connect.browserbase.com?sessionId=one&token=secret", 30_000)
+    ]
+    assert browserbase.created == [("context-1", False)]
+    assert browserbase.timeouts == [300]
+    assert browserbase.released == ["session-one"]
+    assert browser.closed is True
+    assert page.unroute_behaviors == ["ignoreErrors"]
+
+
+def test_public_form_runtime_uses_ephemeral_browserbase_session() -> None:
+    page = FakePage(_task("scan", None).target_url, _fields())
+    browserbase = FakeBrowserbase()
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(
+            FakeChromium(FakeBrowser(page))
+        ),
+    )
+    task = ResolvedBrowserTask(
+        job_id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="greenhouse",
+        phase="scan",
+        target_url="https://job-boards.greenhouse.io/acme/jobs/1",
+        context_id=None,
+    )
+
+    execution = asyncio.run(runtime.execute(task, resume_path=None))
+
+    assert execution.result.code == "application_form_scanned"
+    assert browserbase.ephemeral == [False]
+    assert browserbase.timeouts == [300]
+    assert browserbase.created == []
+
+
+def test_prefill_keeps_bounded_live_review_session_without_exposing_cdp_url() -> None:
+    page = FakePage(_task("scan", None).target_url, _fields())
+    schema = _runtime_schema(page)
+    task = _task(
+        "prefill",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    browserbase = FakeBrowserbase()
+    browser = FakeBrowser(page)
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(
+            FakeChromium(browser)
+        ),
+    )
+
+    execution = asyncio.run(runtime.execute(task, resume_path=None))
+
+    details = execution.details()
+    assert execution.result.code == "review_required"
+    assert details["review_session_id"] == "session-one"
+    assert details["live_view_url"].startswith("https://")
+    assert "connect.browserbase.com" not in repr(details)
+    assert browserbase.created == [("context-1", True)]
+    assert browserbase.timeouts == [300]
+    assert browserbase.released == []
+    assert browser.closed is False
+
+
+class FakeTenantRepository:
+    def __init__(
+        self,
+        bundle: dict[str, Any],
+        *,
+        responses: dict[str, Any] | None = None,
+    ) -> None:
+        self.bundle = bundle
+        self.responses = responses or {}
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.downloads: list[tuple[str, str]] = []
+
+    async def rpc(self, name: str, params: dict[str, Any]) -> Any:
+        self.calls.append((name, params))
+        if name == "get_application_job_bundle":
+            return [self.bundle]
+        return self.responses.get(name, True)
+
+    async def download_object(self, bucket: str, path: str) -> bytes:
+        self.downloads.append((bucket, path))
+        return b"%PDF-1.7\nworker-test"
+
+
+def _bundle(cipher: TokenCipher) -> dict[str, Any]:
+    return {
+        "user_id": USER_ID,
+        "application_id": APPLICATION_ID,
+        "provider": "greenhouse",
+        "target_url": "https://job-boards.greenhouse.io/acme/jobs/1",
+        "browser_context_id_ciphertext": cipher.encrypt("context-one"),
+        "resume": {
+            "storage_path": f"{USER_ID}/resume-1.pdf",
+            "size_bytes": 20,
+            "mime_type": "application/pdf",
+        },
+    }
+
+
+def test_public_ats_can_resolve_to_an_ephemeral_session_without_saved_context() -> None:
+    cipher = TokenCipher(TokenCipher.generate_key())
+    bundle = _bundle(cipher)
+    bundle["browser_context_id_ciphertext"] = None
+    repository = FakeTenantRepository(bundle)
+    resources = SupabaseTenantResources(repository, cipher)
+    job = SimpleNamespace(
+        id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="greenhouse",
+        kind="application_scan",
+    )
+
+    task = asyncio.run(resources.resolve(job, "worker-1"))
+
+    assert task.context_id is None
+
+
+def test_account_provider_still_requires_a_saved_tenant_context() -> None:
+    cipher = TokenCipher(TokenCipher.generate_key())
+    bundle = _bundle(cipher)
+    bundle.update(
+        {
+            "provider": "wellfound",
+            "target_url": "https://wellfound.com/jobs/one",
+            "browser_context_id_ciphertext": None,
+        }
+    )
+    repository = FakeTenantRepository(bundle)
+    resources = SupabaseTenantResources(repository, cipher)
+    job = SimpleNamespace(
+        id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="wellfound",
+        kind="application_scan",
+    )
+
+    with pytest.raises(ManagedBrowserError) as error:
+        asyncio.run(resources.resolve(job, "worker-1"))
+
+    assert error.value.code == "provider_connection_required"
+
+
+def test_tenant_resource_bundle_is_lease_bound_and_resume_is_ephemeral() -> None:
+    cipher = TokenCipher(TokenCipher.generate_key())
+    repository = FakeTenantRepository(_bundle(cipher))
+    resources = SupabaseTenantResources(repository, cipher)
+    job = SimpleNamespace(
+        id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="greenhouse",
+        kind="application_scan",
+    )
+
+    async def exercise() -> None:
+        task = await resources.resolve(job, "worker-1")
+        assert task.context_id == "context-one"
+        async with resources.materialize_resume(task) as resume_path:
+            assert resume_path is not None
+            assert Path(resume_path).read_bytes().startswith(b"%PDF-")
+            temporary = Path(resume_path)
+        assert not temporary.exists()
+
+    asyncio.run(exercise())
+
+    assert repository.calls[0] == (
+        "get_application_job_bundle",
+        {"job_id": JOB_ID, "worker_id": "worker-1"},
+    )
+    assert repository.downloads == [("resumes", f"{USER_ID}/resume-1.pdf")]
+
+
+def test_cross_tenant_bundle_is_rejected_before_resume_download() -> None:
+    cipher = TokenCipher(TokenCipher.generate_key())
+    bundle = _bundle(cipher)
+    bundle["user_id"] = "00000000-0000-0000-0000-000000000099"
+    repository = FakeTenantRepository(bundle)
+    resources = SupabaseTenantResources(repository, cipher)
+    job = SimpleNamespace(
+        id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="greenhouse",
+        kind="application_scan",
+    )
+
+    with pytest.raises(ManagedBrowserError) as error:
+        asyncio.run(resources.resolve(job, "worker-1"))
+
+    assert error.value.code == "application_bundle_mismatch"
+    assert repository.downloads == []
+
+
+def test_confirmed_submission_uses_exact_lease_bound_record_rpc() -> None:
+    cipher = TokenCipher(TokenCipher.generate_key())
+    repository = FakeTenantRepository(
+        _bundle(cipher),
+        responses={"record_application_form_submission": [{"id": REVISION_ID}]},
+    )
+    resources = SupabaseTenantResources(repository, cipher)
+    schema = _runtime_schema(FakePage(_task("scan", None).target_url, _fields()))
+    task = _task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    result = ProviderResult(
+        status="succeeded",
+        code="application_submitted",
+        message="Provider confirmed.",
+        provider="greenhouse",
+        phase="submit",
+        form_url=task.target_url,
+        schema=schema,
+        filled_count=1,
+        submission_state="confirmed",
+    )
+
+    assert asyncio.run(resources.record_submission(task, "worker-1", result)) is True
+    name, params = repository.calls[-1]
+    assert name == "record_application_form_submission"
+    assert params["job_id"] == JOB_ID
+    assert params["worker_id"] == "worker-1"
+    assert params["provider_submission_id"] is None
+    assert params["result"]["submission_state"] == "confirmed"
+
+
+class FakeManagedResources:
+    def __init__(self, task: ResolvedBrowserTask, *, recorded: bool) -> None:
+        self.task = task
+        self.recorded = recorded
+        self.record_calls = 0
+
+    async def resolve(self, _job: Any, _worker_id: str) -> ResolvedBrowserTask:
+        return self.task
+
+    async def progress(self, *_args: Any) -> bool:
+        return True
+
+    @asynccontextmanager
+    async def materialize_resume(self, _task: Any) -> Any:
+        yield "/tmp/tenant-resume.pdf"
+
+    async def store_scan(self, *_args: Any) -> bool:
+        return True
+
+    async def record_submission(self, *_args: Any) -> bool:
+        self.record_calls += 1
+        return self.recorded
+
+
+class FakeManagedRuntime:
+    def __init__(self, execution: Any) -> None:
+        self.execution = execution
+
+    async def execute(self, *_args: Any, **_kwargs: Any) -> Any:
+        callback = _kwargs.get("before_submit")
+        assert callback is not None and await callback() is True
+        return self.execution
+
+
+@pytest.mark.parametrize(
+    ("recorded", "expected_status", "expected_code"),
+    [
+        (True, "succeeded", "application_submitted"),
+        (False, "needs_attention", "submission_record_unconfirmed"),
+    ],
+)
+def test_clear_submission_is_recorded_before_worker_reports_success(
+    recorded: bool, expected_status: str, expected_code: str
+) -> None:
+    schema = _runtime_schema(FakePage(_task("scan", None).target_url, _fields()))
+    task = _task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    provider_result = ProviderResult(
+        status="succeeded",
+        code="application_submitted",
+        message="Provider confirmed.",
+        provider="greenhouse",
+        phase="submit",
+        form_url=task.target_url,
+        schema=schema,
+        filled_count=1,
+        submission_state="confirmed",
+    )
+    resources = FakeManagedResources(task, recorded=recorded)
+    handler = ManagedBrowserJobHandler(
+        resources,  # type: ignore[arg-type]
+        FakeManagedRuntime(SimpleNamespace(result=provider_result, details=lambda: {})),  # type: ignore[arg-type]
+        "worker-1",
+        ("greenhouse",),
+        handle_job,
+    )
+    job = SimpleNamespace(
+        id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="greenhouse",
+        kind="application_submit",
+    )
+
+    outcome = asyncio.run(handler(job))
+
+    assert outcome.status == expected_status
+    assert outcome.code == expected_code
+    assert resources.record_calls == 1

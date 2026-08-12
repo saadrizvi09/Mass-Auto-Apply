@@ -35,11 +35,11 @@ Run these from the project root (the app server does NOT need to be running):
       walks into each company ATS, AI-fills everything it knows, and HOLDS the
       windows for you to review + Submit. Never submits for you.
 
-  py -3.11 formtool.py platlogin <yc|cutshort|ziprecruiter|wellfound|instahyre>
+  py -3.11 formtool.py platlogin <yc|cutshort|wellfound|instahyre>
       One-time login for an external platform (same .browser_profile). Log in,
       close the window. Required before that platform's auto-apply will work.
 
-  py -3.11 formtool.py platauto <yc|cutshort|ziprecruiter|wellfound|instahyre> [query]
+  py -3.11 formtool.py platauto <yc|cutshort|wellfound|instahyre> [query]
       AUTONOMOUS apply on that platform up to its daily cap. ToS-restricted +
       bot-defended; it STOPS on any security check. Watch the window.
 """
@@ -200,11 +200,11 @@ def cmd_lihard(limit: int) -> None:
     print(res.get("message", ""))
 
 
-_PLATFORMS = ("yc", "cutshort", "ziprecruiter", "wellfound", "instahyre")
+_PLATFORMS = ("yc", "cutshort", "wellfound", "instahyre")
 
 
 def cmd_platlogin(platform: str) -> None:
-    """One-time login for an external platform (YC / Cutshort / ZipRecruiter)."""
+    """One-time login for a supported external platform."""
     from app.integrations import platforms
     if platform not in _PLATFORMS:
         print(f"Unknown platform '{platform}'. Use one of: {', '.join(_PLATFORMS)}")

@@ -2,6 +2,9 @@
 // and renders status pills, quota cards, and the draft review panel.
 
 const $ = (id) => document.getElementById(id);
+// Null-safe text write: a missing element (renamed/removed in the HTML, or a stale cached
+// app.js vs. a newer index.html) must never crash the whole dashboard render.
+const setText = (id, value) => { const el = $(id); if (el) el.textContent = value; };
 
 const STATUS_LABELS = {
   discovered: "Discovered",
@@ -24,6 +27,7 @@ function esc(v) {
 
 function setStatus(msg, isError = false) {
   const el = $("status-msg");
+  if (!el) return;
   el.textContent = msg || "";
   el.classList.toggle("error", !!isError);
 }
@@ -53,27 +57,29 @@ async function api(path, options = {}) {
 // ===== Rendering =====================================================
 
 function renderState(state) {
-  $("banner").textContent = state.banner || "";
-  $("dry-badge").classList.toggle("hidden", !state.dry_run);
-  $("pause-banner").classList.toggle("hidden", !state.paused);
+  setText("banner", state.banner || "");
+  const dry = $("dry-badge"); if (dry) dry.classList.toggle("hidden", !state.dry_run);
+  const pb = $("pause-banner"); if (pb) pb.classList.toggle("hidden", !state.paused);
 
   // Send budget + usage bar
   const b = state.send_budget || {};
   if (b.cap_today != null) {
-    $("q-send").textContent = `${b.remaining} / ${b.cap_today}`;
-    const pct = b.cap_today ? Math.min(100, (b.sent_today / b.cap_today) * 100) : 0;
-    $("q-send-bar").style.width = `${pct}%`;
+    setText("q-send", `${b.remaining} / ${b.cap_today}`);
+    const bar = $("q-send-bar");
+    if (bar) bar.style.width = `${b.cap_today ? Math.min(100, (b.sent_today / b.cap_today) * 100) : 0}%`;
   }
 
   // Bounce rate
   if (state.bounce_rate != null) {
-    $("q-bounce").textContent = `${(state.bounce_rate * 100).toFixed(1)}%`;
+    setText("q-bounce", `${(state.bounce_rate * 100).toFixed(1)}%`);
   }
 
-  // Applications table
-  const apps = state.applications || [];
-  $("apps-count").textContent = apps.length;
+  // The full application tracker lives on /applications.
+  const appsCount = $("apps-count");
   const body = $("apps-body");
+  if (!appsCount || !body) return;
+  const apps = state.applications || [];
+  appsCount.textContent = apps.length;
   if (apps.length === 0) {
     body.innerHTML =
       '<tr><td colspan="5" class="empty">No applications yet — start with ① Find Jobs.</td></tr>';
@@ -99,16 +105,14 @@ function fmtDate(iso) {
 
 function renderQuota(q) {
   if (q.cse) {
-    $("q-cse").textContent =
-      q.cse.used_today != null
-        ? `${q.cse.limit_per_day - q.cse.used_today} / ${q.cse.limit_per_day}`
-        : `${q.cse.limit_per_day}`;
+    setText("q-cse", q.cse.used_today != null
+      ? `${q.cse.limit_per_day - q.cse.used_today} / ${q.cse.limit_per_day}`
+      : `${q.cse.limit_per_day}`);
   }
   if (q.hunter) {
-    $("q-hunter").textContent =
-      q.hunter.used_this_month != null
-        ? `${q.hunter.limit_per_month - q.hunter.used_this_month} / ${q.hunter.limit_per_month}`
-        : `${q.hunter.limit_per_month}`;
+    setText("q-hunter", q.hunter.used_this_month != null
+      ? `${q.hunter.limit_per_month - q.hunter.used_this_month} / ${q.hunter.limit_per_month}`
+      : `${q.hunter.limit_per_month}`);
   }
 }
 
@@ -345,9 +349,9 @@ async function runLiAutoApply(btn) {
   }
 }
 
-// ===== Other platforms: YC / Cutshort / ZipRecruiter ================
+// ===== Other platforms: YC / Instahyre / Wellfound / Cutshort =======
 
-const PLATFORM_LABEL = { yc: "Y Combinator", cutshort: "Cutshort", ziprecruiter: "ZipRecruiter",
+const PLATFORM_LABEL = { yc: "Y Combinator", cutshort: "Cutshort",
   wellfound: "Wellfound", instahyre: "Instahyre" };
 
 async function runPlatformApply(platform, query, btn) {
@@ -604,7 +608,7 @@ function wireButtons() {
   const liStop = $("btn-li-stop");
   if (liStop) liStop.addEventListener("click", stopLiAuto);
 
-  // Other-platform auto-apply buttons (YC / Cutshort / ZipRecruiter)
+  // Other-platform auto-apply buttons (YC / Instahyre / Wellfound / Cutshort)
   document.querySelectorAll(".aac-run").forEach((b) => {
     b.addEventListener("click", () => {
       const platform = b.getAttribute("data-run");

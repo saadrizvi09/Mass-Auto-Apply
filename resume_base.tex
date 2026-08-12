@@ -1,0 +1,150 @@
+%-------------------------
+% AutoApply base resume template — ATS-optimized, one-page, 10pt.
+% Two injection slots filled per-job by app/services/resume_tailor.py:
+%   the SUMMARY slot -> tailored 2-3 line summary
+%   the SKILLS slot  -> tailored Technical Skills lines
+% Compiles on BOTH pdflatex and Tectonic/XeTeX (glyphtounicode guarded).
+%-------------------------
+\documentclass[letterpaper,10pt]{article}
+\usepackage{enumitem}
+\usepackage{fontawesome}
+\usepackage{latexsym}
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{verbatim}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+\addtolength{\oddsidemargin}{-0.6in}
+\addtolength{\evensidemargin}{-0.6in}
+\addtolength{\textwidth}{1.19in}
+\addtolength{\topmargin}{-.7in}
+\addtolength{\textheight}{1.4in}
+
+\urlstyle{same}
+\raggedbottom
+\raggedright
+\setlength{\tabcolsep}{0in}
+
+\titleformat{\section}{
+  \vspace{-4pt}\scshape\raggedright\large
+}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+
+% Machine-readable PDF (pdfTeX only; skipped cleanly under XeTeX/Tectonic).
+\ifdefined\pdfgentounicode
+  \input{glyphtounicode}
+  \pdfgentounicode=1
+\fi
+
+\newcommand{\resumeItem}[1]{\item\small{{#1 \vspace{-2pt}}}}
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-2pt}\item
+    \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \textbf{#1} & #2 \\
+      \textit{\small#3} & \textit{\small #4} \\
+    \end{tabular*}\vspace{-7pt}
+}
+\newcommand{\resumeProjectHeading}[2]{
+    \item
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      \small#1 & #2 \\
+    \end{tabular*}\vspace{-7pt}
+}
+\renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
+
+\begin{document}
+
+\begin{center}
+    {\Huge \scshape Saad Rizvi} \\ \vspace{2pt}
+    \small AI Engineer $|$ Software Engineer \\ \vspace{2pt}
+    \small New Delhi, India $|$ +91 8287608280 $|$
+    \href{mailto:saadrizvi1234@gmail.com}{\underline{saadrizvi1234@gmail.com}} $|$
+    \href{https://www.linkedin.com/in/saad-rizvi-447451256}{\underline{LinkedIn}} $|$
+    \href{https://github.com/saadrizvi09}{\underline{GitHub}} $|$
+    \href{https://leetcode.com/u/saadrizvi1234/}{\underline{LeetCode}} $|$
+    \href{https://www.geeksforgeeks.org/user/saadrizeyca/}{\underline{GeeksforGeeks}}
+\end{center}
+
+%-----------EDUCATION-----------
+\section{Education}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {Jamia Millia Islamia University}{New Delhi, India}
+      {B.Tech in Electronics and Communication}{Oct 2022 -- Jul 2026}
+  \resumeSubHeadingListEnd
+
+%-----------EXPERIENCE-----------
+\section{Experience}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {Product Intern (Automation)}{Jul 2026 -- Present}
+      {Times Internet}{Noida, India}
+      \resumeItemListStart
+        \resumeItem{Built a live operations \textbf{analytics dashboard} that ingests real-time business reports from \textbf{Google Sheets (Sheets API)} and renders interactive KPI graphs and charts, replacing manual spreadsheet review for business teams.}
+        \resumeItem{Embedded an \textbf{LLM-powered chatbot} into the dashboard that \textbf{reasons over live report data} to answer ad hoc business questions with grounded, data-backed responses.}
+        \resumeItem{Automated cross-team \textbf{data migration pipelines} that ingest, clean, and merge reports from telecalling and CRM sources into unified sheets, eliminating manual consolidation work.}
+      \resumeItemListEnd
+
+    \resumeSubheading
+      {Software Development Intern (Remote)}{Jan 2026 -- Jul 2026}
+      {Anything AI}{Hyderabad, India}
+      \resumeItemListStart
+        \resumeItem{Architected \textbf{WorkLens}, a production workforce-monitoring bot that autonomously joins \textbf{Google Meet} calls, captures screenshots, and analyzes each participant's work in real time via \textbf{multimodal AI} on \textbf{AWS Bedrock (Mistral Vision)}, with concurrent-safe pipelines (BullMQ, Redis) and \textbf{WebSocket}-driven multi-tier escalation workflows.}
+        \resumeItem{Engineered \textbf{Hirewire}, an autonomous \textbf{voice agent} (STT/TTS) for end-to-end technical interviewing, with stateful real-time pipelines and zero-human-intervention anti-cheat validation.}
+        \resumeItem{Built and deployed an automated HR/\textbf{ATS pipeline} on \textbf{AWS EC2}, removing 20+ recruiter hours/week by auto-ingesting, scoring, and syncing candidate data to Google Sheets in real-time.}
+      \resumeItemListEnd
+  \resumeSubHeadingListEnd
+
+%-----------PROJECTS-----------
+\section{Projects}
+\resumeSubHeadingListStart
+
+  \resumeProjectHeading
+    {\textbf{Automate-on-Edge} \href{https://github.com/saadrizvi09}{\faGithub} $|$ \emph{Python, FastAPI, Next.js, TypeScript, Pydantic, PostgreSQL}}{Feb 2026}
+    \resumeItemListStart
+      \resumeItem{Built an autonomous verification agent that turns a raw datasheet PDF into a signed multi-page test report, orchestrating \textbf{10 specialized LLM agents} (requirement extraction, test planning, code generation, root-cause analysis, cited Q\&A) in a sequential reasoning pipeline with \textbf{human-in-the-loop} approval gates.}
+      \resumeItem{Engineered a single-entrypoint \textbf{LLM router} with dual-provider failover (\textbf{Groq} $\rightarrow$ \textbf{AWS Bedrock}) driven by rate-limit and error-body detection, hardening every agent with deterministic fallbacks and multi-candidate \textbf{JSON parsing} so the pipeline emits a valid report even under model failure.}
+      \resumeItem{Designed a guardrail layer that treats \textbf{LLM-generated code as untrusted}: generated Arduino C++ is structurally validated and auto-falls back to a deterministic code generator when the model produces uncompilable output.}
+      \resumeItem{Shipped the full stack (\textbf{FastAPI} + \textbf{Next.js 14}/TypeScript): 17 REST endpoints with a strict response contract, live \textbf{NDJSON streaming} with inline anomaly flagging, statistical process control (Cpk, cross-batch drift detection), and a \textbf{185-test} fully mocked offline suite.}
+    \resumeItemListEnd
+
+  \resumeProjectHeading
+    {\textbf{Algo-Quant} \href{https://algo-quant-pi.vercel.app/}{\faExternalLink} $|$ \href{https://github.com/saadrizvi09/Algo-Quant}{\faGithub} $|$ \emph{Next.js, Python, FastAPI, PostgreSQL, WebSocket}}{Nov 2025}
+    \resumeItemListStart
+      \resumeItem{Built a real-time crypto trading platform using predictive \textbf{machine learning} on live Binance data, executing data-driven strategies in a simulated \$10k portfolio.}
+      \resumeItem{Designed a hybrid ML architecture: 3-state Gaussian \textbf{HMM} for market-regime inference with \textbf{Support Vector Regression} for volatility forecasting.}
+      \resumeItem{Automated \textbf{CI/CD} via \textbf{GitHub Actions} to \textbf{AWS Elastic Beanstalk}; validated a \textbf{2213\% return} over 5 years on Bitcoin across Bull/Bear/Sideways cycles (vs 1157\% buy \& hold).}
+    \resumeItemListEnd
+
+  \resumeProjectHeading
+    {\textbf{Git-Bot} \href{https://git-bot-phi.vercel.app/}{\faExternalLink} $|$ \href{https://github.com/saadrizvi09/git-bot}{\faGithub} $|$ \emph{Next.js, TypeScript, tRPC, Prisma, PostgreSQL}}{May 2025}
+    \resumeItemListStart
+      \resumeItem{Engineered a monetized full-stack AI platform (Next.js, PostgreSQL, Razorpay) with \textbf{RAG}-powered semantic search (vector embeddings) for instant code retrieval.}
+      \resumeItem{Built an \textbf{AI agent} that generates context-aware code from a single prompt after analyzing a GitHub repo, plus one-click \textbf{Gemini} bug detection.}
+    \resumeItemListEnd
+
+\resumeSubHeadingListEnd
+
+%-----------TECHNICAL SKILLS-----------
+\section{Technical Skills}
+ \begin{itemize}[leftmargin=0.15in, label={}]
+  \small{\item{
+%%SKILLS%%
+  }}
+ \end{itemize}
+
+\end{document}

@@ -1,4 +1,4 @@
-"""Offline tests for the external-platform layer (YC / Cutshort / ZipRecruiter).
+"""Offline tests for the supported external-platform layer.
 The browser-driving is validated live on first run; here we cover the pure logic:
 the persisted dedupe set, the role mapping, and unknown-platform handling."""
 import json
@@ -33,7 +33,5 @@ def test_autoapply_rejects_unknown_platform():
 
 
 def test_caps_are_bounded():
-    # ZipRecruiter (PerimeterX, fragile) stays the lowest; all caps stay sane.
-    assert platform_apply._CAPS["ziprecruiter"] <= platform_apply._CAPS["yc"]
-    assert platform_apply._CAPS["ziprecruiter"] <= platform_apply._CAPS["cutshort"]
+    assert set(platform_apply._CAPS) == {"yc", "cutshort", "wellfound", "instahyre"}
     assert all(1 <= c <= 50 for c in platform_apply._CAPS.values())

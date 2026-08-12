@@ -1,23 +1,17 @@
-"""Autonomous apply on external job platforms — Y Combinator Work at a Startup,
-Cutshort, and ZipRecruiter.
+"""Autonomous apply on supported external job platforms.
 
 Each reuses the shared real-Chrome persistent profile, the answer resolver + learning
 bank, human-like typing/pacing, and the bot-wall STOP from browser.py. Important, honest
 constraints (see the research notes in memory):
 
-  * ALL THREE prohibit automation in their ToS — this is the operator's accepted risk.
+  * These platforms prohibit automation in their ToS — this is the operator's accepted risk.
   * Each needs a ONE-TIME manual login (Google blocks scripted sign-in); the session then
     persists in .browser_profile.
   * Their apply DOM lives behind auth, so selectors here are best-effort and get refined
     on the FIRST LIVE RUN (exactly how LinkedIn Easy-Apply's `<a>`-vs-`<button>` was found).
   * Every driver fails SAFE: it never crashes the run, never submits an incomplete app,
-    STOPS the whole run on a visible captcha / PerimeterX press-and-hold, dedupes against
+    STOPS the whole run on a visible captcha or bot wall, dedupes against
     a persisted applied-set, and respects a low per-run cap.
-
-ZipRecruiter additionally: vanilla Playwright leaks via CDP `Runtime.Enable`, so PerimeterX
-can flag it regardless of profile/IP. This driver therefore only attempts 1-Click on loaded
-results and HANDS OFF the instant a challenge appears — it is a fragile assistant, not a
-reliable autopilot.
 """
 from __future__ import annotations
 
@@ -37,7 +31,7 @@ APPLIED_PATH = ROOT / "platform_applied.json"
 # Force-on for any platform with env PLATFORM_DEBUG=1. The concise per-job outcome line
 # ("-> YC <role>: submitted") always prints regardless.
 _DEBUG_ALL = os.getenv("PLATFORM_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
-_VERBOSE = {"cutshort", "ziprecruiter", "wellfound", "instahyre"}   # still validating live
+_VERBOSE = {"cutshort", "wellfound", "instahyre"}   # still validating live
 
 
 def _verbose(platform: str) -> bool:
@@ -79,8 +73,6 @@ _LOGIN = {
            "Log into Work at a Startup (YC) — 'Log In' top-right — then CLOSE this window."),
     "cutshort": ("https://cutshort.io/",
                  "Log into Cutshort (Candidate login), then CLOSE this window."),
-    "ziprecruiter": ("https://www.ziprecruiter.com/authn/login",
-                     "Log into ZipRecruiter, then CLOSE this window."),
     "wellfound": ("https://wellfound.com/login",
                   "Log into Wellfound (ex-AngelList), then CLOSE this window."),
     "instahyre": ("https://www.instahyre.com/login/",
@@ -91,7 +83,6 @@ _LOGIN = {
 _HOME = {
     "yc": "https://www.workatastartup.com/companies",
     "cutshort": "https://cutshort.io/jobs",
-    "ziprecruiter": "https://www.ziprecruiter.com/candidate/dashboard",
     "wellfound": "https://wellfound.com/jobs",
     "instahyre": "https://www.instahyre.com/candidate/opportunities/",
 }
@@ -102,7 +93,6 @@ _HOME = {
 _LOGGED_IN_MARKERS = {
     "yc": ("My profile", "Inbox", "Education"),
     "cutshort": ("My profile", "Logout", "My applications", "Dashboard"),
-    "ziprecruiter": ("My ZipRecruiter", "Sign Out", "Saved Jobs", "My Account"),
     "wellfound": ("Messages", "My profile", "Saved", "For you", "Log out"),
     "instahyre": ("Opportunities", "My Profile", "Logout", "Recommended", "Applied"),
 }
@@ -207,8 +197,7 @@ def login_probe(platform: str) -> dict:
 
 def _human_pause(page, min_s: float = 10, max_s: float = 22) -> None:
     """Randomised, non-linear pause between applications. Defaults are moderate; callers
-    pass a tighter range for low-risk platforms (YC) and a wider one for aggressive bot
-    defenses (ZipRecruiter/PerimeterX)."""
+    pass a tighter range for low-risk platforms and a wider one for stronger bot defenses."""
     pause = _random.uniform(min_s * 1000, max_s * 1000)
     if _random.random() < 0.12:
         pause += _random.uniform(15_000, 35_000)  # occasional longer break
@@ -279,8 +268,21 @@ _NON_ENG_TITLE_MARKERS = (
 # "Founding Engineer" is NOT senior and is kept (attainable for strong juniors at startups).
 _SENIOR_MARKERS = (" senior ", " sr ", " snr ")
 
+# General software-engineering / software-development titles the operator ALSO wants — but
+# ONLY on Cutshort + Instahyre (allow_swe=True), not on the AI-focused platforms. A title on
+# this whitelist bypasses the ML/data + non-eng "off-target" gate (so a borderline role like
+# "Software Engineer, ML Platform" is kept as a software role), while the intern + senior gates
+# still apply. " sde " is space-padded so it matches the standalone token, not "sdet"/inside a word.
+_SWE_TITLE_MARKERS = (
+    "software engineer", "software developer", "software development",
+    " sde ", "backend developer", "backend engineer", "back end developer",
+    "full stack developer", "full stack engineer", "fullstack developer",
+    "frontend developer", "frontend engineer", "front end developer",
+    "web developer", "application developer", "application engineer",
+)
 
-def _skip_reason(title: str, allow_intern: bool = False) -> str | None:
+
+def _skip_reason(title: str, allow_intern: bool = False, allow_swe: bool = False) -> str | None:
     """Return why this title is off-target for the operator, or None if it's a keeper.
     Catches ML/data roles, non-engineering roles (marketing/sales/design/PM), unreachable
     senior/lead/exec titles, and (by default) internships — so external auto-apply only submits
@@ -288,12 +290,18 @@ def _skip_reason(title: str, allow_intern: bool = False) -> str | None:
 
     allow_intern=True keeps internships (used for FOREIGN/worldwide-remote platforms — the
     operator will take an unpaid foreign role). India platforms keep the default (skip interns:
-    Cutshort gives no salary on the card, so an India intern can't be confirmed >=8 LPA)."""
+    Cutshort gives no salary on the card, so an India intern can't be confirmed >=8 LPA).
+
+    allow_swe=True (Cutshort + Instahyre only) also keeps general software-engineer /
+    software-development roles — a title on _SWE_TITLE_MARKERS bypasses the off-target gate so
+    the net widens past AI-only. Senior/intern gates still apply; other platforms stay AI-focused."""
     import re
     low = " " + re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip() + " "
     if not allow_intern and any(m in low for m in _INTERN_TITLE_MARKERS):
         return "intern"
-    if any(m in low for m in _OFF_TARGET_TITLE_MARKERS) or any(m in low for m in _NON_ENG_TITLE_MARKERS):
+    swe = allow_swe and any(m in low for m in _SWE_TITLE_MARKERS)
+    if not swe and (any(m in low for m in _OFF_TARGET_TITLE_MARKERS)
+                    or any(m in low for m in _NON_ENG_TITLE_MARKERS)):
         return "off-target"
     if any(m in low for m in _YC_SKIP_TITLES) or any(m in low for m in _SENIOR_MARKERS):
         return "senior-role"
@@ -448,7 +456,8 @@ def yc_autoapply(profile: dict, role_key: str, remote: bool, max_apply: int) -> 
 
 def _cutshort_discover(ctx, skill: str, location: str, limit: int) -> list[dict]:
     """Discover jobs for one skill in one location bucket. location: 'remote' →
-    remote-{slug}-jobs; a city slug (e.g. 'delhi-ncr') → {slug}-jobs-in-{city}; '' → all."""
+    remote-{slug}-jobs; a city slug (e.g. 'delhi-ncr-gurgaon-noida') → {slug}-jobs-in-{city};
+    '' → all."""
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     slug = skill.strip().lower().replace(" ", "-") or "software-developer"
     if location == "remote":
@@ -495,8 +504,15 @@ def _cutshort_discover(ctx, skill: str, location: str, limit: int) -> list[dict]
 # large AI-backend pool (verified live) so a run still finds volume even if the narrow AI
 # slugs are thin that day. ML/data-only slugs (machine-learning, data-science) are deliberately
 # excluded — the operator does not want ML-engineer / data roles.
-_CUTSHORT_DEFAULT_SKILLS = ["artificial-intelligence", "generative-ai", "llm", "langchain",
-                            "ai-engineer", "nlp", "python", "fastapi"]
+# General software-engineer / software-development slugs are appended so a run also surfaces
+# broad SWE jobs (not just AI) — the operator asked to widen Cutshort past the AI pool.
+# 'artificial-intelligence-ai' leads: combined with the NCR location it reproduces the exact
+# operator-provided filter URL (…/artificial-intelligence-ai-jobs-in-delhi-ncr-gurgaon-noida).
+_CUTSHORT_DEFAULT_SKILLS = ["artificial-intelligence-ai", "artificial-intelligence",
+                            "generative-ai", "llm", "langchain",
+                            "ai-engineer", "nlp", "python", "fastapi",
+                            "software-engineer", "software-developer",
+                            "backend-developer", "full-stack-developer"]
 
 
 def _cutshort_applied(page) -> bool:
@@ -618,8 +634,12 @@ def cutshort_autoapply(profile: dict, query: str, remote: bool, max_apply: int) 
     try:
         with browser._context(headless=False) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            # sweep every skill across REMOTE + onsite Delhi-NCR; aggregate + dedupe
-            locations = ["remote", "delhi-ncr"] if remote else ["delhi-ncr", ""]
+            # sweep every skill across REMOTE + onsite Delhi-NCR/Gurgaon/Noida; aggregate + dedupe.
+            # 'delhi-ncr-gurgaon-noida' is Cutshort's canonical multi-city NCR location slug
+            # (matches the operator-provided filter URL, widening the narrower 'delhi-ncr' to
+            # also cover Gurgaon + Noida).
+            _ncr = "delhi-ncr-gurgaon-noida"
+            locations = ["remote", _ncr] if remote else [_ncr, ""]
             targets, seen = [], set()
             for sk in skills:
                 for loc in locations:
@@ -631,7 +651,7 @@ def cutshort_autoapply(profile: dict, query: str, remote: bool, max_apply: int) 
                 if len(targets) >= max(max_apply * 5, 20):
                     break
             _say(f"  -> Cutshort: {len(targets)} job(s) found across {len(skills)} skill(s) "
-                 f"(remote + Delhi-NCR)")
+                 f"(remote + Delhi-NCR/Gurgaon/Noida)")
             if not targets:
                 return [{"company": "-", "outcome": "skipped:no-jobs-found",
                          "error": "no jobs found / not logged in"}]
@@ -641,7 +661,7 @@ def cutshort_autoapply(profile: dict, query: str, remote: bool, max_apply: int) 
                 key = f"cutshort:{j['url']}"
                 if _already_applied(key):
                     continue
-                reason = _skip_reason(j.get("company"))
+                reason = _skip_reason(j.get("company"), allow_swe=True)  # AI + general SWE
                 if reason:
                     _dbg("cutshort", f"  [cutshort] skipping {reason} role '{j.get('company')}'")
                     results.append({"company": j["company"], "url": j["url"],
@@ -868,6 +888,11 @@ def _wellfound_discover(ctx, role_slug: str, remote: bool, limit: int) -> list[d
 _WF_BLOCK_MARKERS = (
     "does not offer visa sponsorship", "require sponsorship", "requires sponsorship",
     "in-country", "must be located", "not eligible to apply", "all remote workers to be",
+    # Newer Wellfound wording (live 2026-06-25, Pronexus): the modal red banner reads
+    # "<Co> is not accepting applications from your current location due to timezone or
+    # relocation constraints." — authoritative block, present only when Send is disabled.
+    "not accepting applications from your current location", "timezone or relocation",
+    "relocation constraints", "due to timezone",
 )
 
 # Proactive location filter, read off the JOB DETAIL PAGE before the apply modal is even
@@ -884,6 +909,10 @@ _WF_LOCATION_SKIP_MARKERS = (
     "u.s. citizen", "us citizen", "green card", "must be a us ", "must be us ",
     "uk only", "eu only", "canada only", "us work authorization", "onsite in",
     "must be in the us", "remote (us)", "remote - us", "remote, us", "remote · united states",
+    # Wellfound's job-detail location label "Hires remotely in United States" (+ relocation
+    # not allowed) is a clear US-in-country lock for an India applicant.
+    "hires remotely in united states", "remotely in united states", "remotely in the united states",
+    "remotely in the us", "remotely in canada", "remotely in the uk", "remotely in europe",
 )
 _WF_LOCATION_OK_MARKERS = (
     "india", "worldwide", "anywhere", "remote (global", "globally", "any location",
@@ -904,6 +933,47 @@ def _wellfound_location_restricted(page) -> bool:
     if any(ok in low for ok in _WF_LOCATION_OK_MARKERS):
         return False
     return any(m in low for m in _WF_LOCATION_SKIP_MARKERS)
+
+
+# Big USD salary bands ($170k–$250k etc.) are a strong tell for US-in-country roles that are
+# work-auth-blocked for this India-based operator — the operator asked to "completely ignore the
+# US jobs with big USD bands". Skip a job whose displayed $ band tops out at/above this (env-
+# overridable). A genuine worldwide/India role at high USD is still kept (the ok-marker veto).
+try:
+    _WF_MAX_USD_BAND = int(os.getenv("WF_MAX_USD_BAND", "120000"))
+except ValueError:
+    _WF_MAX_USD_BAND = 120000
+
+# Matches a RANGE of two $ amounts ("$170k – $250k", "$170,000 - $250,000", "$120k to $160k").
+# Range-specific on purpose so stray single amounts (referral "$200", funding "$10M") don't trip it.
+_WF_USD_BAND_RE = re.compile(
+    r"\$\s*([\d][\d.,]*)\s*([kK])?\s*(?:[–\-—]|to)\s*\$?\s*([\d][\d.,]*)\s*([kK])?", re.I)
+
+
+def _wf_usd_amount(num: str, k: str | None) -> int:
+    n = float((num or "0").replace(",", ""))
+    if k:                       # 'k' suffix -> thousands
+        n *= 1000
+    elif n < 1000:              # bare "170" in a salary band means 170k
+        n *= 1000
+    return int(n)
+
+
+def _wellfound_us_pay_band(page) -> bool:
+    """True if the job shows a big USD salary band (upper bound >= _WF_MAX_USD_BAND) with NO
+    india/worldwide allowance — a strong proxy for a US-in-country role the operator can't take.
+    Skips it proactively. The ok-marker veto keeps a genuine worldwide/India high-USD role."""
+    try:
+        txt = page.inner_text("body") or ""
+    except Exception:
+        return False
+    if any(ok in txt.lower() for ok in _WF_LOCATION_OK_MARKERS):
+        return False
+    m = _WF_USD_BAND_RE.search(txt)
+    if not m:
+        return False
+    upper = _wf_usd_amount(m.group(3), m.group(4))
+    return upper >= _WF_MAX_USD_BAND
 
 
 def _wellfound_blocked(page) -> bool:
@@ -991,8 +1061,16 @@ def wellfound_autoapply(profile: dict, query: str, remote: bool, max_apply: int)
                     if any(s in page.url.lower() for s in ("login", "signin", "sign-in")):
                         r["outcome"] = "needs_login"; results.append(r)
                         _say(f"  -> Wellfound {r['company']}: needs_login — stopping"); break
-                    # Proactive geo filter: skip roles clearly locked outside India BEFORE
-                    # opening the modal (saves a modal open + ~4.5s banner poll + Groq letter).
+                    # Proactive filters BEFORE opening the modal (saves a modal open + ~4.5s
+                    # banner poll + Groq letter): (1) big USD pay band = US-in-country tell the
+                    # operator asked to ignore outright; (2) roles clearly geo-locked outside India.
+                    if _wellfound_us_pay_band(page):
+                        r["outcome"] = "skipped:us-pay-band"
+                        _dbg("wellfound", f"  [wellfound] {j['company']}: big USD band — US role, ignored")
+                        results.append(r)
+                        _say(f"  -> Wellfound {r['company']}: {r['outcome']}")
+                        page.wait_for_timeout(800)
+                        continue
                     if _wellfound_location_restricted(page):
                         r["outcome"] = "skipped:location-restricted"
                         _dbg("wellfound", f"  [wellfound] {j['company']}: geo-locked outside India")
@@ -1290,8 +1368,8 @@ def instahyre_autoapply(profile: dict, query: str, remote: bool, max_apply: int)
                 if _already_applied(key):
                     _instahyre_close_modal(page); i += 1; continue
                 # Interns ALLOWED, salary IGNORED (operator's call) — only off-target / senior
-                # titles drop. Apply to every on-target AI/software role regardless of stipend.
-                reason = _skip_reason(title, allow_intern=True)
+                # titles drop. AI + general SWE roles kept (allow_swe); apply regardless of stipend.
+                reason = _skip_reason(title, allow_intern=True, allow_swe=True)
                 if reason:
                     _dbg("instahyre", f"  [instahyre] skipping {reason} role '{title}'")
                     results.append({"company": label, "outcome": f"skipped:{reason}", "error": ""})
@@ -1353,62 +1431,4 @@ def instahyre_autoapply(profile: dict, query: str, remote: bool, max_apply: int)
                 _human_pause(page, 6, 14) if r["outcome"] == "submitted" else page.wait_for_timeout(1100)
     except Exception as e:  # noqa: BLE001
         log_event("platforms", "instahyre_autoapply", "error", str(e))
-    return results
-
-
-# --- ZipRecruiter (fragile: 1-Click only, stop on PerimeterX) --------------------
-
-def ziprecruiter_autoapply(profile: dict, search: str, location: str, max_apply: int) -> list[dict]:
-    """1-Click apply on already-loaded ZipRecruiter results. STOPS the instant a Press &
-    Hold / PerimeterX challenge appears (never auto-solves). Deliberately low volume."""
-    results = []
-    applied = 0
-    try:
-        with browser._context(headless=False) as ctx:
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            url = ("https://www.ziprecruiter.com/jobs-search?"
-                   f"search={search.replace(' ', '+')}&location={location.replace(' ', '+')}&zipapply=1")
-            if not browser._safe_goto(page, url):
-                return [{"company": "-", "outcome": "error", "error": "search load failed"}]
-            page.wait_for_timeout(3000)
-            browser._human_dwell(page)
-            if browser._ats_is_blocked(page):
-                return [{"company": "-", "outcome": "captcha_stop",
-                         "error": "PerimeterX challenge on search — stopped"}]
-            if "login" in page.url.lower() or "authn" in page.url.lower():
-                return [{"company": "-", "outcome": "needs_login", "error": "not logged in"}]
-            cards = page.query_selector_all('button:has-text("1-Click Apply"), button:has-text("Apply")')
-            for card in cards:
-                if applied >= max_apply:
-                    break
-                r = {"company": "ZipRecruiter job", "outcome": "", "error": ""}
-                try:
-                    if not card.is_visible():
-                        continue
-                    card.click()
-                    page.wait_for_timeout(2500)
-                    if browser._ats_is_blocked(page):
-                        r["outcome"] = "captcha_stop"; results.append(r)
-                        log_event("platforms", "ziprecruiter", "captcha_stop", "press-and-hold — stop")
-                        break  # HARD STOP — never push PerimeterX
-                    # some 1-Click jobs add screening questions
-                    browser._fill_external_form(page, profile)
-                    if browser._ext_missing_required(page) > 0:
-                        r["outcome"] = "skipped:required-unanswered"; results.append(r)
-                        _human_pause(page); continue
-                    sub = browser._ext_submit_button(page) or page.query_selector('button:has-text("Submit")')
-                    if sub:
-                        sub.click()
-                        page.wait_for_timeout(2000)
-                        if browser._ats_is_blocked(page):
-                            r["outcome"] = "captcha_stop"; results.append(r); break
-                    r["outcome"] = "submitted"
-                    applied += 1
-                    _say(f"  -> ZipRecruiter: submitted ({applied}/{max_apply})")
-                except Exception as e:  # noqa: BLE001
-                    r["outcome"] = "error"; r["error"] = str(e)[:150]
-                results.append(r)
-                _human_pause(page)
-    except Exception as e:  # noqa: BLE001
-        log_event("platforms", "ziprecruiter_autoapply", "error", str(e))
     return results

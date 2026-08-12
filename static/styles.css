@@ -639,6 +639,22 @@ td .cell-muted { color: var(--faint); }
 /* ===== Auto-Apply Center ===== */
 .aac .panel-head { margin-bottom: 14px; }
 
+.platform-panel {
+  margin-bottom: 20px;
+}
+
+.platform-panel .panel-head {
+  align-items: flex-start;
+}
+
+.platform-grid {
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.platform-grid .aac-card {
+  background: var(--bg-1);
+}
+
 .aac-card {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);

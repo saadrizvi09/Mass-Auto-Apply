@@ -1,0 +1,19 @@
+# Deny the entire local checkout by default. The worker image needs only the
+# tenant-safe SaaS modules and persistent-worker sources listed below. This
+# prevents remote builders from receiving .env files, résumés, browser profiles,
+# databases, Git history, virtual environments, screenshots, or legacy data.
+**
+
+!worker/
+!worker/Dockerfile
+!worker/requirements.txt
+!worker/*.py
+!worker/providers/
+!worker/providers/*.py
+
+!app/
+!app/__init__.py
+!app/saas/
+!app/saas/*.py
+!app/saas/discovery/
+!app/saas/discovery/*.py

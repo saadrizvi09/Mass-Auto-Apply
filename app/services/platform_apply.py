@@ -1,5 +1,4 @@
-"""Orchestrates autonomous apply on external platforms: Y Combinator Work at a Startup,
-Cutshort, and ZipRecruiter.
+"""Orchestrates autonomous apply on supported external job platforms.
 
 Thin layer over app/integrations/platforms.py: enforces a conservative per-day cap per
 platform (these are ToS-restricted + bot-defended, so volume stays low), handles DRY_RUN,
@@ -30,11 +29,10 @@ def _cap(name: str, default: int) -> int:
 _CAPS = {
     "yc": _cap("YC_DAILY_CAP", 20),
     "cutshort": _cap("CUTSHORT_DAILY_CAP", 12),
-    "ziprecruiter": _cap("ZIP_DAILY_CAP", 6),
     "wellfound": _cap("WELLFOUND_DAILY_CAP", 15),
     "instahyre": _cap("INSTAHYRE_DAILY_CAP", 15),
 }
-_LABEL = {"yc": "Y Combinator", "cutshort": "Cutshort", "ziprecruiter": "ZipRecruiter",
+_LABEL = {"yc": "Y Combinator", "cutshort": "Cutshort",
           "wellfound": "Wellfound", "instahyre": "Instahyre"}
 
 
@@ -63,7 +61,7 @@ def status() -> dict:
     }
 
 
-def autoapply(platform: str, query: str = "", location: str = "", remote: bool = True,
+def autoapply(platform: str, query: str = "", remote: bool = True,
               limit: int | None = None) -> dict:
     """Run an autonomous apply batch on one platform up to its daily cap.
 
@@ -97,11 +95,8 @@ def autoapply(platform: str, query: str = "", location: str = "", remote: bool =
         results = platforms.cutshort_autoapply(profile, query, remote, remaining)
     elif platform == "wellfound":
         results = platforms.wellfound_autoapply(profile, query, remote, remaining)
-    elif platform == "instahyre":
+    else:  # instahyre
         results = platforms.instahyre_autoapply(profile, query, remote, remaining)
-    else:  # ziprecruiter
-        results = platforms.ziprecruiter_autoapply(profile, query or "software engineer",
-                                                   location or "Remote", remaining)
 
     submitted = [r for r in results if r.get("outcome") == "submitted"]
     skipped = [r for r in results if str(r.get("outcome", "")).startswith("skipped")]

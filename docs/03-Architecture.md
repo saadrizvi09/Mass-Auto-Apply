@@ -1,217 +1,496 @@
-# Architecture Document
-### Project: AutoApply — Free Job-Application Emailer
-**Version:** 1.1 · **Status:** Final · **Last updated:** 2026-06-18
+# Architecture
 
----
+## AutoApply Cloud 2.0
+
+**Status:** Implementation baseline
+**Date:** 2026-08-11
 
 ## 1. Architectural goals
 
-- Single-user, **runs locally**, zero hosting cost.
-- Clear pipeline of independent stages, each individually runnable and retryable.
-- Safety-first sending (account protection > throughput).
-- Secrets never leave the local machine.
+- Public, authenticated, multi-user service with strict tenant isolation.
+- Vercel-compatible stateless web/API execution.
+- Durable provider actions with explicit approval and idempotency.
+- Bounded tenant-owned discovery without additional provider credentials.
+- Immutable form revisions with separate scan, prefill, and submit boundaries.
+- Direct private résumé storage and per-user provider connections.
+- Honest separation between product auth, OAuth authorization, and browser sessions.
+- Reuse of the legacy pure matching/safety logic without reusing its global state.
 
-## 2. Why not serverless (Vercel)
-
-Rejected because: Hobby cron runs **once per day** (insufficient for hourly reply
-scans), serverless functions time out at ~30–60 s (insufficient for batch scraping),
-the filesystem is ephemeral (cannot persist the OAuth token or SQLite DB), and hosting
-a Gmail refresh token on a public deployment is an unnecessary security risk. A local
-process with an in-process scheduler solves all four cleanly and for free.
-
-## 3. System context
-
-```mermaid
-flowchart LR
-    U[Operator / Browser] -->|HTTP| API[FastAPI Backend]
-    API --> DB[(SQLite jobs.db)]
-    API --> LI[LinkedIn guest jobs endpoint]
-    API --> HUN[Hunter.io domain-search + verifier]
-    API --> GROQ[Groq LLM API + backup key]
-    API --> GMAIL[Gmail API]
-    API --> CHROME[User's logged-in Chrome / Playwright<br/>Google Forms]
-    API -.legacy.-> CSE[Google Custom Search API]
-    SCHED[APScheduler] --> API
-```
-
-Discovery now scrapes LinkedIn's public **guest** jobs endpoint (no login). The
-Google Custom Search path is retained only as a disabled legacy fallback
-(`discover_ats`). HR emails come from Hunter domain-search (and Hunter's verifier
-guards sends); Groq runs every LLM task and auto-fails-over to a backup key on 429;
-Google Forms are filled via pre-filled links opened in the operator's own Chrome.
-
-## 4. Component view
+## 2. Deployment view
 
 ```mermaid
 flowchart TB
-    subgraph Frontend
-      UI[Dashboard + buttons]
+    subgraph Browser[User browser]
+      SPA[Static SPA]
+      LS[localStorage<br/>Supabase session + BYO Groq key]
     end
-    subgraph Backend [FastAPI process]
-      ROUTES[HTTP routes]
-      DISC[Discovery service]
-      LI[LinkedIn integration]
-      HUN[Hunter integration]
-      DRAFT[Draft service]
-      SEND[Throttled sender]
-      SCAN[Reply scanner]
-      FORMS[Forms / referrals / formfiller]
-      BROW[Browser integration]
-      RESUME[Resume parser]
-      IMP[Importer]
-      SCHED2[Scheduler]
-      STORE[Repository / SQLite]
-      CFG[Config + secrets loader]
+
+    subgraph Vercel[Vercel]
+      CDN[CDN public assets]
+      API[FastAPI Function<br/>short stateless requests]
     end
-    UI --> ROUTES
-    ROUTES --> DISC & DRAFT & SEND & SCAN & FORMS & RESUME & IMP
-    DISC --> LI & HUN
-    FORMS --> BROW
-    DISC & DRAFT & SEND & SCAN & FORMS & RESUME & IMP --> STORE
-    SCHED2 --> SCAN
-    DISC --> CFG
-    SEND --> CFG
+
+    subgraph Supabase[Supabase]
+      AUTH[Auth]
+      PG[(Postgres + RLS)]
+      ST[(Private Storage)]
+    end
+
+    subgraph External[External services]
+      GROQ[Groq]
+      GOOG[Google OAuth / Gmail]
+      CF[Cloudflare Turnstile]
+      PUB[Telegram/RSS + LinkedIn guest pages]
+      BB[Browserbase managed browser]
+    end
+
+    WORKER[Python worker<br/>persistent process]
+
+    SPA --> CDN
+    SPA <--> AUTH
+    SPA -->|Bearer JWT| API
+    SPA -->|direct owned path| ST
+    API --> AUTH
+    API --> PG
+    API --> ST
+    API -->|transient user key| GROQ
+    API <--> GOOG
+    SPA -->|short-lived challenge| CF
+    SPA -->|CAPTCHA token| AUTH
+    WORKER --> PG
+    WORKER --> ST
+    WORKER --> GOOG
+    WORKER --> PUB
+    WORKER --> BB
 ```
 
-### 4.1 Component responsibilities
-- **Dashboard (frontend):** renders status tables + action buttons + quota indicators; calls backend routes.
-- **HTTP routes (FastAPI):** thin controllers; validate input, invoke services, return JSON.
-- **Discovery service (`services/discovery.py`):** `discover()` scrapes LinkedIn guest jobs across roles × geos, filters (interns, over-senior titles, big-company/staffing blocklist, salary < Min LPA, headcount > Max team size), stores new postings, and resolves an HR email per company via Hunter. `discover_ats` is the legacy Custom Search path (disabled).
-- **LinkedIn integration (`integrations/linkedin.py`):** fetches the public guest jobs endpoint (no login) and BeautifulSoup-parses HTML cards into `{title, company, location, url, remote, salary, salary_lpa}`.
-- **Hunter integration (`integrations/hunter.py`):** `find_hr_emails` runs a domain-search by company name → `{domain, headcount, contacts}` (HR/recruiter contacts first); `verify` is the pre-send mailbox check. Free tier 50/month, tracked locally.
-- **Draft service:** builds a Groq prompt per posting (via `groq_client.chat`), stores draft.
-- **Throttled sender (`services/sender.py`):** enforces pause/cap/ramp/warm-up gate/bounce auto-pause/verify-before-send (+ optional allow-unverified)/pre-send Hunter mailbox check/duplicate guard/first-send guard/human spacing; sends via Gmail; records thread IDs.
-- **Reply scanner:** reads new mail, matches threads, classifies via Groq, updates status + labels.
-- **Forms stack (`services/forms.py`, `referrals.py`, `formfiller.py`):** `referrals.parse_digest` splits a referral digest and routes each job (`form` / `email` / `manual`); `forms` orchestrates the Google-Forms flow — its primary mechanism builds **pre-filled links** (`build_prefill_links`) from a form's entry IDs; `formfiller` plans answers (Groq for open text).
-- **Browser integration (`integrations/browser.py`):** persistent-context Playwright launched against the operator's **real installed Chrome**; `read_form_full` parses the `FB_PUBLIC_LOAD_DATA_` blob for entry IDs; also drives optional in-browser fill/submit.
-- **Resume parser (`services/resume.py`):** pypdf reads `cv.pdf`, extracts email/phone/profile links, fills BLANK fields in `profile.json`.
-- **Importer (`services/importer.py`):** bulk-imports jobs/contacts from CSV/Excel.
-- **Scheduler (APScheduler):** triggers reply scanner hourly.
-- **Repository (`db.py`):** all SQLite reads/writes; transactional; self-healing migrations.
-- **Config/secrets loader:** reads `.env` + OAuth creds (incl. primary + backup Groq keys).
+## 3. Trust boundaries
 
-## 5. Technology choices & rationale
+### Browser
 
-| Layer | Choice | Rationale |
+The browser is controlled by the user and is not trusted to assert a `user_id`, status,
+approval, quota, or ownership. It holds:
+
+- the Supabase application session managed by `supabase-js`;
+- one namespaced Groq key per user in local storage;
+- UI state that is never authoritative.
+
+The public Turnstile site key may reach the browser; the matching Turnstile secret is
+configured only inside Supabase Auth. CAPTCHA tokens protect sign-in, sign-up, and reset
+requests and are kept in memory only until the next auth attempt.
+
+### Vercel API
+
+The API validates the Supabase bearer token for each private request, derives the UUID
+from its verified subject, and calls Supabase with that user's JWT wherever possible so
+RLS remains active. It may use the Supabase secret key only for server-only records such
+as OAuth token storage and callback state.
+
+No user-bound client, token, application state, rate limiter, or run status is cached in
+module globals because a warm Function may serve different users.
+
+### Worker
+
+The worker has elevated credentials and therefore carries the largest blast radius. It
+may process only a job atomically claimed from the database. The job's persisted
+`user_id` is the sole tenant input; queue messages never nominate a separate user. It
+owns bounded public-feed/LinkedIn guest network fetches and all managed-browser work.
+Provider navigation and every redirect are checked against explicit HTTPS host
+allowlists before content is read.
+
+### Providers
+
+Groq sees the profile/résumé/JD content needed for the requested generation. Google sees
+the OAuth/send operations the user approved. Managed-browser providers hold opaque
+browser contexts. Tokens, cookies, and context connection URLs never reach public rows.
+Telegram/RSS and LinkedIn guest discovery use public pages only and receive no user
+credentials. LinkedIn guest discovery is unofficial/best-effort and is not connected to
+LinkedIn Easy Apply.
+
+## 4. Request authentication
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant A as Supabase Auth
+    participant API as FastAPI
+    participant DB as Supabase Data API
+    B->>A: sign in
+    A-->>B: access + refresh session
+    B->>API: Authorization: Bearer access_jwt
+    API->>A: validate token / get current user
+    A-->>API: verified user id
+    API->>DB: request with publishable key + same user JWT
+    DB->>DB: RLS auth.uid() = user_id
+    DB-->>API: owned rows only
+    API-->>B: private, no-store response
+```
+
+The initial implementation uses the Auth server's current-user endpoint for strong,
+simple verification. It can move to cached JWKS verification later without changing the
+route dependency contract. That verified response also supplies `last_sign_in_at`;
+permanent account deletion fails closed unless it is no more than ten minutes old.
+Reauthentication uses the normal Supabase sign-in and Turnstile flow, so AutoApply never
+receives the user's password.
+
+## 5. Resume flow
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant S as Supabase Storage
+    participant API as FastAPI
+    participant DB as Postgres
+    B->>S: upload user-id/resume-[1-5].pdf with user JWT
+    S->>S: Storage RLS checks exact owner + slot + five-object cap
+    B->>API: register owned slot + safe metadata
+    API->>DB: RPC verifies object; lock user; deactivate old; activate selected
+    B->>API: parse selected resume
+    API->>S: download after owner/path check
+    API->>API: validate PDF and extract text
+    API->>DB: save parsed text + suggestions
+    API-->>B: suggestions; no silent overwrite
+```
+
+Temporary parse files, if required, use `/tmp` and are discarded after results are
+written to Supabase.
+
+Registration is one database transaction, so concurrent tabs cannot leave multiple
+active résumés. The five fixed filenames also let Storage uniqueness enforce the hard
+object cap. Deletion removes the selected object and its `resumes` row only; application
+history has no cascading résumé foreign key and is retained.
+
+## 6. Browser-only Groq flow
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as FastAPI
+    participant G as Groq
+    B->>B: save key in localStorage
+    B->>API: JWT + X-Groq-Api-Key + job/application id
+    API->>API: load owned profile, résumé and JD
+    API->>G: completion request with transient key
+    G-->>API: generated draft
+    API->>API: validate/normalize and persist draft, never key
+    API-->>B: editable draft
+```
+
+The API sanitizes provider errors so a key cannot be reflected. Content generation is a
+foreground request because the background worker cannot read browser local storage.
+The key is stored as `autoapply.groq_api_key.v2.<auth-user-uuid>`. Normal sign-out clears
+the auth session but deliberately preserves that user's browser key; explicit key
+removal, account deletion, clearing site data, or deleting the browser profile removes
+it. A subsequently signed-in user reads only their own namespaced key.
+
+## 7. Credential-free discovery flow
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as FastAPI
+    participant DB as Postgres
+    participant W as Worker
+    participant P as Public source
+    alt pasted referral digest or CSV/XLSX
+      B->>API: bounded untrusted text/file
+      API->>API: parse, normalize, detect provider
+      API->>DB: upsert owned jobs by normalized URL
+      API-->>B: imported/duplicate/rejected counts
+    else Telegram/RSS, LinkedIn guest, or public ATS board search
+      B->>API: owned discovery preferences + explicit run
+      API->>DB: enqueue bounded discovery job
+      W->>DB: claim job with user ID + lease
+      W->>P: allowlisted HTTPS request with byte/item/page limits
+      W->>DB: normalize/upsert owned jobs; persist redacted result
+      B->>API: poll owned job/result
+      API-->>B: reviewable discoveries
+    end
+```
+
+Discovery preferences and results are tenant-owned. A normalized URL is the idempotency
+boundary when available. Pasted/imported strings are rendered through `textContent` and
+never trusted as markup. CSV/XLSX parsing has file, row, and cell ceilings and does not
+execute formulas or macros.
+
+Telegram preview/RSS fetching uses a fixed source catalog and redirect revalidation;
+job URLs found in content are stored for review, not fetched arbitrarily. LinkedIn guest
+search has small page/result limits and stops on throttling or challenge responses. It
+does not create or reuse a LinkedIn login context and cannot queue Easy Apply.
+Greenhouse, Lever, and Ashby board discovery derives a fixed official API URL from the
+hosted board identifier, fetches no user-selected destination, and interleaves bounded
+results when multiple company boards are supplied.
+
+## 8. Gmail OAuth and send flow
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as FastAPI
+    participant DB as Postgres
+    participant G as Google
+    opt Advanced user-managed OAuth client
+        B->>API: save Web client ID + secret
+        API->>DB: encrypt both; service-role-only upsert; advance credential generation
+    end
+    B->>API: authenticated Connect Gmail (platform default or explicit user client)
+    API->>DB: advance lifecycle; store one-time state bound to user + source/generation
+    API-->>B: Google authorization URL
+    B->>G: consent to identity + gmail.send
+    G->>API: callback(code, state)
+    API->>DB: consume state atomically
+    API->>DB: resolve only the state-bound encrypted client
+    API->>G: exchange code using that Web client + the fixed callback
+    G-->>API: tokens + account identity
+    API->>DB: save only if generation is current; encrypt tokens; upsert connection
+    API-->>B: redirect to app
+    B->>API: approve and send application + idempotency key
+    API->>DB: reserve tenant + pseudonymous provider limits transactionally
+    API->>G: users.messages.send with owned resume
+    G-->>API: provider message/thread id
+    API->>DB: finalize send and audit event
+    API-->>B: sent result
+```
+
+Only single reviewed sends run in the web function. Delayed/batched sending, if added,
+uses the worker and persisted already-approved content.
+
+The operator-managed OAuth client is the normal/default source when configured. The
+advanced user-managed path stores an authenticated user's Web client ID and secret in
+`user_google_oauth_clients`, encrypted before the service-role write. Browser roles
+have no table policy or grant, and status never returns the saved secret. Both sources
+use the single fixed `GOOGLE_REDIRECT_URI`; users cannot provide redirect URIs, scopes,
+or Google endpoints. A Google Cloud API key cannot replace a Web OAuth client.
+
+`connection_lifecycles` serializes Gmail start, callback, reconnect, disconnect, and
+user-client changes. A new start increments the lifecycle generation and removes prior
+states. Each state also records `credential_source` and the user client's generation,
+when applicable; callback exchange and token refresh resolve only that binding. Saving,
+replacing, or deleting a user client advances its credential generation and invalidates
+pending states, and is rejected until Gmail is disconnected and no provider send is in
+flight. Beginning disconnect also advances/locks the lifecycle before calling Google.
+A stale callback therefore cannot recreate a newer/disconnected connection or switch
+OAuth clients. Disconnect deletes local connection/token rows even if Google's
+revocation endpoint is unavailable; revocation is best-effort and the UI directs the
+user to Google Account controls when it is not confirmed. Disconnect does not by itself
+delete a saved user-managed OAuth client; the user can delete it afterward.
+
+Google-project lifecycle is outside AutoApply's database lifecycle. An External project
+in Testing must explicitly list test users; with `gmail.send`, its grants and refresh
+tokens expire seven days after consent. The project owner must publish and complete
+brand/domain and sensitive-scope verification before using that client as a public
+production app.
+
+Send reservation hashes `gmail:<Google subject>` and the normalized recipient with
+domain-separated SHA-256. A server-only `provider_send_events` row has no user ID,
+plaintext email, body, or token. It serializes provider-account reservations, applies a
+25-send rolling 24-hour ceiling and the configured duplicate window even after account
+recreation, and expires no later than 90 days. Account deletion removes tenant send
+history but deliberately leaves only these bounded hashes until their expiry. Expired
+rows stop participating immediately; an hourly service-only database job and the
+reservation hot path physically delete them. Physical deletion can lag logical expiry
+if cron fails, so the job's run history is monitored.
+
+## 9. Managed-browser application flow
+
+The sequence below applies only to a provider whose application handler has been
+enabled after its capability and staging gates pass; registry-only connections never
+enter the fill or submit stages.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as FastAPI
+    participant DB as Postgres
+    participant W as Worker
+    participant BB as Browserbase
+    B->>API: request scan for owned application/job
+    API->>DB: enqueue application_scan
+    W->>BB: open isolated provider context; inspect fields only
+    W->>DB: append immutable form revision + schema/content hashes
+    DB-->>B: exact revision for review
+    B->>API: optionally request grounded suggestions with transient Groq key
+    API-->>B: draft answers only; no DB mutation or approval
+    B->>API: approve revision ID + expected hashes
+    API->>DB: transactional exact-revision approval
+    B->>API: explicit prefill
+    API->>DB: enqueue application_prefill for approved revision
+    W->>BB: revalidate schema; fill approved values/resume; stop
+    B->>API: separately request submit
+    API->>DB: enqueue application_submit for same approved revision
+    W->>BB: revalidate approval/schema; activate submit once
+    W->>DB: confirmed success or needs_attention
+```
+
+The adapter registry contains `google_forms`, `greenhouse`, `lever`, `ashby`, `yc`,
+`wellfound`, `cutshort`, and `instahyre`. ZipRecruiter is absent. Registry membership
+provides provider identity, host/redirect policy, and an isolated Browserbase context;
+it does not assert that every provider has an end-to-end application state machine.
+Greenhouse and one-page Google Forms have aligned handlers. Multi-page or branching
+Google Forms are unsupported. Lever and Ashby have safe mappings with read-only live
+scan evidence but still require controlled prefill/submit canaries; Wellfound still
+needs a signed-in canary. YC, Cutshort, and Instahyre are connection-only and the worker
+fails safely until tenant-aware multi-step state machines are implemented. Public forms
+may use an ephemeral session; login-gated providers reuse an encrypted
+`(user_id, provider)` context. A single active lease may use a persisted context.
+
+Scanning, prefilling, and submission are intentionally separate. A revision binds the
+target URL, detected form schema, proposed answers, and selected résumé. First approval
+atomically seals the exact answers reviewed in the browser. Any post-approval answer
+change, or any URL/résumé/schema change, requires a new revision. Prefill never activates
+submit. Submit requires a distinct user action and exact revision/hash match. CAPTCHA,
+MFA, login expiry, unknown required fields, or ambiguous confirmation produce
+`needs_attention`; the browser worker never bypasses or guesses.
+
+## 10. Durable worker protocol
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> running: atomic claim + lease
+    running --> succeeded: persisted result
+    running --> needs_attention: login/MFA/manual step
+    running --> failed: terminal/retry exhausted
+    running --> queued: retry after transient failure
+    queued --> cancelled: user cancellation
+    running --> cancelled: cooperative cancellation
+    running --> queued: lease expired after crash
+```
+
+The queue is initially a Postgres table and claim RPC using `FOR UPDATE SKIP LOCKED`.
+This is portable and easy to deploy. It may later be fed by Vercel Queues without
+changing job semantics.
+
+Idempotency boundaries:
+
+- unique `(user_id, normalized_url)` for owned jobs;
+- unique `idempotency_key` per user/job type;
+- unique provider send reference after Gmail accepts a message;
+- one running browser job per connection/context;
+- one immutable form revision/hash approval per prefill/submit request;
+- terminal transitions compare the worker lease token.
+
+Durable job kinds include `discover_public_feeds`, `discover_linkedin_guest`,
+`discover_public_ats`, `application_scan`, `application_prefill`, and
+`application_submit`, plus the existing manual handoff/control jobs.
+
+## 11. Connection modes
+
+| Mode | Meaning | Examples |
 |---|---|---|
-| Backend | Python 3.11 + FastAPI + Uvicorn | Fast to build, great HTTP + async, huge ecosystem |
-| Scheduler | APScheduler (in-process) | Hourly scans without external cron; free |
-| DB | SQLite (file) | Zero-setup, local, persistent, sufficient for one user |
-| Frontend | HTML + vanilla JS (or Vite/React) | Five buttons + a table; no heavy framework needed |
-| Scraping | requests + BeautifulSoup | Parses LinkedIn guest job cards (HTML); no browser needed for discovery |
-| Forms | Playwright (real installed Chrome, persistent context) | Google trusts real Chrome at sign-in; reads `FB_PUBLIC_LOAD_DATA_` entry IDs for pre-filled links + optional in-browser fill |
-| Résumé | pypdf | Extracts contact details from `cv.pdf` into `profile.json` |
-| LLM | Groq `llama-3.3-70b-versatile` (OpenAI-compatible) + backup key | Free tier ample, fast, drop-in OpenAI SDK; auto-fails-over to a second key on 429 |
-| Discovery | LinkedIn public *guest* jobs endpoint | No login (lower ban risk); real remote openings. Google Custom Search kept only as legacy fallback |
-| Contacts / Verify | Hunter.io domain-search + email-verifier | 50 free/month; domain-search finds HR emails + headcount, verifier cuts bounces pre-send |
-| Mail | Gmail API (OAuth) | One API for both send and read; uses the operator's own account |
+| `oauth` | Official provider authorization | Gmail send |
+| `public_ats` | Recognized application URL or explicit public company-board enumeration; no account secret required | Google Forms, Greenhouse, Lever, Ashby |
+| `managed_browser` | Isolated remote context; provider must be allowlisted | Google Forms, Greenhouse, Lever, Ashby, YC, Wellfound, Cutshort, Instahyre |
+| `manual_only` | Product tracks and opens the external page | Any unsupported board |
+| `partner_required` | Official approval/API agreement is required | LinkedIn candidate apply |
 
-## 6. Key data flows
+LinkedIn application handling is manual/partner-only. The separate unofficial guest-job
+adapter is discovery-only: no LinkedIn OAuth, account context, Easy Apply fill, or submit
+is claimed. Even a future identity-only OIDC link would not grant candidate application
+access.
 
-### 6.1 Discover → Send (happy path)
-```mermaid
-sequenceDiagram
-    participant U as Operator
-    participant API as Backend
-    participant LI as LinkedIn guest
-    participant HUN as Hunter
-    participant GROQ as Groq
-    participant GM as Gmail
-    U->>API: ① Find Jobs (filters: roles × geos, remote, Min LPA, Max team size)
-    loop each role × geo
-        API->>LI: scrape guest job cards
-        LI-->>API: postings (title/company/url/salary)
-    end
-    API->>API: dedupe + filter (interns, over-senior, big-co/staffing, below-salary)
-    loop each kept company (Hunter budget)
-        API->>HUN: domain-search by company name
-        HUN-->>API: {domain, headcount, HR contacts}
-        API->>API: drop if headcount > Max team size; store HR email
-    end
-    U->>API: ② Draft Emails
-    API->>GROQ: tailor email per posting
-    GROQ-->>API: draft -> applications(drafted)
-    U->>API: ③ Review & Send (approve subset; may allow-unverified)
-    loop each approved, throttled
-        API->>API: pause/cap/ramp/warm-up, dup + first-send guards
-        API->>HUN: pre-send mailbox verify (Hunter-sourced emails)
-        HUN-->>API: skip if invalid, else send
-        API->>GM: send (CV attached, optional Cc)
-        GM-->>API: thread_id -> status sent
-        API->>API: spacing 90-180s
-    end
-```
+`managed_browser` describes the connection mechanism, not application completeness.
+The initial production allowlist is `google_forms,greenhouse` after their controlled
+staging checks. Lever, Ashby, and Wellfound are added one at a time only after canaries;
+YC, Cutshort, and Instahyre remain outside the allowlist until their multi-step handlers
+exist. The Google Forms entry is limited to one-page forms.
 
-### 6.1a Referral digest → Google Form (pre-filled link)
-```mermaid
-sequenceDiagram
-    participant U as Operator
-    participant API as Backend
-    participant GROQ as Groq
-    participant CH as Chrome (Playwright)
-    U->>API: Ingest referral digest (paste / scan Gmail)
-    API->>GROQ: parse digest into jobs
-    GROQ-->>API: jobs routed by apply_kind (form / email / manual)
-    U->>API: Build pre-filled links (form jobs)
-    API->>CH: read_form_full -> FB_PUBLIC_LOAD_DATA_ entry IDs
-    CH-->>API: fields + entry IDs
-    API->>GROQ: plan open-text answers
-    GROQ-->>API: planned answers
-    API->>API: build viewform?usp=pp_url&entry.X=... link
-    U->>U: open link in own logged-in Chrome -> attach CV -> Submit
-    U->>API: Mark submitted
-```
+Managed-browser connection flow:
 
-### 6.2 Automated reply scan
-```mermaid
-sequenceDiagram
-    participant S as Scheduler (hourly)
-    participant API as Backend
-    participant GM as Gmail
-    participant GROQ as Groq
-    S->>API: trigger Scan Replies
-    API->>GM: list messages since last_check
-    GM-->>API: new messages
-    API->>API: match by thread_id
-    API->>GROQ: classify reply text
-    GROQ-->>API: label (interview/rejection/needinfo/auto_ack)
-    API->>API: update status + reply_excerpt + last_checked_at
-    API->>GM: apply Gmail label
-```
+1. API confirms the provider is one of the eight registry entries, is operator
+   allowlisted, and creates a context through the Browserbase API.
+2. It starts a session with persistence and returns a short-lived Live View URL.
+3. The user types credentials/MFA directly into that remote browser.
+4. The session closes and only its opaque context ID remains in server-only metadata.
+5. Worker jobs reuse that context while enforcing a connection lock and exact revision
+   approval.
 
-## 7. Deployment view
+`BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_ID` are operator credentials shared only
+by trusted API/worker environments. They are not user provider credentials. Gmail's
+optional `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` provide the default platform OAuth
+client; `GOOGLE_REDIRECT_URI` remains required for both platform- and user-managed
+Gmail OAuth. None of these settings authorize Google Forms.
 
-Single local process started with one command (Uvicorn). SQLite file + `token.json`
-persist on disk in the project directory. The browser UI is served on `localhost`.
-No containers required (a Dockerfile is optional for portability).
+## 12. Data architecture
 
-```
-127.0.0.1:8000     → FastAPI (serves API + static UI)
-./jobs.db          → SQLite (self-healing migrations)
-./token.json       → Gmail OAuth token (git-ignored)
-./.env             → API keys incl. backup Groq key (git-ignored)
-./cv.pdf           → CV: attached to emails + parsed into profile.json
-./profile.json     → answers used to build pre-filled form links
-./.browser_profile → Playwright persistent Chrome profile (one-time Google login)
-./form_shots/      → form fill screenshots for review
-```
+All tenant tables use UUIDs, `timestamptz`, `created_at`/`updated_at`, an indexed
+`user_id`, foreign keys with deliberate cascade behavior, and RLS. Visible integration
+metadata is separated from encrypted provider secrets. Storage is private.
 
-## 8. Security architecture
+The exceptions are server-only lifecycle/secret records, including encrypted
+`user_google_oauth_clients`, and the pseudonymous Gmail abuse ledger. Browser roles
+have no grants on them. Lifecycle/secret/user-client records cascade with the account;
+provider-abuse rows have no account foreign key so caps cannot be
+reset by deleting/recreating an account, but their schema enforces a 90-day maximum
+expiry. An hourly database job plus reservation traffic prunes expired rows.
+Cron failure does not reactivate an expired row, but it can delay physical deletion and
+therefore requires an operational alert and remediation.
 
-- All secrets local; `.gitignore` excludes `.env`, `credentials.json`, `token.json`, `jobs.db`.
-- Gmail OAuth uses a Desktop-app client in **Testing** mode with the operator as the sole test user; minimal scopes (`gmail.send`, `gmail.readonly`, `gmail.modify`).
-- No inbound exposure: server bound to `127.0.0.1`.
-- No third-party storage of email content or contacts.
+The worker's secret key bypasses RLS, so repository methods require `user_id` even when
+the primary key is globally unique. This defense prevents accidental cross-tenant work.
 
-## 9. Failure handling & resilience
+`discovery_preferences` stores per-user source/query bounds. `application_form_revisions`
+uses appended revisions whose identity/schema payload is immutable; first approval
+seals the reviewed answers, while bounded lifecycle/result fields may advance. Each row
+binds provider, URL, field schema, answers, résumé, hashes, and approval.
+`automation_jobs.form_revision_id` ties browser work to the reviewed record instead of
+accepting answers in an untrusted queue payload. Browser roles may read their own
+revisions and invoke the exact-approval RPC; worker mutations use service-only
+bundle/scan/progress RPCs.
 
-- External calls wrapped with retry + exponential backoff (NFR-4).
-- Each pipeline stage is idempotent on its records (safe to re-run).
-- Sender persists progress per email so a crash mid-batch never double-sends (thread_id + status checked before send).
-- Quota exhaustion (Hunter) and LinkedIn rate-limiting (429/403 back-off) degrade gracefully and report remaining budget; Groq 429 auto-fails-over to the backup key.
+## 13. Legacy component disposition
 
-## 10. Scalability note
+| Legacy component | Hosted disposition |
+|---|---|
+| `app/logic.py` safety math | Reuse pure functions |
+| Prompt and field-matching logic | Generalize and inject user profile |
+| SQLite `app/db.py` | Replace with Supabase REST/Postgres migration |
+| Root `.env`, `profile.json`, `cv.pdf`, token files | Never load in hosted mode |
+| APScheduler / FastAPI `BackgroundTasks` | Replace with durable jobs |
+| `LAST_*`, stop flags, cached clients | Replace with rows/leases; no user globals |
+| Shared `digest_seen.json` / import files | Replace with tenant rows and normalized URL idempotency |
+| Legacy public discovery parsers | Reuse only bounded pure normalization; move network work to worker |
+| Desktop Gmail `InstalledAppFlow` | Replace with web OAuth |
+| Local `.browser_profile` | Optional managed context or user companion |
+| Legacy ZipRecruiter integration | Do not migrate into hosted catalog or worker |
+| Static dashboard concepts | Replace with authenticated SaaS SPA |
+| Local CLI/scripts | Legacy/worker development only |
 
-Designed for one user and tens of applications/day. Higher volume is intentionally
-**not** supported because it conflicts with deliverability safety (NFR-2). Scaling
-beyond this requires paid email infrastructure, which is explicitly out of scope.
+## 14. Failure and recovery
+
+- API errors preserve correct status codes and stable error identifiers.
+- Provider timeouts never become successful terminal states.
+- OAuth state is single-use; token exchange failure leaves no connected status.
+- OAuth generations make superseded callbacks stale, including callbacks racing a
+  disconnect. Failed Google revocation does not preserve local token rows.
+- OAuth credential bindings prevent a callback or refresh from falling back to another
+  client. A missing/corrupt/stale user client requires reconfiguration/reconnection;
+  it is never replaced by the platform secret implicitly.
+- A send reservation has `pending_provider`, `sent`, or `failed` state. Ambiguous Gmail
+  timeouts are reconciled before retry rather than blindly repeated.
+- Worker retries use bounded exponential backoff and a maximum attempt count.
+- CAPTCHA/security/MFA is `needs_attention`; workers never attempt bypass.
+- A changed form schema/revision invalidates approval and requires a new review.
+- Prefill success is never submission success; ambiguous submit state is
+  `needs_attention` and is not blindly retried.
+- LinkedIn guest/public-feed throttling produces a bounded retry or visible partial
+  result, never an unbounded crawl.
+- A provider policy/configuration mismatch is a capability error, not a retry loop.
+
+## 15. Security posture required for a public product
+
+The instruction to disregard privacy cannot be applied to a public Gmail/Supabase
+product. Provider policies and basic tenant safety require least scopes, a privacy
+notice, secure token storage, RLS, deletion, log redaction, and verified consent. These
+controls are architectural requirements, not optional polish.
+
+Production promotion additionally requires an actual staging Supabase migration plus
+RLS, Storage, OAuth-generation, send-reservation, deletion, and worker concurrency
+tests; verified Vercel/Supabase production settings; Google verification for the exact
+domain and scopes of the public platform client, plus accurate Testing/verification
+guidance for user-managed project owners; Browserbase credentials; a persistent worker;
+live provider testing
+with controlled accounts/jobs; and reviewed operator-specific legal/contact pages. The
+generic placeholders in this repository are explicit launch blockers, not inferred
+defaults. Mocked browser tests demonstrate deterministic worker behavior, not that a
+third-party provider's current production markup or terms have been validated.
