@@ -691,6 +691,19 @@ async def resume_upload_guard_issue(
                 "The Google résumé picker could not be identified unambiguously. Complete the attachment in Live View.",
             )
 
+    if not file_fields:
+        # A URL field labelled "Resume Link" is common on Google Forms and is
+        # not an upload widget.  Avoid probing every dynamic question container
+        # (which can detach while Google re-renders) unless the visible form copy
+        # contains an actual upload/picker prompt.  If the root itself cannot be
+        # inspected, retain the conservative container checks below.
+        try:
+            visible_form_text = (await scope.inner_text(timeout=2_000))[:100_000]
+        except Exception:
+            visible_form_text = ""
+        if visible_form_text and not _has_file_picker_prompt(visible_form_text):
+            return None
+
     # Some sites render a provider-owned file picker without exposing a native
     # input in the reviewed form. Never click that picker or attempt a nearby
     # input: it may require a separate login, Drive permission, or ambiguous

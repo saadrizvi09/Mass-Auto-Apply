@@ -3793,11 +3793,23 @@ function formApplicationById(id) {
   return state.formApplications.find((item) => item.id === id && item.channel === "ats") || null;
 }
 
+function formScanJobs(applicationId) {
+  return state.automationJobs
+    .filter((job) => job.application_id === applicationId && job.kind === "application_scan")
+    .sort((left, right) => {
+      const rightAt = new Date(right.updated_at || right.created_at || 0).getTime() || 0;
+      const leftAt = new Date(left.updated_at || left.created_at || 0).getTime() || 0;
+      return rightAt - leftAt;
+    });
+}
+
+function latestFormScanJob(applicationId) {
+  return formScanJobs(applicationId)[0] || null;
+}
+
 function activeFormScanJob(applicationId) {
-  return state.automationJobs.find(
-    (job) => job.application_id === applicationId
-      && job.kind === "application_scan"
-      && ["queued", "running"].includes(job.status),
+  return formScanJobs(applicationId).find(
+    (job) => ["queued", "running"].includes(String(job.status || "").toLowerCase()),
   ) || null;
 }
 
@@ -3989,6 +4001,99 @@ function formJobDetail(job, fallback = "The isolated worker is preparing the for
   return String(detail).slice(0, 500);
 }
 
+function setFormScanRetry(applicationId, visible) {
+  const button = byId("retry-form-scan");
+  if (!button) return;
+  const application = formApplicationById(applicationId);
+  const job = application ? jobForApplication(application) : null;
+  button.hidden = !visible || !job?.id;
+  button.disabled = false;
+  button.dataset.jobId = button.hidden ? "" : job.id;
+  button.title = button.hidden ? "" : "Create a new preparation run for this form";
+}
+
+function renderFormScanPlaceholder(applicationId) {
+  const container = byId("form-revision-answers");
+  const status = byId("form-revision-status");
+  const applicationStatus = byId("form-application-status-pill");
+  const submit = byId("submit-form-revision");
+  const job = latestFormScanJob(applicationId);
+  const jobStatus = String(job?.status || "").toLowerCase();
+  const active = ["queued", "running"].includes(jobStatus);
+  submit.disabled = true;
+
+  if (!job) {
+    hideFormWorkflowProgress();
+    status.className = "status-pill status-neutral";
+    status.textContent = "Not prepared";
+    applicationStatus.className = "status-pill status-neutral";
+    applicationStatus.textContent = "Not prepared";
+    setText("form-revision-context", "This form has no captured questions yet. Start preparation from the form inbox above.");
+    container.append(emptyState("Prepare this form first", "Choose Prepare form in the inbox to capture its current questions.", "⌕"));
+    setFormScanRetry(applicationId, Boolean(applicationId));
+    setFormMessage("form-revision-message");
+    return;
+  }
+
+  if (active) {
+    const running = jobStatus === "running";
+    const detail = formJobDetail(
+      job,
+      running
+        ? "The worker is recording the form's current questions."
+        : "The preparation job is safely queued and waiting for a worker.",
+    );
+    status.className = "status-pill status-info";
+    status.textContent = running ? "Capturing form" : "Waiting for worker";
+    applicationStatus.className = "status-pill status-info";
+    applicationStatus.textContent = running ? "Preparing form" : "Preparation queued";
+    setText("form-revision-context", detail);
+    container.append(emptyState(
+      running ? "Capturing the form" : "Preparation is queued",
+      running
+        ? "The visible questions will appear here when capture finishes."
+        : "You can keep using AutoApply. Activity shows whether the worker has claimed this job.",
+      "⌕",
+    ));
+    showFormWorkflowProgress({
+      title: running ? "Capturing the visible form" : "Waiting for the form worker",
+      detail,
+      value: humanize(jobStatus),
+      percent: running ? 58 : 18,
+    });
+    setFormScanRetry(applicationId, false);
+    setFormMessage("form-revision-message", running ? "The scan is running; nothing has been submitted." : "The scan is queued; nothing has been submitted.");
+    return;
+  }
+
+  const succeededWithoutRevision = jobStatus === "succeeded";
+  const detail = `${formJobDetail(
+    job,
+    succeededWithoutRevision
+      ? "The worker finished without returning any reviewable questions."
+      : "The worker could not capture a reviewable form revision.",
+  )} Nothing was submitted.`;
+  status.className = `status-pill ${succeededWithoutRevision ? "status-warning" : statusClass(jobStatus)}`;
+  status.textContent = succeededWithoutRevision ? "No questions captured" : humanize(jobStatus || "needs_attention");
+  applicationStatus.className = "status-pill status-warning";
+  applicationStatus.textContent = "Preparation needs attention";
+  setText("form-revision-context", detail);
+  container.append(emptyState(
+    succeededWithoutRevision ? "No questions were captured" : "Form preparation stopped",
+    "Review the worker detail above, then retry preparation. The previous run cannot submit this form.",
+    "!",
+  ));
+  showFormWorkflowProgress({
+    title: "The form needs attention",
+    detail,
+    value: humanize(jobStatus || "stopped"),
+    percent: 100,
+    tone: "error",
+  });
+  setFormScanRetry(applicationId, true);
+  setFormMessage("form-revision-message", detail, "error");
+}
+
 function rememberAutomationJob(job) {
   if (!job?.id) return;
   const index = state.automationJobs.findIndex((item) => item.id === job.id);
@@ -4044,6 +4149,10 @@ async function monitorFormScan(jobId, applicationId, identity = identitySnapshot
   });
   const outcome = await monitorFormWorkflowJob(jobId, identity, (job) => {
     const running = job.status === "running";
+    if (state.selectedFormApplicationId === applicationId && !latestFormRevision(applicationId)) {
+      renderFormRevision(null);
+      return;
+    }
     showFormWorkflowProgress({
       title: running ? "Capturing the visible form" : "Waiting for the form worker",
       detail: formJobDetail(job),
@@ -4399,13 +4508,10 @@ function renderFormRevision(revision) {
   liveLink.removeAttribute("href");
   if (!revision) {
     preflight.hidden = true;
-    status.className = "status-pill status-neutral";
-    status.textContent = "Awaiting scan";
-    setText("form-revision-context", "The worker has not returned the visible questions yet. This desk refreshes automatically while the scan runs.");
-    container.append(emptyState("Capturing the form", "Form Pilot will place the exact visible questions here when the worker finishes scanning.", "⌕"));
-    byId("submit-form-revision").disabled = true;
+    renderFormScanPlaceholder(byId("form-application-id")?.value || state.selectedFormApplicationId || "");
     return;
   }
+  setFormScanRetry(state.selectedFormApplicationId, false);
   const approved = Boolean(revision.approved_at) || revision.status === "approved";
   status.className = `status-pill ${approved ? "status-success" : "status-warning"}`;
   status.textContent = approved ? `Revision ${revision.revision} approved` : `Revision ${revision.revision} needs review`;
@@ -5427,6 +5533,8 @@ async function loadAutomationJobs(quiet = false, identity = identitySnapshot()) 
   const selectedRevision = latestFormRevision(byId("form-application-id")?.value || "");
   const selectedSubmission = selectedRevision ? formSubmissionJobForRevision(selectedRevision) : null;
   if (selectedRevision && selectedSubmission) renderFormSubmissionJob(selectedRevision, selectedSubmission);
+  const selectedFormApplicationId = byId("form-application-id")?.value || state.selectedFormApplicationId || "";
+  if (selectedFormApplicationId && !selectedRevision) renderFormRevision(null);
   return state.automationJobs;
 }
 
@@ -5927,6 +6035,15 @@ function bindWorkspaceEvents() {
       return;
     }
     await openFormApplicationReview(application.id);
+  });
+  byId("retry-form-scan").addEventListener("click", async (event) => {
+    const application = formApplicationById(state.selectedFormApplicationId);
+    const job = application ? jobForApplication(application) : null;
+    if (!job?.id) {
+      toast("This form is no longer linked to a saved job. Add its URL again from the Form Pilot inbox.", "error");
+      return;
+    }
+    await scanJobApplication(job, providerForJob(job) || "google_forms", event.currentTarget);
   });
 
   byId("hunter-setup-form").addEventListener("submit", saveHunter);

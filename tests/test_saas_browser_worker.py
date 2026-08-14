@@ -473,11 +473,69 @@ class FakePage:
         return None
 
 
+class DelayedGoogleFormPage(FakePage):
+    """Model Google's empty HTML shell becoming interactive after page load."""
+
+    def __init__(self, url: str, rendered_fields: list[dict[str, Any]]) -> None:
+        super().__init__(url, [])
+        self.rendered_fields = rendered_fields
+        self.form_waits: list[dict[str, Any]] = []
+
+    async def wait_for_selector(self, selector: str, **kwargs: Any) -> None:
+        self.form_waits.append({"selector": selector, **kwargs})
+        self.fields = self.rendered_fields
+        self.controls = [FakeControl() for _ in self.rendered_fields]
+
+
 def _runtime_schema(page: FakePage, provider: str = "greenhouse") -> Any:
     return bind_schema_to_target(
         asyncio.run(scan_form(page)),
         canonical_form_target(provider, page.url),
     )
+
+
+def test_google_forms_waits_for_client_rendered_controls_before_scanning() -> None:
+    page = DelayedGoogleFormPage(
+        _google_task("scan", None).target_url,
+        _fields(),
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            _google_task("scan", None),
+            None,
+        )
+    )
+
+    assert result.code == "application_form_scanned"
+    assert result.schema is not None
+    assert result.schema.public_fields[0]["label"] == "Email address"
+    assert len(page.form_waits) == 1
+    assert page.form_waits[0]["state"] == "visible"
+    assert page.form_waits[0]["timeout"] == 8_000
+
+
+def test_google_forms_reports_closed_form_instead_of_missing_form() -> None:
+    task = _google_task("scan", None)
+    page = DelayedGoogleFormPage(task.target_url, _fields())
+    page.redirect_url = task.target_url.replace("/viewform", "/closedform")
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            task,
+            None,
+        )
+    )
+
+    assert result.status == "needs_attention"
+    assert result.code == "application_form_closed"
+    assert result.message == "This Google Form is no longer accepting responses."
+    assert result.submission_state == "not_attempted"
+    assert page.form_waits == []
 
 
 def _fields() -> list[dict[str, Any]]:
@@ -1326,6 +1384,7 @@ def test_uninspectable_upload_widget_fails_closed_before_fill_or_submit() -> Non
     page = FakePage(
         _google_task("scan", None).target_url,
         _fields(),
+        body="Upload Resume Add file",
         submit_count=1,
         upload_prompt_containers=[widget],
     )

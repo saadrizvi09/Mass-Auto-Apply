@@ -13,8 +13,8 @@
       content="default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co; frame-src https://challenges.cloudflare.com; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
     />
     <title>AutoApply Cloud — Your job search, thoughtfully organized</title>
-    <link rel="stylesheet" href="/styles.css?v=20260814.1" />
-    <script type="module" src="/app.js?v=20260814.1"></script>
+    <link rel="stylesheet" href="/styles.css?v=20260814.2" />
+    <script type="module" src="/app.js?v=20260814.2"></script>
   </head>
   <body>
     <a id="skip-link" class="skip-link" href="#public-main">Skip to main content</a>
@@ -949,6 +949,7 @@
               </section>
               <div class="form-actions wrap-actions form-review-actions">
                 <button id="submit-form-revision" class="button button-accent form-submit-button" type="button" aria-describedby="form-submit-preflight-detail form-revision-message">Approve &amp; submit in background</button>
+                <button id="retry-form-scan" class="button button-ghost" type="button" hidden>Retry preparation</button>
                 <a id="form-live-review-link" class="button button-ghost" href="#" target="_blank" rel="noopener noreferrer" hidden>Open Live View to finish</a>
               </div>
               <p id="form-revision-message" class="form-message" role="status" aria-live="polite"></p>

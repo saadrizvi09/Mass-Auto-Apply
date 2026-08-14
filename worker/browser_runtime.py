@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from app.saas.browser import BrowserbaseClient, TrustedBrowserSession
@@ -49,6 +50,12 @@ _MAX_RESUME_BYTES = 6 * 1024 * 1024
 # project setting keeps every task bounded and leaves a predictable Live View
 # window for reviewed prefills.
 _BROWSER_SESSION_TIMEOUT_SECONDS = 300
+_GOOGLE_FORM_RENDER_TIMEOUT_MS = 8_000
+_GOOGLE_FORM_CONTROL_SELECTOR = (
+    'form input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]),'
+    "form textarea,form select,form [role=\"combobox\"],form [role=\"listbox\"],"
+    "form [role=\"radio\"],form [role=\"checkbox\"]"
+)
 _PUBLIC_SESSION_PROVIDERS = frozenset(
     {"company_form", "google_forms", "greenhouse", "lever", "ashby"}
 )
@@ -523,6 +530,37 @@ class BrowserRuntime:
         return blocked
 
     @staticmethod
+    async def _wait_for_provider_form_render(
+        page: Any, adapter: ProviderAdapter
+    ) -> None:
+        """Give client-rendered Google Forms a bounded chance to expose controls.
+
+        ``domcontentloaded`` can fire while the Google Forms shell still contains
+        no form controls.  Scanning immediately at that point produces a false
+        ``application_form_not_found`` terminal result.  Other adapters retain
+        their existing timing; a real closed, inaccessible, or unsupported Google
+        Form still falls through to the normal structural checks after eight
+        seconds.
+        """
+
+        if adapter.provider != "google_forms":
+            return
+        wait_for_selector = getattr(page, "wait_for_selector", None)
+        if not callable(wait_for_selector):
+            return
+        try:
+            await wait_for_selector(
+                _GOOGLE_FORM_CONTROL_SELECTOR,
+                state="visible",
+                timeout=_GOOGLE_FORM_RENDER_TIMEOUT_MS,
+            )
+        except Exception:
+            # Readiness is advisory. The provider adapter below remains the
+            # authority for login, checkpoint, ambiguity, and form-not-found
+            # outcomes, and returns only sanitized terminal messages.
+            return
+
+    @staticmethod
     def _attention(
         task: ResolvedBrowserTask,
         code: str,
@@ -615,6 +653,19 @@ class BrowserRuntime:
                 "A CAPTCHA, MFA prompt, or security checkpoint requires your attention.",
                 current_url=current_url,
             )
+
+        if (
+            task.provider == "google_forms"
+            and urlsplit(current_url).path.rstrip("/").endswith("/closedform")
+        ):
+            return self._attention(
+                task,
+                "application_form_closed",
+                "This Google Form is no longer accepting responses.",
+                current_url=current_url,
+            )
+
+        await self._wait_for_provider_form_render(page, adapter)
 
         preparation = await adapter.open_application(
             page,

@@ -267,6 +267,7 @@ def test_discovery_and_exact_form_review_are_wired_into_workspace() -> None:
         "form-application-id",
         "form-workflow-progress",
         "form-live-review-link",
+        "retry-form-scan",
         "form-revision-answers",
         "form-submit-preflight",
         "form-submit-preflight-status",
@@ -278,6 +279,16 @@ def test_discovery_and_exact_form_review_are_wired_into_workspace() -> None:
     assert 'body instanceof FormData' in APP_JS
     assert 'schema_hash: revision.schema_hash' in APP_JS
     assert 'form_revision_id: revision.id' in APP_JS
+    assert "function latestFormScanJob(applicationId)" in APP_JS
+    assert "function renderFormScanPlaceholder(applicationId)" in APP_JS
+    assert 'status.textContent = running ? "Capturing form" : "Waiting for worker"' in APP_JS
+    assert 'applicationStatus.textContent = running ? "Preparing form" : "Preparation queued"' in APP_JS
+    assert 'status.textContent = succeededWithoutRevision ? "No questions captured"' in APP_JS
+    assert 'applicationStatus.textContent = "Preparation needs attention"' in APP_JS
+    assert 'state.selectedFormApplicationId === applicationId && !latestFormRevision(applicationId)' in APP_JS
+    assert 'setFormScanRetry(applicationId, true)' in APP_JS
+    assert 'byId("retry-form-scan").addEventListener("click"' in APP_JS
+    assert 'if (selectedFormApplicationId && !selectedRevision) renderFormRevision(null)' in APP_JS
     assert 'loadJobs(true, identitySnapshot(), true)' in APP_JS
     assert 'state.jobsHasMore' in APP_JS
     assert 'apiRequest("/discovery/ats/boards"' in APP_JS
@@ -572,8 +583,8 @@ def test_groq_validation_displays_the_provider_status_instead_of_a_generic_error
 
 
 def test_local_frontend_assets_are_versioned_to_avoid_stale_validation_code() -> None:
-    assert 'href="/styles.css?v=20260814.1"' in INDEX_HTML
-    assert 'src="/app.js?v=20260814.1"' in INDEX_HTML
+    assert 'href="/styles.css?v=20260814.2"' in INDEX_HTML
+    assert 'src="/app.js?v=20260814.2"' in INDEX_HTML
 
 
 def test_ziprecruiter_is_not_presented_in_hosted_frontend() -> None:
