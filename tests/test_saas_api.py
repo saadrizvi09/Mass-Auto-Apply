@@ -359,6 +359,52 @@ def test_referral_ingestion_uses_tenant_derived_bulk_rpc() -> None:
     assert row["metadata"]["discovered"] is True
 
 
+def test_referral_digest_endpoint_returns_mixed_intake_summary() -> None:
+    def persisted(params: dict[str, Any]) -> dict[str, Any]:
+        rows = params["jobs_input"]
+        return {
+            "items": [{"id": str(uuid4()), **row} for row in rows],
+            "count": len(rows),
+            "inserted": len(rows),
+            "updated": 0,
+        }
+
+    store = FakeStore(rpc_results={"ingest_discovered_jobs": persisted})
+    response = TestClient(
+        create_app(settings=configured_settings(), auth=FakeAuth(), store=store)
+    ).post(
+        "/api/v1/discovery/referrals",
+        json={
+            "text": (
+                "Referral Alert\n"
+                "1) Company - Acme\nRole - Platform Intern\n"
+                "How to Apply: https://docs.google.com/forms/d/e/acme/viewform\n\n"
+                "2) Company - Beta AI\nRole - ML Intern\n"
+                "Email: careers@beta.example\nSubject: ML Intern\n\n"
+                "For Free Hiring Updates Join:\n"
+                "https://www.whatsapp.com/channel/example"
+            )
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["summary"] == {
+        "parsed": 2,
+        "saved": 2,
+        "google_forms": 1,
+        "email_apply": 1,
+        "ignored_promotional": 1,
+    }
+    rows = next(
+        params["jobs_input"]
+        for function, params in store.rpc_calls
+        if function == "ingest_discovered_jobs"
+    )
+    assert rows[0]["apply_url"] == "https://docs.google.com/forms/d/e/acme/viewform"
+    assert rows[1]["contact_email"] == "careers@beta.example"
+    assert all("whatsapp.com" not in row["description"] for row in rows)
+
+
 def test_csv_import_is_parsed_in_memory_and_bounded() -> None:
     store = FakeStore(
         rpc_results={
@@ -552,6 +598,199 @@ def test_managed_application_scan_creates_tenant_application_and_queues_scan() -
     assert data["application"]["channel"] == "ats"
     assert data["automation_job"]["id"] == queued_id
     assert store.rpc_calls[-1][1]["payload_input"] == {"job_id": job_id}
+
+
+def test_explicit_company_form_save_creates_service_binding_and_queues_scan() -> None:
+    queued_id = str(uuid4())
+    store = FakeStore(
+        {
+            "resumes": [
+                {
+                    "id": str(uuid4()),
+                    "user_id": str(USER_ID),
+                    "is_active": True,
+                    "storage_path": f"{USER_ID}/resume.pdf",
+                }
+            ]
+        },
+        rpc_results={"enqueue_automation_job": [{"id": queued_id, "status": "queued"}]},
+    )
+    settings = replace(
+        browser_settings(Fernet.generate_key().decode()),
+        allowed_browser_providers=("company_form",),
+    )
+    client = TestClient(create_app(settings=settings, auth=FakeAuth(), store=store))
+    saved = client.post(
+        "/api/v1/jobs",
+        json={
+            "title": "Platform Engineer",
+            "company": "Acme",
+            "description": "Build reliable platform systems for Acme customers.",
+            "apply_url": "https://Careers.Acme.com/jobs/42?source=manual#apply",
+            "metadata": {
+                "application_provider": "company_form",
+                "company_form_host": "evil.example",
+            },
+        },
+    )
+    assert saved.status_code == 201, saved.text
+    job = saved.json()["data"]
+    assert job["metadata"]["company_form_host"] == "careers.acme.com"
+    assert store.client.tables["company_form_targets"] == [
+        {
+            "id": store.client.tables["company_form_targets"][0]["id"],
+            "job_id": job["id"],
+            "user_id": str(USER_ID),
+            "source_url": "https://Careers.Acme.com/jobs/42?source=manual#apply",
+            "target_url": "https://careers.acme.com/jobs/42?source=manual",
+            "exact_host": "careers.acme.com",
+        }
+    ]
+
+    response = client.post(
+        f"/api/v1/jobs/{job['id']}/application/scan",
+        json={"idempotency_key": "company-scan-test-0001"},
+    )
+
+    assert response.status_code == 202, response.text
+    assert store.rpc_calls[-1][1]["provider_input"] == "company_form"
+    assert store.rpc_calls[-1][1]["payload_input"] == {
+        "job_id": job["id"],
+        "company_form_host": "careers.acme.com",
+        "company_form_target_url": "https://careers.acme.com/jobs/42?source=manual",
+    }
+
+
+def test_discovered_generic_url_without_service_binding_stays_manual() -> None:
+    job_id = str(uuid4())
+    store = FakeStore(
+        {
+            "jobs": [
+                {
+                    "id": job_id,
+                    "user_id": str(USER_ID),
+                    "apply_url": "https://careers.acme.com/apply",
+                    "metadata": {
+                        "application_provider": "company_form",
+                        "company_form_host": "careers.acme.com",
+                    },
+                }
+            ],
+            "resumes": [
+                {
+                    "id": str(uuid4()),
+                    "user_id": str(USER_ID),
+                    "is_active": True,
+                }
+            ],
+        }
+    )
+    settings = replace(
+        browser_settings(Fernet.generate_key().decode()),
+        allowed_browser_providers=("company_form",),
+    )
+
+    response = TestClient(
+        create_app(settings=settings, auth=FakeAuth(), store=store)
+    ).post(
+        f"/api/v1/jobs/{job_id}/application/scan",
+        json={"idempotency_key": "company-scan-test-0002"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "application_provider_unsupported"
+    assert store.rpc_calls == []
+
+
+@pytest.mark.parametrize(
+    ("revision_url", "expected_status"),
+    [
+        ("https://careers.acme.com/application/42?stage=questions", 202),
+        ("https://forms.evil.com/application/42", 409),
+    ],
+)
+def test_company_form_revision_may_move_path_but_never_exact_host(
+    revision_url: str, expected_status: int
+) -> None:
+    job_id = str(uuid4())
+    application_id = str(uuid4())
+    revision_id = str(uuid4())
+    schema_hash = "d" * 64
+    source_url = "https://careers.acme.com/jobs/42"
+    store = FakeStore(
+        {
+            "jobs": [
+                {
+                    "id": job_id,
+                    "user_id": str(USER_ID),
+                    "apply_url": source_url,
+                }
+            ],
+            "company_form_targets": [
+                {
+                    "job_id": job_id,
+                    "user_id": str(USER_ID),
+                    "source_url": source_url,
+                    "target_url": source_url,
+                    "exact_host": "careers.acme.com",
+                }
+            ],
+            "applications": [
+                {
+                    "id": application_id,
+                    "user_id": str(USER_ID),
+                    "job_id": job_id,
+                    "channel": "ats",
+                }
+            ],
+            "application_form_revisions": [
+                {
+                    "id": revision_id,
+                    "user_id": str(USER_ID),
+                    "application_id": application_id,
+                    "job_id": job_id,
+                    "provider": "company_form",
+                    "form_url": revision_url,
+                    "revision": 1,
+                    "schema_hash": schema_hash,
+                    "approved_revision": 1,
+                    "approved_schema_hash": schema_hash,
+                    "status": "approved",
+                    "approved_at": "2026-08-13T10:00:00Z",
+                    "question_schema": [
+                        {"key": "email", "label": "Email", "required": True}
+                    ],
+                    "answers": {"email": "owner@example.test"},
+                }
+            ],
+        },
+        rpc_results={
+            "enqueue_automation_job": [{"id": str(uuid4()), "status": "queued"}]
+        },
+    )
+    settings = replace(
+        browser_settings(Fernet.generate_key().decode()),
+        allowed_browser_providers=("company_form",),
+    )
+
+    response = TestClient(
+        create_app(settings=settings, auth=FakeAuth(), store=store)
+    ).post(
+        f"/api/v1/application-form-revisions/{revision_id}/submit",
+        json={
+            "idempotency_key": "company-submit-test-0001",
+            "form_revision_id": revision_id,
+        },
+    )
+
+    assert response.status_code == expected_status, response.text
+    if expected_status == 202:
+        payload = store.rpc_calls[-1][1]["payload_input"]
+        assert payload["company_form_host"] == "careers.acme.com"
+        assert payload["company_form_target_url"] == revision_url
+    else:
+        assert response.json()["error"]["code"] == "company_form_target_changed"
+        assert not any(call[0] == "enqueue_automation_job" for call in store.rpc_calls)
 
 
 def test_ziprecruiter_url_is_not_a_supported_managed_application() -> None:
@@ -844,8 +1083,21 @@ def test_submit_queues_only_the_approved_owned_revision() -> None:
                     "user_id": str(USER_ID),
                     "application_id": application_id,
                     "provider": "greenhouse",
+                    "revision": 1,
+                    "schema_hash": "a" * 64,
+                    "approved_revision": 1,
+                    "approved_schema_hash": "a" * 64,
                     "status": "approved",
                     "approved_at": "2026-08-11T10:00:00Z",
+                    "question_schema": [
+                        {
+                            "key": "email",
+                            "label": "Email address",
+                            "type": "email",
+                            "required": True,
+                        }
+                    ],
+                    "answers": {"Email address": "owner@example.test"},
                 }
             ],
             "connections": [
@@ -879,9 +1131,441 @@ def test_submit_queues_only_the_approved_owned_revision() -> None:
         "kind_input": "application_submit",
         "provider_input": "greenhouse",
         "application_id_input": application_id,
-        "payload_input": {"form_revision_id": revision_id},
+        "payload_input": {
+            "form_revision_id": revision_id,
+            "required_answer_preflight": {
+                "required_count": 1,
+                "answered_count": 1,
+                "missing_count": 0,
+                "missing_keys": [],
+                "missing_labels": [],
+                "resume_upload_keys": [],
+                "complete": True,
+            },
+        },
         "idempotency_key_input": "submit-test-0001",
     }
+
+
+def test_google_forms_allows_exact_approved_prefill_and_submit() -> None:
+    application_id = str(uuid4())
+    revision_id = str(uuid4())
+    store = FakeStore(
+        {
+            "applications": [
+                {"id": application_id, "user_id": str(USER_ID), "channel": "ats"}
+            ],
+            "application_form_revisions": [
+                {
+                    "id": revision_id,
+                    "user_id": str(USER_ID),
+                    "application_id": application_id,
+                    "provider": "google_forms",
+                    "revision": 1,
+                    "schema_hash": "b" * 64,
+                    "approved_revision": 1,
+                    "approved_schema_hash": "b" * 64,
+                    "status": "approved",
+                    "approved_at": "2026-08-13T10:00:00Z",
+                    "question_schema": [
+                        {
+                            "key": "graduation_year",
+                            "label": "Graduation Year",
+                            "type": "select",
+                            "required": True,
+                        },
+                        {
+                            "key": "resume_file",
+                            "label": "Upload Resume",
+                            "type": "file",
+                            "accepts_resume": True,
+                            "required": True,
+                        },
+                    ],
+                    "answers": {"Graduation Year": "2026"},
+                }
+            ],
+        },
+        rpc_results={
+            "enqueue_automation_job": [{"id": str(uuid4()), "status": "queued"}]
+        },
+    )
+    settings = replace(
+        browser_settings(Fernet.generate_key().decode()),
+        allowed_browser_providers=("google_forms",),
+    )
+    client = TestClient(create_app(settings=settings, auth=FakeAuth(), store=store))
+
+    prefill = client.post(
+        f"/api/v1/application-form-revisions/{revision_id}/prefill",
+        json={
+            "idempotency_key": "google-prefill-test-0001",
+            "form_revision_id": revision_id,
+        },
+    )
+    assert prefill.status_code == 202, prefill.text
+    assert store.rpc_calls[-1][1]["kind_input"] == "application_prefill"
+
+    submit = client.post(
+        f"/api/v1/application-form-revisions/{revision_id}/submit",
+        json={
+            "idempotency_key": "google-submit-test-0001",
+            "form_revision_id": revision_id,
+        },
+    )
+    assert submit.status_code == 202, submit.text
+    enqueue_calls = [call for call in store.rpc_calls if call[0] == "enqueue_automation_job"]
+    assert len(enqueue_calls) == 2
+    assert enqueue_calls[-1][1]["kind_input"] == "application_submit"
+    assert enqueue_calls[-1][1]["payload_input"] == {
+        "form_revision_id": revision_id,
+        "required_answer_preflight": {
+            "required_count": 2,
+            "answered_count": 2,
+            "missing_count": 0,
+            "missing_keys": [],
+            "missing_labels": [],
+            "resume_upload_keys": ["resume_file"],
+            "complete": True,
+        },
+    }
+
+
+def test_google_forms_submit_blocks_missing_public_resume_link_before_queueing() -> None:
+    application_id = str(uuid4())
+    revision_id = str(uuid4())
+    schema_hash = "c" * 64
+    store = FakeStore(
+        {
+            "applications": [
+                {"id": application_id, "user_id": str(USER_ID), "channel": "ats"}
+            ],
+            "application_form_revisions": [
+                {
+                    "id": revision_id,
+                    "user_id": str(USER_ID),
+                    "application_id": application_id,
+                    "provider": "google_forms",
+                    "revision": 2,
+                    "schema_hash": schema_hash,
+                    "approved_revision": 2,
+                    "approved_schema_hash": schema_hash,
+                    "status": "approved",
+                    "approved_at": "2026-08-13T10:00:00Z",
+                    "question_schema": [
+                        {
+                            "key": "graduation_year",
+                            "label": "Graduation Year",
+                            "type": "select",
+                            "required": True,
+                        },
+                        {
+                            "key": "resume_link",
+                            "label": "Resume Link",
+                            "type": "url",
+                            "required": True,
+                        },
+                    ],
+                    "answers": {
+                        "graduation_year": "2026",
+                        "resume_link": "",
+                    },
+                }
+            ],
+        },
+        rpc_results={
+            "enqueue_automation_job": [{"id": str(uuid4()), "status": "queued"}]
+        },
+    )
+    settings = replace(
+        browser_settings(Fernet.generate_key().decode()),
+        allowed_browser_providers=("google_forms",),
+    )
+
+    response = TestClient(
+        create_app(settings=settings, auth=FakeAuth(), store=store)
+    ).post(
+        f"/api/v1/application-form-revisions/{revision_id}/submit",
+        json={
+            "idempotency_key": "google-submit-missing-resume-link",
+            "form_revision_id": revision_id,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "form_required_answers_missing"
+    assert "Resume Link" in response.json()["error"]["message"]
+    assert "storage_path" not in response.text
+    assert not any(call[0] == "enqueue_automation_job" for call in store.rpc_calls)
+
+
+def test_form_revision_listing_hydrates_saved_profile_facts_only_before_approval() -> None:
+    application_id = str(uuid4())
+    draft_id = str(uuid4())
+    sealed_id = str(uuid4())
+    profile_url = "https://drive.google.com/file/d/resume-id/view?usp=sharing"
+    schema = [
+        {"key": "resume_link", "label": "Resume Link", "type": "url", "required": True},
+        {
+            "key": "graduation_year",
+            "label": "Graduation Year",
+            "type": "listbox",
+            "options": ["2025", "2026", "2027"],
+            "required": True,
+        },
+    ]
+    store = FakeStore(
+        {
+            "profiles": [
+                {
+                    "user_id": str(USER_ID),
+                    "resume_url": profile_url,
+                    "graduation_year": 2026,
+                }
+            ],
+            "applications": [
+                {"id": application_id, "user_id": str(USER_ID), "channel": "ats"}
+            ],
+            "application_form_revisions": [
+                {
+                    "id": sealed_id,
+                    "user_id": str(USER_ID),
+                    "application_id": application_id,
+                    "status": "approved",
+                    "approved_at": "2026-08-13T10:00:00Z",
+                    "question_schema": schema,
+                    "answers": {"resume_link": ""},
+                    "created_at": "2026-08-13T10:00:00Z",
+                },
+                {
+                    "id": draft_id,
+                    "user_id": str(USER_ID),
+                    "application_id": application_id,
+                    "status": "scanned",
+                    "approved_at": None,
+                    "question_schema": schema,
+                    "answers": {},
+                    "created_at": "2026-08-13T11:00:00Z",
+                },
+            ],
+        }
+    )
+
+    response = TestClient(
+        create_app(
+            settings=browser_settings(Fernet.generate_key().decode()),
+            auth=FakeAuth(),
+            store=store,
+        )
+    ).get(f"/api/v1/applications/{application_id}/form-revisions")
+
+    assert response.status_code == 200, response.text
+    by_id = {row["id"]: row for row in response.json()["items"]}
+    assert by_id[draft_id]["profile_answers"] == {
+        "resume_link": profile_url,
+        "graduation_year": "2026",
+    }
+    # A later profile edit must never rewrite what an approved worker snapshot
+    # displays or submits.
+    assert by_id[sealed_id]["profile_answers"] == {}
+
+
+def test_saving_profile_refreshes_prepared_answers_as_a_new_review_revision() -> None:
+    application_id = str(uuid4())
+    revision_id = str(uuid4())
+    profile_url = "https://drive.google.com/file/d/new-resume/view?usp=sharing"
+    store = FakeStore(
+        {
+            "profiles": [{"user_id": str(USER_ID), "resume_url": None}],
+            "application_form_revisions": [
+                {
+                    "id": revision_id,
+                    "user_id": str(USER_ID),
+                    "application_id": application_id,
+                    "status": "approved",
+                    "revision": 3,
+                    "schema_hash": "e" * 64,
+                    "question_schema": [
+                        {
+                            "key": "resume_link",
+                            "label": "Resume Link",
+                            "type": "url",
+                            "required": True,
+                        }
+                    ],
+                    "answers": {"resume_link": ""},
+                    "created_at": "2026-08-13T10:00:00Z",
+                }
+            ],
+        }
+    )
+
+    response = TestClient(
+        create_app(
+            settings=browser_settings(Fernet.generate_key().decode()),
+            auth=FakeAuth(),
+            store=store,
+        )
+    ).patch("/api/v1/profile", json={"resume_url": profile_url})
+
+    assert response.status_code == 200, response.text
+    sync_calls = [
+        params
+        for name, params in store.rpc_calls
+        if name == "refresh_application_form_profile_answers_for_user"
+    ]
+    assert sync_calls == [
+        {
+            "user_id_input": str(USER_ID),
+            "revision_id_input": revision_id,
+            "expected_revision_input": 3,
+            "expected_schema_hash_input": "e" * 64,
+            "answers_input": {"resume_link": profile_url},
+        }
+    ]
+
+
+def test_saving_unchanged_profile_fact_does_not_churn_form_revisions() -> None:
+    application_id = str(uuid4())
+    revision_id = str(uuid4())
+    profile_url = "https://drive.google.com/file/d/resume/view?usp=sharing"
+    store = FakeStore(
+        {
+            "profiles": [{"user_id": str(USER_ID), "resume_url": profile_url}],
+            "application_form_revisions": [
+                {
+                    "id": revision_id,
+                    "user_id": str(USER_ID),
+                    "application_id": application_id,
+                    "status": "prefilled",
+                    "revision": 1,
+                    "schema_hash": "f" * 64,
+                    "question_schema": [
+                        {"key": "resume_link", "label": "Resume Link", "type": "url"}
+                    ],
+                    "answers": {"resume_link": profile_url},
+                    "created_at": "2026-08-13T10:00:00Z",
+                }
+            ],
+        }
+    )
+
+    response = TestClient(
+        create_app(
+            settings=browser_settings(Fernet.generate_key().decode()),
+            auth=FakeAuth(),
+            store=store,
+        )
+    ).patch("/api/v1/profile", json={"resume_url": profile_url})
+
+    assert response.status_code == 200, response.text
+    assert not any(
+        name == "refresh_application_form_profile_answers_for_user"
+        for name, _params in store.rpc_calls
+    )
+
+
+def test_form_suggest_returns_deterministic_profile_answers_without_groq_or_quota() -> None:
+    application_id = str(uuid4())
+    job_id = str(uuid4())
+    resume_id = str(uuid4())
+    revision_id = str(uuid4())
+    resume_url = "https://drive.google.com/file/d/resume/view?usp=sharing"
+    store = FakeStore(
+        {
+            "applications": [
+                {"id": application_id, "user_id": str(USER_ID), "job_id": job_id}
+            ],
+            "jobs": [{"id": job_id, "user_id": str(USER_ID), "title": "Engineer"}],
+            "resumes": [
+                {
+                    "id": resume_id,
+                    "user_id": str(USER_ID),
+                    "parse_status": "parsed",
+                    "parsed_text": "Candidate graduates in 2026.",
+                }
+            ],
+            "profiles": [
+                {
+                    "user_id": str(USER_ID),
+                    "resume_url": resume_url,
+                    "graduation_year": 2026,
+                }
+            ],
+            "application_form_revisions": [
+                {
+                    "id": revision_id,
+                    "user_id": str(USER_ID),
+                    "application_id": application_id,
+                    "job_id": job_id,
+                    "resume_id": resume_id,
+                    "revision": 1,
+                    "schema_hash": "a" * 64,
+                    "status": "scanned",
+                    "question_schema": [
+                        {
+                            "key": "year",
+                            "label": "Graduation Year",
+                            "type": "listbox",
+                            "options": ["2025", "2026", "2027"],
+                        },
+                        {"key": "resume", "label": "Resume Link", "type": "url"},
+                    ],
+                }
+            ],
+        }
+    )
+
+    response = TestClient(
+        create_app(settings=configured_settings(), auth=FakeAuth(), store=store)
+    ).post(f"/api/v1/application-form-revisions/{revision_id}/suggest")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"] == {
+        "revision_id": revision_id,
+        "revision": 1,
+        "schema_hash": "a" * 64,
+        "answers": {"year": "2026", "resume": resume_url},
+        "source": "profile",
+    }
+    assert not any(name == "reserve_groq_request" for name, _ in store.rpc_calls)
+
+
+def test_application_listing_can_filter_one_valid_channel_before_pagination() -> None:
+    applications = [
+        {
+            "id": str(uuid4()),
+            "user_id": str(USER_ID),
+            "channel": "ats",
+            "status": "draft_pending",
+        },
+        {
+            "id": str(uuid4()),
+            "user_id": str(USER_ID),
+            "channel": "email",
+            "status": "drafted",
+        },
+        {
+            "id": str(uuid4()),
+            "user_id": str(USER_ID),
+            "channel": "manual",
+            "status": "draft_pending",
+        },
+    ]
+    client = TestClient(
+        create_app(
+            settings=configured_settings(),
+            auth=FakeAuth(),
+            store=FakeStore({"applications": applications}),
+        )
+    )
+
+    email = client.get("/api/v1/applications?channel=email&limit=1")
+    assert email.status_code == 200, email.text
+    assert [row["channel"] for row in email.json()["items"]] == ["email"]
+
+    invalid = client.get("/api/v1/applications?channel=social")
+    assert invalid.status_code == 422, invalid.text
 
 
 def test_openapi_contract_is_buildable() -> None:

@@ -31,6 +31,7 @@ from worker.providers.base import (
     canonical_form_target,
     checkpoint_present,
     fill_approved,
+    resume_upload_guard_issue,
     safe_form_url,
     scan_form,
 )
@@ -49,7 +50,33 @@ _MAX_RESUME_BYTES = 6 * 1024 * 1024
 # window for reviewed prefills.
 _BROWSER_SESSION_TIMEOUT_SECONDS = 300
 _PUBLIC_SESSION_PROVIDERS = frozenset(
-    {"google_forms", "greenhouse", "lever", "ashby"}
+    {"company_form", "google_forms", "greenhouse", "lever", "ashby"}
+)
+_RETAINED_SUBMIT_PROVIDERS = frozenset({"company_form", "google_forms", "yc"})
+_SUBMIT_LIVE_VIEW_CODES = frozenset(
+    {
+        "provider_login_required",
+        "provider_redirect_blocked",
+        "security_checkpoint",
+        "application_entry_ambiguous",
+        "application_entry_unavailable",
+        "application_entry_unconfirmed",
+        "application_form_not_found",
+        "application_form_ambiguous",
+        "form_approval_required",
+        "form_schema_changed",
+        "required_answers_missing",
+        "file_upload_inspection_failed",
+        "required_file_upload_unsupported",
+        "provider_file_picker_unsupported",
+        "resume_upload_ambiguous",
+        "resume_upload_unsupported",
+        "final_action_ambiguous",
+        "submission_click_unconfirmed",
+        "provider_redirect_blocked_after_submit",
+        "security_checkpoint_after_submit",
+        "submission_unconfirmed",
+    }
 )
 
 
@@ -150,6 +177,10 @@ class BrowserExecution:
 
     def details(self) -> dict[str, Any]:
         details = self.result.details()
+        if self.result.missing_required:
+            # ``missing_required`` is retained for compatibility; ``missing_fields``
+            # is the actionable UI contract used by form-review surfaces.
+            details["missing_fields"] = list(self.result.missing_required)
         if self.review_session_id is not None:
             details["review_session_id"] = self.review_session_id
         if self.live_view_url is not None:
@@ -628,12 +659,37 @@ class BrowserRuntime:
                 "The provider form identity could not be preserved safely.",
                 current_url=current_url,
             )
-        schema = bind_schema_to_target(await scan_form(form_root), canonical_target)
+        schema = bind_schema_to_target(
+            await scan_form(form_root, provider=task.provider), canonical_target
+        )
         if not schema.fields:
             return self._attention(
                 task,
                 "application_form_not_found",
                 "No supported application fields were found on this page.",
+                schema=schema,
+                current_url=current_url,
+            )
+        upload_issue = await resume_upload_guard_issue(form_root, schema)
+        if upload_issue is not None:
+            code, message = upload_issue
+            return self._attention(
+                task,
+                code,
+                message,
+                schema=schema,
+                current_url=current_url,
+            )
+        if (
+            task.provider == "google_forms"
+            and task.phase != "scan"
+            and task.context_id is None
+            and any(field.is_resume_upload for field in schema.fields)
+        ):
+            return self._attention(
+                task,
+                "provider_login_required",
+                "Connect an isolated Google browser session before filling this form's signed-in résumé upload.",
                 schema=schema,
                 current_url=current_url,
             )
@@ -832,8 +888,16 @@ class BrowserRuntime:
         resume_path: str | None,
         before_submit: Any | None = None,
     ) -> BrowserExecution:
-        adapter = get_adapter(task.provider)
+        adapter = get_adapter(task.provider, target_url=task.target_url)
         if adapter is None:
+            if task.provider == "company_form":
+                return BrowserExecution(
+                    self._attention(
+                        task,
+                        "provider_url_forbidden",
+                        "Custom company forms must use a public HTTPS DNS host without credentials, IP addresses, or explicit ports.",
+                    )
+                )
             return BrowserExecution(
                 self._attention(
                     task,
@@ -851,7 +915,9 @@ class BrowserRuntime:
                 )
             )
 
-        keep_alive = task.phase == "prefill"
+        keep_alive = task.phase == "prefill" or (
+            task.provider in _RETAINED_SUBMIT_PROVIDERS and task.phase == "submit"
+        )
         metadata = {
             "user_id": task.user_id,
             "job_id": task.job_id,
@@ -875,55 +941,92 @@ class BrowserRuntime:
         retain_session = False
         browser: Any | None = None
         page: Any | None = None
+        final_action_execution: BrowserExecution | None = None
         try:
-            async with self.playwright_factory() as playwright:
-                browser = await playwright.chromium.connect_over_cdp(
-                    session.connect_url,
-                    timeout=30_000,
-                )
-                contexts = browser.contexts
-                context = contexts[0] if contexts else await browser.new_context()
-                pages = context.pages
-                page = pages[0] if pages else await context.new_page()
-                try:
-                    result = await self._run_page(
-                        page,
-                        adapter,
-                        task,
-                        resume_path,
-                        before_submit,
+            try:
+                async with self.playwright_factory() as playwright:
+                    browser = await playwright.chromium.connect_over_cdp(
+                        session.connect_url,
+                        timeout=30_000,
                     )
-
-                    live_view_url: str | None = None
-                    if task.phase == "prefill" and result.code == "review_required":
-                        live = await asyncio.to_thread(
-                            self.browserbase.get_session_live_view, session.id
+                    contexts = browser.contexts
+                    context = contexts[0] if contexts else await browser.new_context()
+                    pages = context.pages
+                    page = pages[0] if pages else await context.new_page()
+                    result: ProviderResult | None = None
+                    try:
+                        result = await self._run_page(
+                            page,
+                            adapter,
+                            task,
+                            resume_path,
+                            before_submit,
                         )
-                        live_view_url = live.get("live_view_url")
-                        retain_session = bool(live_view_url)
-                        if retain_session:
-                            return BrowserExecution(
-                                result,
-                                review_session_id=session.id,
-                                live_view_url=live_view_url,
-                            )
-                    return BrowserExecution(result)
-                finally:
-                    # Drain registered route callbacks before Playwright
-                    # disconnects. ``ignoreErrors`` applies only to callbacks
-                    # already in flight; unrelated unroute failures still fail
-                    # the task closed.
-                    unroute_all = getattr(page, "unroute_all", None)
-                    if callable(unroute_all):
-                        try:
-                            await unroute_all(behavior="ignoreErrors")
-                        except Exception as exc:
-                            if not _is_closed_target_error(exc):
-                                raise
+                        execution = BrowserExecution(result)
+                        if result.submission_state in {"confirmed", "uncertain"}:
+                            final_action_execution = execution
+
+                        live_view_url: str | None = None
+                        wants_live_view = (
+                            task.phase == "prefill" and result.code == "review_required"
+                        ) or (
+                            task.provider in _RETAINED_SUBMIT_PROVIDERS
+                            and task.phase == "submit"
+                            and result.status == "needs_attention"
+                            and result.code in _SUBMIT_LIVE_VIEW_CODES
+                        )
+                        if wants_live_view:
+                            try:
+                                live = await asyncio.to_thread(
+                                    self.browserbase.get_session_live_view, session.id
+                                )
+                                live_view_url = live.get("live_view_url")
+                            except Exception:
+                                # Live View is observability only. In particular,
+                                # an outage after a Submit click must never bubble
+                                # into the queue retry path and risk a duplicate.
+                                live_view_url = None
+                            retain_session = bool(live_view_url)
+                            if retain_session:
+                                execution = BrowserExecution(
+                                    result,
+                                    review_session_id=session.id,
+                                    live_view_url=live_view_url,
+                                )
+                                if result.submission_state in {"confirmed", "uncertain"}:
+                                    final_action_execution = execution
+                                return execution
+                        return execution
+                    finally:
+                        # Drain registered route callbacks before Playwright
+                        # disconnects. ``ignoreErrors`` applies only to callbacks
+                        # already in flight; unrelated unroute failures still fail
+                        # the task closed unless a final click may already have run.
+                        unroute_all = getattr(page, "unroute_all", None)
+                        if callable(unroute_all):
+                            try:
+                                await unroute_all(behavior="ignoreErrors")
+                            except Exception as exc:
+                                final_action_may_have_happened = (
+                                    result is not None
+                                    and result.submission_state in {"confirmed", "uncertain"}
+                                )
+                                if (
+                                    not _is_closed_target_error(exc)
+                                    and not final_action_may_have_happened
+                                ):
+                                    raise
+            except Exception:
+                if final_action_execution is not None:
+                    # Playwright teardown can fail after the provider received the
+                    # click. Preserve the terminal outcome instead of asking the
+                    # queue to repeat an inherently ambiguous final action.
+                    return final_action_execution
+                raise
         finally:
-            # ``browser.close()`` explicitly terminates a Browserbase session.  A
-            # prefill Live View must instead disconnect through Playwright teardown
-            # and let keepAlive preserve the bounded review session.
+            # ``browser.close()`` explicitly terminates a Browserbase session. A
+            # retained review/attention Live View instead disconnects through
+            # Playwright teardown and lets keepAlive preserve the bounded session.
             if browser is not None and not retain_session:
                 try:
                     await browser.close()

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
+import unicodedata
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
@@ -26,6 +28,14 @@ DISCOVERY_JOB_KINDS: tuple[str, ...] = (
 )
 _MAX_BATCH = 200
 _MAX_BATCH_BYTES = 1_500_000
+_MAX_SEARCH_TERMS = 20
+_MAX_SEARCH_TERM_LENGTH = 100
+_SEARCHABLE_FIELDS: tuple[str, ...] = (
+    "title",
+    "company",
+    "location",
+    "description",
+)
 
 
 class DiscoveryRepository(Protocol):
@@ -38,6 +48,51 @@ def _bounded_int(value: Any, default: int, maximum: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
         raise ValueError("discovery limit is invalid")
     return value
+
+
+def _normalize_search_text(value: str) -> str:
+    """Make punctuation-insensitive text whose spaces remain word boundaries."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(re.findall(r"[^\W_]+", normalized, flags=re.UNICODE))
+
+
+def _validated_search_terms(value: Any) -> tuple[str, ...]:
+    """Validate an optional, untrusted worker payload and normalize its phrases."""
+
+    if value is None:
+        return ()
+    if not isinstance(value, list) or len(value) > _MAX_SEARCH_TERMS:
+        raise ValueError("public feed search terms are invalid")
+
+    terms: list[str] = []
+    for raw_term in value:
+        if (
+            not isinstance(raw_term, str)
+            or not 1 <= len(raw_term.strip()) <= _MAX_SEARCH_TERM_LENGTH
+        ):
+            raise ValueError("public feed search terms are invalid")
+        term = _normalize_search_text(raw_term)
+        if not term:
+            raise ValueError("public feed search terms are invalid")
+        if term not in terms:
+            terms.append(term)
+    return tuple(terms)
+
+
+def _matches_search_terms(item: Mapping[str, Any], terms: tuple[str, ...]) -> bool:
+    if not terms:
+        return True
+    fields = [
+        _normalize_search_text(value)
+        for field in _SEARCHABLE_FIELDS
+        if isinstance((value := item.get(field)), str) and value
+    ]
+    return any(
+        f" {term} " in f" {field_text} "
+        for term in terms
+        for field_text in fields
+    )
 
 
 def _serialize_job(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -110,6 +165,7 @@ class DiscoveryJobHandler:
             raise ValueError("discovery sources are invalid")
         sources = list(dict.fromkeys(raw_sources))
         limit = _bounded_int(payload.get("limit"), 60, _MAX_BATCH)
+        search_terms = _validated_search_terms(payload.get("search_terms"))
         buckets: list[tuple[str, list[Mapping[str, Any]]]] = []
         errors: list[dict[str, str]] = []
         for source in sources:
@@ -122,7 +178,15 @@ class DiscoveryJobHandler:
                 errors.append({"source": source, "code": "source_unavailable"})
                 continue
             buckets.append(
-                (source, [item for item in found if isinstance(item, Mapping)])
+                (
+                    source,
+                    [
+                        item
+                        for item in found
+                        if isinstance(item, Mapping)
+                        and _matches_search_terms(item, search_terms)
+                    ],
+                )
             )
 
         # A busy Telegram catalog must not starve RSS (or vice versa).  Merge one

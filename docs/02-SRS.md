@@ -3,7 +3,7 @@
 ## AutoApply Cloud 2.0
 
 **Status:** Implementation baseline
-**Date:** 2026-08-11
+**Date:** 2026-08-13
 
 ## 1. System boundary
 
@@ -13,9 +13,10 @@ AutoApply Cloud consists of:
 2. a stateless FastAPI API deployed as a Vercel Function;
 3. Supabase Auth, Postgres, and private Storage;
 4. Google OAuth and Gmail API integration;
-5. credential-free discovery/import adapters;
-6. a durable job table and separately deployable Python worker; and
-7. optional managed-browser contexts for explicitly permitted providers.
+5. transient, user-supplied Groq and Hunter integrations;
+6. credential-free discovery/import adapters;
+7. a durable job table and separately deployable Python worker; and
+8. optional managed-browser contexts for explicitly permitted providers.
 
 The legacy local application remains a development/reference implementation and is not
 loaded by the Vercel entrypoint.
@@ -25,7 +26,8 @@ loaded by the Vercel entrypoint.
 - **Anonymous visitor:** may view the landing page, product configuration, health, terms,
   and privacy information.
 - **Authenticated user:** owns a profile, résumés, connections, jobs, applications,
-  drafts, answer bank, audit history, and queued work.
+  drafts, answer bank, audit history, and queued work; may hold Groq and Hunter keys in
+  their own browser for explicit provider requests.
 - **Worker:** trusted service authenticated with the Supabase secret key; may claim jobs
   but must bind every operation to the claimed row's stored `user_id`.
 - **Operator:** configures Vercel/Supabase/Google/Browserbase and reviews operational
@@ -56,6 +58,13 @@ loaded by the Vercel entrypoint.
 - **PROF-03:** The API shall return onboarding completion/missing-field state.
 - **PROF-04:** Hard-coded owner-specific geography, education, work authorization, and
   experience assumptions shall not be used in generated answers.
+- **PROF-05:** The profile shall store an optional user-provided public HTTPS
+  `resume_url` separately from private résumé Storage metadata. It shall never be
+  populated from a private object path, an expiring signed URL, or an inferred PDF link.
+- **PROF-06:** Recognized passout/graduation-year application questions shall map
+  deterministically to the reviewed `graduation_year` fact. Recognized résumé/CV URL
+  questions shall map deterministically only to `resume_url`; absent facts shall remain
+  unanswered for review.
 
 ### RES — résumé
 
@@ -89,6 +98,33 @@ loaded by the Vercel entrypoint.
 - **AI-09:** Groq local-storage keys shall be namespaced by authenticated user ID.
   Sign-out shall preserve the signed-out user's key; explicit removal and successful
   account deletion shall remove it. Clearing browser site data also removes it.
+- **AI-10:** `POST /api/v1/discovery/resume-guided` shall use the transient Groq key
+  and the owned active parsed résumé/profile to derive bounded roles and search terms,
+  return those terms for inspection, and enqueue public discovery without copying the
+  key into either automation-job payload.
+- **AI-11:** Batch draft generation shall remain a browser-orchestrated sequence of
+  existing owned-job draft requests. Every generated application shall remain editable
+  and require its own exact-content approval.
+
+### HUNT — browser-held Hunter contact lookup
+
+- **HUNT-01:** The frontend shall store an optional Hunter key only in origin-scoped,
+  authenticated-user-namespaced local storage and shall mask and delete it on the same
+  explicit browser/account lifecycle boundaries documented for browser-held keys.
+- **HUNT-02:** Authenticated Hunter requests shall transmit the key only over HTTPS in
+  `X-Hunter-Api-Key`; the key shall not enter a URL, database row, analytics event,
+  application log, provider error, or API response.
+- **HUNT-03:** `POST /api/v1/hunter/validate` shall make one bounded account check and
+  return only validity, safe status, and an allowlisted current quota summary.
+- **HUNT-04:** `POST /api/v1/jobs/{job_id}/contacts/hunter` shall enforce job ownership,
+  require the owned job's company name, accept a contact limit from 1 through 10, and
+  request HR-department contacts only.
+- **HUNT-05:** Contact results shall expose only bounded email, name, position,
+  confidence, verification status, and domain fields. The user shall choose a contact;
+  lookup shall not approve a draft or send a message.
+- **HUNT-06:** Hunter calls shall be explicit foreground requests. No operator Hunter
+  key, durable Hunter job, unattended contact crawl, or server-side key persistence
+  shall exist.
 
 ### JOB — jobs and applications
 
@@ -132,6 +168,35 @@ loaded by the Vercel entrypoint.
 - **DISC-09:** Every accepted candidate shall be tenant-owned and idempotently
   deduplicated by normalized URL when present. One tenant's discovery preferences,
   source cursors, or results shall never affect another tenant.
+- **DISC-10:** `POST /api/v1/discovery/resume-guided` shall require an active parsed
+  owned résumé and a transient Groq key, accept bounded location/remote/result options
+  plus an idempotency key, and return HTTP 202 with an inspectable plan and two redacted
+  automation jobs.
+- **DISC-11:** The guided plan shall prefer saved target roles, then Groq-analyzed roles,
+  then deterministic résumé recommendations; combine bounded analyzed and saved skills;
+  and choose the request, discovery preference, profile, or `India` location in that
+  order.
+- **DISC-12:** Guided discovery shall enqueue one `discover_linkedin_guest` job using
+  the first role and one `discover_public_feeds` job for `telegram` and `rss`. Child
+  idempotency keys shall be deterministically derived from the supplied key.
+- **DISC-13:** The public-feed worker shall validate the bounded search-term list and
+  retain only Telegram/RSS candidates whose searchable text matches at least one term
+  before source interleaving, deduplication, and the global cap. An unfiltered manual
+  public-feed run shall retain its existing behavior.
+- **DISC-14:** `GET /api/v1/discovery/google-forms` shall return a bounded, paginated,
+  tenant-scoped queue of direct saved Google Forms and form URLs discovered in job
+  metadata, deduplicate by normalized URL, use stable item IDs, and link the latest
+  existing application for a saved job. Queue reads shall not enqueue scans.
+- **DISC-15:** Form Pilot Stage 01 shall accept either one Google Form URL or a complete
+  referral message. Referral parsing shall split numbered postings and extract labeled
+  Company, Role, Batch, CTC/Stipend/compensation, Location, application URL, application
+  email, subject, and CC fields when present.
+- **DISC-16:** Referral parsing shall exclude recognized WhatsApp/channel, Telegram,
+  Topmate, paid-group, and premium-referral promotion links/tails from actionable
+  application routes. Google Form routes shall appear in Form Pilot; email-address
+  routes shall become saved jobs available in Mass Cold Email.
+- **DISC-17:** Referral parsing shall return bounded routing counts and shall not scan,
+  prepare, approve, prefill, submit, draft, or send as a side effect.
 
 ### MAIL — Gmail connection and reviewed sending
 
@@ -197,6 +262,19 @@ loaded by the Vercel entrypoint.
 - **MAIL-24:** Public production guidance shall distinguish preview testing from
   publication and Google's brand/domain and sensitive-scope verification expectations
   for the owner of each OAuth project.
+- **MAIL-25:** The **Mass Cold Email** sidebar destination shall contain **Build
+  campaign** and **Review & send** subtabs rather than exposing review as a separate
+  primary-navigation item. Both subtabs shall include email-channel applications only;
+  ATS/form revisions and form answers belong to Form Pilot. Mass Cold Email may collect
+  at most 10 selected jobs, but the backend shall continue to expose only the existing
+  one-application send operation. The browser shall invoke it sequentially for
+  individually approved email applications after an explicit final confirmation.
+- **MAIL-26:** Every send in that sequence shall independently revalidate ownership,
+  exact approval, recipient/content, Gmail connection, active résumé, user daily cap,
+  provider-account cap, duplicate-recipient window, and send idempotency reservation.
+  A UI batch shall not weaken, pre-reserve around, or bypass any gate.
+- **MAIL-27:** The product shall not generate approval from batch selection and shall
+  expose no autonomous, delayed, or unreviewed bulk cold-email endpoint.
 
 ### CONN — provider connection center
 
@@ -221,41 +299,60 @@ loaded by the Vercel entrypoint.
   configured, the operator allowlists it, and its current flow is validated with a
   controlled test account/job.
 - **CONN-11:** Connection availability shall not imply application capability. The
-  catalog shall report Greenhouse and one-page Google Forms as the initial aligned
-  handlers; Lever and Ashby as read-only-scan validated but pending controlled
-  prefill/submit canaries, Wellfound as pending a signed-in canary; and YC,
-  Cutshort, and Instahyre as connection-only until tenant-aware multi-step state
-  machines exist. Multi-page or branching Google Forms shall remain unavailable.
+  catalog shall report Greenhouse as an aligned managed-browser handler and one-page
+  Google Forms as scan plus explicit exact-approved background submit with verified
+  confirmation and needs-attention-only Live View; Lever and Ashby as read-only-scan
+  validated but pending controlled submit canaries; Wellfound as pending a signed-in
+  canary; YC as adapter-implemented but controlled-canary gated; and Cutshort and
+  Instahyre as connection-only until tenant-aware multi-step state machines exist. The
+  generic exact-host company-form adapter shall remain internal/gated and absent from
+  the public catalog. Multi-page or branching Google Forms shall remain unavailable.
 
 ### FORM — immutable application-form review
 
 - **FORM-01:** `application_scan` shall inspect one owned job/application URL and persist
   a new form revision containing the detected provider, target URL, exact field schema,
-  proposed answer values, selected résumé ID, and deterministic content/schema hashes.
+  provider-observed values, selected résumé ID, and deterministic content/schema hashes.
+  Groq suggestions shall not be persisted by the scan worker.
 - **FORM-02:** Form ownership, provider/URL, résumé, detected schema, and revision number
   are immutable. The first approval may atomically replace proposed answers with the
   exact reviewed answer object and then seal it; every subsequent answer change, résumé
   or URL change, or newly observed schema shall create a new revision.
 - **FORM-03:** Approval shall name an exact owned revision and its expected hashes. A
   stale or mismatched revision/hash shall fail closed without queueing browser work.
-- **FORM-04:** Before approval, users may request Groq answer suggestions using their
-  transient browser-held key. Suggestions shall use only the owned profile, linked
-  résumé, job, and captured non-sensitive questions and shall never persist or approve
-  themselves.
-- **FORM-04:** Approval shall not itself fill or submit a form.
-- **FORM-05:** `application_prefill` shall fill only values and résumé bytes bound to the
-  approved revision, then stop without activating a provider submit control.
-- **FORM-06:** `application_submit` shall be a separate explicit user request and shall
-  revalidate ownership, approval, revision/hash equality, URL/provider, and current
-  form schema before interacting with submit.
-- **FORM-07:** A required unanswered/sensitive/unknown field, changed schema, expired
+- **FORM-04:** When a newly scanned, unapproved revision is loaded and the authenticated
+  browser has a user-namespaced Groq key, the browser shall automatically request one
+  set of grounded answer suggestions. The request shall be deduplicated per revision,
+  use only the owned profile, linked résumé, job, and captured non-sensitive questions,
+  and keep the key and suggested answers out of the worker payload. A missing/failed
+  Groq request shall leave the fields editable and expose a retry rather than blocking
+  manual review. Suggestions shall never approve themselves.
+- **FORM-05:** Calling the approval RPC alone shall not fill or submit a form. The normal
+  Form Pilot UI may intentionally compose exact approval and submit enqueue behind one
+  explicit **Approve & submit in background** action.
+- **FORM-06:** `application_prefill` shall remain an observable diagnostic/canary path:
+  it fills only values and résumé bytes bound to an approved revision and never
+  activates the provider submit control. It is not the normal Google Forms completion
+  path.
+- **FORM-07:** The normal Google Forms action shall atomically seal the latest exact
+  revision, reject any incomplete required-answer preflight, and enqueue an idempotent
+  `application_submit` bound to that revision. A queued or running job shall never be
+  described as submitted.
+- **FORM-08:** A required unanswered/sensitive/unknown field, changed schema, expired
   login, CAPTCHA, MFA, security checkpoint, or ambiguous submission result shall stop
   as `needs_attention`; the worker shall never guess, bypass, or report assumed success.
-- **FORM-08:** A successful submit shall require provider-page confirmation evidence and
-  an idempotent terminal transition. A timeout after submit shall remain
-  `needs_attention` until reconciled and shall not be blindly retried.
-- **FORM-09:** Repeating the identical approval shall be idempotent; attempting to alter
+- **FORM-09:** For Google Forms and every separately enabled provider that permits a
+  worker submit phase, success shall require freshly observed provider-page confirmation
+  evidence and an idempotent terminal transition. The verified result contract is
+  `code=application_submitted` and `submission_state=confirmed`. A timeout or ambiguous
+  state after submit shall remain `needs_attention` and shall not be blindly retried.
+- **FORM-10:** Repeating the identical approval shall be idempotent; attempting to alter
   answers or hashes after approval shall fail and require a new revision.
+- **FORM-11:** Form Pilot shall own scanning, suggestion review, exact approval-bound
+  submission progress, verified confirmation, and any needs-attention Browserbase Live
+  View fallback for form-channel applications. It
+  shall not move Google Form revisions into **Mass Cold Email**, whose **Review & send**
+  subtab is reserved for email drafts.
 
 ### RUN — durable execution
 
@@ -274,6 +371,9 @@ loaded by the Vercel entrypoint.
   control jobs.
 - **RUN-10:** Application-form jobs shall reference an owned immutable form revision;
   queue payloads shall not be accepted as an alternate source of answers or approval.
+- **RUN-11:** Durable discovery payloads may contain bounded résumé-derived search
+  terms, but shall contain no résumé text, Groq key, Hunter key, contact candidates, or
+  draft message content.
 
 ### OPS — public operation
 
@@ -281,7 +381,8 @@ loaded by the Vercel entrypoint.
 - **OPS-02:** Errors shall use correct 4xx/5xx codes and a stable `{error:{code,message}}`
   shape with a request ID.
 - **OPS-03:** Logs shall exclude authorization headers, API keys, OAuth tokens, résumé
-  text, message bodies, and browser context secrets.
+  text, message bodies, browser context secrets, `X-Groq-Api-Key`, and
+  `X-Hunter-Api-Key`.
 - **OPS-04:** A clean deployment ignore list shall exclude local credentials, databases,
   PDFs, profiles, logs, screenshots, browser profiles, backups, and generated output.
 - **OPS-05:** Security headers shall include CSP, frame restrictions, MIME sniffing
@@ -305,8 +406,9 @@ loaded by the Vercel entrypoint.
 - **NFR-08 Data minimization:** only data required for visible user features is retained.
 - **NFR-09 Deletion:** disconnect/account deletion has documented provider and storage
   cleanup behavior.
-- **NFR-10 Rate control:** auth, AI validation/generation, OAuth start, and send endpoints
-  have abuse limits at the platform and/or database layer.
+- **NFR-10 Rate control:** auth, AI validation/generation, Hunter validation/contact
+  lookup, OAuth start, and send endpoints have bounds or abuse limits at the provider,
+  platform, and/or database layer.
 - **NFR-11 Launch assurance:** public promotion requires a real staging migration and
   cross-tenant RLS, Storage, send, OAuth lifecycle, deletion, and concurrency tests;
   local schema parsing and mocked tests are not substitutes.
@@ -317,9 +419,11 @@ loaded by the Vercel entrypoint.
   navigation/redirect against provider-specific HTTPS host allowlists and never fetch
   loopback, private, link-local, metadata-service, or credential-bearing URLs.
 - **NFR-14 Browser execution:** browser work requires a continuously running worker;
-  Vercel request lifetime or local disk shall never be used as the job scheduler.
+  it shall be deployed on a persistent process host outside Vercel. Vercel request
+  lifetime or local disk shall never be used as the job scheduler.
 - **NFR-15 Human checkpoints:** CAPTCHA and MFA are user/provider controls, not errors to
-  evade. The product shall pause visibly and provide a Live View/manual continuation.
+  evade. The product shall pause visibly and may provide a Live View/manual continuation
+  only as a `needs_attention` fallback.
 
 ## 5. Authorization matrix
 
@@ -328,6 +432,7 @@ loaded by the Vercel entrypoint.
 | Public config/health | Read | Read | Read |
 | Profile/settings | None | CRUD own | Explicit user-bound access |
 | Résumé metadata/object | None | CRUD own prefix | Explicit job-user access |
+| Browser-held Groq/Hunter keys | None | Local browser control; transient authenticated header use only | None |
 | Jobs/applications/drafts | None | CRUD own | Explicit job-user access |
 | Discovery preferences/results | None | CRUD/read own | Explicit claimed-job user access |
 | Form revisions | None | Create/read/approve exact own revision | Scan/update only through service RPCs bound to claimed job |
@@ -344,6 +449,9 @@ loaded by the Vercel entrypoint.
 - User A cannot select, mutate, delete, or sign URLs for User B's IDs/objects.
 - RLS tests repeat the same attacks through the Supabase REST API.
 - A Groq test key never appears in database writes, logs, errors, or API responses.
+- A Hunter test key never appears in URLs, database writes, logs, provider-error text,
+  automation payloads, or API responses; cross-tenant contact lookup fails before the
+  provider is called, and requested/results limits remain between 1 and 10.
 - OAuth state replay and cross-user callback attempts fail.
 - A newer OAuth start or disconnect makes an older Google callback stale; concurrent
   callback/disconnect execution cannot resurrect a disconnected connection.
@@ -364,26 +472,56 @@ loaded by the Vercel entrypoint.
   logical expiry; scheduled/hot-path cleanup and cron-failure monitoring are verified.
 - Five valid résumé slots are accepted; invalid/sixth/nested slots fail, and concurrent
   registration leaves exactly one active résumé.
+- Deterministic form mapping uses the reviewed graduation year for recognized passout/
+  graduation questions and only the explicit public HTTPS résumé URL for recognized
+  résumé-link questions; a private Storage path or signed URL is never substituted.
 - Sign-out retains the signed-out user's namespaced local Groq key without exposing it
   to another signed-in user; explicit removal and account deletion remove it.
 - Worker claim concurrency gives a job to only one worker.
 - Telegram/RSS redirect and SSRF tests reject private/loopback/link-local/metadata hosts,
   oversized responses, and an item count above the configured bound.
+- Résumé-guided discovery requires an owned parsed active résumé, returns only bounded
+  roles/keywords/search terms, derives two tenant-owned idempotent jobs, and passes only
+  those terms—not résumé text or the Groq key—to the public-feed worker. Nonmatching
+  Telegram/RSS candidates are omitted before the global result cap.
 - CSV/XLSX and pasted-referral tests cover flexible headings, malformed/oversized input,
   formula-like cells, stored-XSS text, normalization, and per-tenant deduplication.
 - LinkedIn guest discovery is page/result bounded, backs off on throttling, persists no
   account cookie, and can create only reviewable jobs; Easy Apply remains unavailable.
+- Google Forms queue tests cover tenant isolation, direct and metadata-discovered URLs,
+  normalized-URL deduplication, stable IDs, latest-application linkage, pagination, and
+  the absence of scan side effects.
 - Provider URL detection covers Google Forms, Greenhouse, Lever, Ashby, YC, Wellfound,
   Cutshort, and Instahyre, and ZipRecruiter is absent from the hosted registry.
 - A changed answer, résumé, target URL, or scanned schema cannot reuse approval; stale
   revision/hash approval and queue attempts fail closed.
-- Scan never fills, prefill never submits, and submit requires a distinct explicit
-  request for the exact approved revision.
+- Scan never fills or submits. The normal Google Forms path requires one explicit
+  approval-bound submit action for the exact latest revision and complete required
+  answers. The worker submits once and succeeds only with fresh confirmation; an
+  uncertain result stops as `needs_attention` without blind retry.
 - Fake-provider tests cover registry, host, login-context, and fail-closed behavior for
-  all eight managed-browser providers. End-to-end scan/prefill/submit tests apply only
-  to implemented application handlers; live launch validation additionally requires
-  Browserbase credentials and controlled provider accounts/jobs.
+  all eight managed-browser providers. End-to-end tests exercise only the stages each
+  handler exposes: Google Forms exercises exact-approved submit and verified
+  confirmation, while every other provider-specific worker submit is tested only when
+  separately enabled. Live launch
+  validation additionally requires Browserbase credentials and controlled provider
+  accounts/jobs.
 - CAPTCHA/MFA/challenge and ambiguous submit outcomes stop as `needs_attention` and are
   never bypassed or marked successful.
 - Unsupported LinkedIn Easy Apply returns a capability response, not a browser job.
+- **Mass Cold Email** UI tests or controlled staging checks show that the sidebar has no
+  separate review destination; **Build campaign** and **Review & send** are subtabs,
+  selection stops at 10, projected Hunter credit use appears inline before an explicit
+  search, contact choice is required, every Groq draft requires exact individual
+  approval, final send requires confirmation, and Gmail calls execute sequentially
+  under the unchanged daily/duplicate/idempotency gates. Both subtabs exclude ATS/form
+  applications; Form Pilot retains ownership of those revisions, submissions, and
+  needs-attention fallbacks.
+- Form Pilot browser tests prove a newly loaded eligible revision automatically makes
+  at most one transient Groq suggestion request, preserves editable/manual review on a
+  missing key or failure, never persists the key, and never grants approval.
+- A Google Forms canary proves exact latest-revision approval, complete required-answer
+  preflight, one idempotent `application_submit`, and success only when the provider
+  freshly confirms submission. Login/challenge/schema/confirmation uncertainty proves
+  the separate `needs_attention` Live View fallback and absence of blind retries.
 - Vercel import/startup does not initialize SQLite, APScheduler, or Playwright.

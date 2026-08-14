@@ -3,15 +3,19 @@
 ## AutoApply Cloud 2.0
 
 **Status:** Implementation baseline
-**Date:** 2026-08-11
+**Date:** 2026-08-13
 
 ## 1. Architectural goals
 
 - Public, authenticated, multi-user service with strict tenant isolation.
 - Vercel-compatible stateless web/API execution.
 - Durable provider actions with explicit approval and idempotency.
-- Bounded tenant-owned discovery without additional provider credentials.
-- Immutable form revisions with separate scan, prefill, and submit boundaries.
+- Bounded tenant-owned discovery using public sources and transient résumé-derived
+  Groq terms.
+- Browser-held Hunter contact lookup and max-10 outreach orchestration without a bulk
+  send API or server-held Hunter credential.
+- Immutable form revisions with separate scan/browser-side suggestions and one explicit
+  exact-approval submission boundary, followed by verified provider confirmation.
 - Direct private résumé storage and per-user provider connections.
 - Honest separation between product auth, OAuth authorization, and browser sessions.
 - Reuse of the legacy pure matching/safety logic without reusing its global state.
@@ -22,7 +26,7 @@
 flowchart TB
     subgraph Browser[User browser]
       SPA[Static SPA]
-      LS[localStorage<br/>Supabase session + BYO Groq key]
+      LS[localStorage<br/>Supabase session + BYO Groq/Hunter keys]
     end
 
     subgraph Vercel[Vercel]
@@ -38,13 +42,14 @@ flowchart TB
 
     subgraph External[External services]
       GROQ[Groq]
+      HUNT[Hunter]
       GOOG[Google OAuth / Gmail]
       CF[Cloudflare Turnstile]
       PUB[Telegram/RSS + LinkedIn guest pages]
       BB[Browserbase managed browser]
     end
 
-    WORKER[Python worker<br/>persistent process]
+    WORKER[Python worker<br/>continuous host outside Vercel]
 
     SPA --> CDN
     SPA <--> AUTH
@@ -54,6 +59,7 @@ flowchart TB
     API --> PG
     API --> ST
     API -->|transient user key| GROQ
+    API -->|transient user key| HUNT
     API <--> GOOG
     SPA -->|short-lived challenge| CF
     SPA -->|CAPTCHA token| AUTH
@@ -64,6 +70,9 @@ flowchart TB
     WORKER --> BB
 ```
 
+`WORKER` is a continuously running process on a persistent host outside Vercel. It is
+not a Vercel Function, request callback, or best-effort in-process background task.
+
 ## 3. Trust boundaries
 
 ### Browser
@@ -73,6 +82,8 @@ approval, quota, or ownership. It holds:
 
 - the Supabase application session managed by `supabase-js`;
 - one namespaced Groq key per user in local storage;
+- one namespaced Hunter key per user in local storage; and
+- a non-authoritative outreach selection/contact cache capped at 10 jobs;
 - UI state that is never authoritative.
 
 The public Turnstile site key may reach the browser; the matching Turnstile secret is
@@ -100,9 +111,11 @@ allowlists before content is read.
 
 ### Providers
 
-Groq sees the profile/résumé/JD content needed for the requested generation. Google sees
-the OAuth/send operations the user approved. Managed-browser providers hold opaque
-browser contexts. Tokens, cookies, and context connection URLs never reach public rows.
+Groq sees the profile/résumé/JD content needed for the requested generation. Hunter sees
+the selected owned job's company name during an explicit HR-contact search; its user key
+travels in the provider header and is never stored. Google sees the OAuth/send
+operations the user approved. Managed-browser providers hold opaque browser contexts.
+Tokens, cookies, and context connection URLs never reach public rows.
 Telegram/RSS and LinkedIn guest discovery use public pages only and receive no user
 credentials. LinkedIn guest discovery is unofficial/best-effort and is not connected to
 LinkedIn Easy Apply.
@@ -178,6 +191,10 @@ sequenceDiagram
 
 The API sanitizes provider errors so a key cannot be reflected. Content generation is a
 foreground request because the background worker cannot read browser local storage.
+The same boundary applies to résumé-guided planning: the API loads the owned parsed
+résumé/profile, calls Groq with the transient header key, reduces the response to
+bounded roles/keywords, and only then enqueues those small terms. Neither résumé text
+nor the Groq key enters an automation payload.
 The key is stored as `autoapply.groq_api_key.v2.<auth-user-uuid>`. Normal sign-out clears
 the auth session but deliberately preserves that user's browser key; explicit key
 removal, account deletion, clearing site data, or deleting the browser profile removes
@@ -192,7 +209,16 @@ sequenceDiagram
     participant DB as Postgres
     participant W as Worker
     participant P as Public source
-    alt pasted referral digest or CSV/XLSX
+    alt resume-guided search
+      B->>API: JWT + X-Groq-Api-Key + bounded options
+      API->>API: derive roles/keywords from owned parsed resume
+      API->>DB: enqueue LinkedIn guest + Telegram/RSS jobs; no key/resume text
+      W->>DB: claim tenant jobs with leases
+      W->>P: bounded public-source requests
+      W->>W: filter Telegram/RSS by derived terms
+      W->>DB: normalize/upsert owned matching jobs
+      API-->>B: inspectable plan + two redacted jobs
+    else pasted referral digest or CSV/XLSX
       B->>API: bounded untrusted text/file
       API->>API: parse, normalize, detect provider
       API->>DB: upsert owned jobs by normalized URL
@@ -220,6 +246,14 @@ does not create or reuse a LinkedIn login context and cannot queue Easy Apply.
 Greenhouse, Lever, and Ashby board discovery derives a fixed official API URL from the
 hosted board identifier, fetches no user-selected destination, and interleaves bounded
 results when multiple company boards are supplied.
+
+`GET /api/v1/discovery/google-forms` is a read model over the authenticated user's jobs
+and latest applications. It combines direct Google Forms job URLs with form URLs nested
+in discovery metadata, normalizes and deduplicates URLs, emits stable queue IDs, and
+paginates the result. A queue read has no automation side effect. A metadata-only form
+must first be saved as a job; scan, immutable-revision review, explicit approval-bound
+submission, verified confirmation, and any needs-attention Browserbase Live View
+fallback retain their explicit boundaries.
 
 ## 8. Gmail OAuth and send flow
 
@@ -252,8 +286,50 @@ sequenceDiagram
     API-->>B: sent result
 ```
 
-Only single reviewed sends run in the web function. Delayed/batched sending, if added,
-uses the worker and persisted already-approved content.
+### Reviewed outreach orchestration
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as FastAPI
+    participant H as Hunter
+    participant Q as Groq
+    participant G as Gmail
+    B->>B: select 1-10 owned jobs
+    B->>B: review inline Hunter credit estimate; click Find contacts
+    loop selected jobs, sequentially
+      B->>API: JWT + X-Hunter-Api-Key + owned job ID
+      API->>H: HR domain search with transient key/company
+      H-->>API: bounded contacts
+      API-->>B: allowlisted contact fields
+      B->>B: choose one contact
+    end
+    loop selected jobs, sequentially
+      B->>API: set chosen recipient; JWT + X-Groq-Api-Key draft request
+      API->>Q: grounded generation with transient key
+      API-->>B: editable application draft
+    end
+    B->>API: approve each exact application revision separately
+    B->>B: explicit final send confirmation
+    loop at most 10 approved applications, sequentially
+      B->>API: single application send + unique idempotency key
+      API->>API: enforce daily/duplicate/provider/idempotency gates
+      API->>G: one users.messages.send
+      API-->>B: per-message result
+    end
+```
+
+Hunter validation (`POST /api/v1/hunter/validate`) and owned-job contact search
+(`POST /api/v1/jobs/{id}/contacts/hunter`) are foreground, stateless operations. The
+key is browser-held and sent as `X-Hunter-Api-Key`; contacts remain non-authoritative UI
+state until the chosen email is explicitly saved on the owned job. The server exposes
+no Hunter queue or deployment-wide key.
+
+Only single reviewed sends run in the web function. The max-10 “batch” is a bounded UI
+loop over that existing endpoint, not a bulk-mail API: approval remains per exact
+message, the user confirms again before sending, and every sequential call independently
+passes the same daily, duplicate-recipient, provider-account, and idempotency
+reservation gates. Delayed or autonomous sending is not implemented.
 
 The operator-managed OAuth client is the normal/default source when configured. The
 advanced user-managed path stores an authenticated user's Web client ID and secret in
@@ -295,7 +371,9 @@ if cron fails, so the job's run history is monitored.
 
 The sequence below applies only to a provider whose application handler has been
 enabled after its capability and staging gates pass; registry-only connections never
-enter the fill or submit stages.
+enter the fill or submit stages. This sequence shows the one-page Google Forms path. The
+user authorizes one exact revision; the worker performs the bounded submit and success
+requires freshly observed provider confirmation.
 
 ```mermaid
 sequenceDiagram
@@ -308,39 +386,55 @@ sequenceDiagram
     API->>DB: enqueue application_scan
     W->>BB: open isolated provider context; inspect fields only
     W->>DB: append immutable form revision + schema/content hashes
-    DB-->>B: exact revision for review
-    B->>API: optionally request grounded suggestions with transient Groq key
+    B->>API: poll owned scan; load exact revision in Form Pilot
+    B->>API: automatically request grounded suggestions with transient Groq key
     API-->>B: draft answers only; no DB mutation or approval
-    B->>API: approve revision ID + expected hashes
-    API->>DB: transactional exact-revision approval
-    B->>API: explicit prefill
-    API->>DB: enqueue application_prefill for approved revision
-    W->>BB: revalidate schema; fill approved values/resume; stop
-    B->>API: separately request submit
-    API->>DB: enqueue application_submit for same approved revision
-    W->>BB: revalidate approval/schema; activate submit once
-    W->>DB: confirmed success or needs_attention
+    B->>B: review/edit every answer in Form Pilot
+    B->>API: Approve & submit exact revision + expected hashes
+    API->>DB: seal latest exact revision; validate required-answer preflight
+    API->>DB: enqueue idempotent application_submit
+    W->>BB: revalidate URL/schema/approval; fill only sealed values/resume
+    W->>BB: activate one unambiguous Submit control; await fresh confirmation
+    alt confirmation observed
+      W->>DB: application_submitted + submission_state=confirmed
+      API-->>B: verified submitted result
+    else login/challenge/schema/required field/uncertain result
+      W->>DB: needs_attention; no blind retry
+      API-->>B: explanation + optional allowlisted Live View fallback
+    end
 ```
 
 The adapter registry contains `google_forms`, `greenhouse`, `lever`, `ashby`, `yc`,
 `wellfound`, `cutshort`, and `instahyre`. ZipRecruiter is absent. Registry membership
 provides provider identity, host/redirect policy, and an isolated Browserbase context;
 it does not assert that every provider has an end-to-end application state machine.
-Greenhouse and one-page Google Forms have aligned handlers. Multi-page or branching
+Greenhouse has an aligned managed-browser handler. One-page Google Forms have aligned
+scan, exact-approved submit, and verified-confirmation handling; multi-page or branching
 Google Forms are unsupported. Lever and Ashby have safe mappings with read-only live
-scan evidence but still require controlled prefill/submit canaries; Wellfound still
-needs a signed-in canary. YC, Cutshort, and Instahyre are connection-only and the worker
-fails safely until tenant-aware multi-step state machines are implemented. Public forms
-may use an ephemeral session; login-gated providers reuse an encrypted
+scan evidence but still require controlled submit canaries; Wellfound still needs a
+signed-in canary. YC and exact-host generic company-form adapters exist in the worker,
+but they are controlled-canary gated rather than enabled public capabilities. Cutshort
+and Instahyre remain connection-only until tenant-aware multi-step state machines are
+implemented. Public forms may use an ephemeral session; login-gated providers reuse an encrypted
 `(user_id, provider)` context. A single active lease may use a persisted context.
 
-Scanning, prefilling, and submission are intentionally separate. A revision binds the
-target URL, detected form schema, proposed answers, and selected résumé. First approval
-atomically seals the exact answers reviewed in the browser. Any post-approval answer
-change, or any URL/résumé/schema change, requires a new revision. Prefill never activates
-submit. Submit requires a distinct user action and exact revision/hash match. CAPTCHA,
-MFA, login expiry, unknown required fields, or ambiguous confirmation produce
-`needs_attention`; the browser worker never bypasses or guesses.
+Scanning/suggestions and the external submission authorization are intentionally
+separate. A revision binds the target URL, detected form schema, and selected résumé.
+After the scan, the signed-in browser automatically calls the existing suggestion
+endpoint once for that revision when its user-namespaced Groq key is available. The key
+and returned draft answers never enter the durable queue; the user still reviews them
+in Form Pilot.
+The explicit combined action atomically seals the exact answers reviewed in the browser
+and queues their submit. Any post-approval answer change, or any URL/résumé/schema
+change, requires a new revision. The worker requires complete required answers, activates
+exactly one provider Submit control, and recognizes success only from a fresh
+confirmation signal. CAPTCHA, MFA, login expiry, unknown required fields, changed
+schema, or uncertain confirmation produce `needs_attention`; Live View is offered only
+for that fallback and the worker never bypasses, guesses, or blindly retries.
+
+Mass Cold Email is a separate email-channel workflow. Its Build campaign and Review &
+send subtabs never render ATS/form revisions; all Google Form answers, approval state,
+submit progress, verification, and attention fallback remain in Form Pilot.
 
 ## 10. Durable worker protocol
 
@@ -367,8 +461,14 @@ Idempotency boundaries:
 - unique `idempotency_key` per user/job type;
 - unique provider send reference after Gmail accepts a message;
 - one running browser job per connection/context;
-- one immutable form revision/hash approval per prefill/submit request;
+- one immutable form revision/hash approval and deterministic submit idempotency key per
+  worker-submit request;
 - terminal transitions compare the worker lease token.
+
+The outreach selection and returned Hunter contacts are deliberately not new durable
+job kinds or idempotency boundaries. They are capped browser state; persistence begins
+only when the user chooses a recipient/creates an application, and every Gmail send
+uses the existing per-application reservation.
 
 Durable job kinds include `discover_public_feeds`, `discover_linkedin_guest`,
 `discover_public_ats`, `application_scan`, `application_prefill`, and
@@ -391,9 +491,13 @@ access.
 
 `managed_browser` describes the connection mechanism, not application completeness.
 The initial production allowlist is `google_forms,greenhouse` after their controlled
-staging checks. Lever, Ashby, and Wellfound are added one at a time only after canaries;
-YC, Cutshort, and Instahyre remain outside the allowlist until their multi-step handlers
-exist. The Google Forms entry is limited to one-page forms.
+staging checks. Google Forms means scan, exact review, one explicit approval-bound
+background submit, and verified confirmation; Live View is only a needs-attention
+fallback. Lever, Ashby, and Wellfound are added one at a time only after canaries. YC
+has an adapter but remains outside the allowlist until a controlled signed-in canary
+passes; Cutshort and Instahyre remain outside until their multi-step handlers exist. The
+generic exact-host company-form adapter is internal/gated and is not a public catalog or
+allowlist entry. The Google Forms entry is limited to one-page forms.
 
 Managed-browser connection flow:
 
@@ -438,6 +542,20 @@ accepting answers in an untrusted queue payload. Browser roles may read their ow
 revisions and invoke the exact-approval RPC; worker mutations use service-only
 bundle/scan/progress RPCs.
 
+Profile facts use two deliberately different résumé representations. The uploaded PDF
+and its Storage path remain private application evidence. `profiles.resume_url` is a
+separate user-provided public HTTPS link for employer-visible résumé/CV URL questions;
+it is never inferred from the private object or replaced with an expiring signed URL.
+Recognized graduation/passout questions map deterministically to
+`profiles.graduation_year`; recognized résumé-link questions map only to
+`profiles.resume_url`, before Groq handles open-ended questions.
+
+The schema transition is forward-only: migration `202608130001` was the temporary
+Google Forms submit prohibition, `202608130002` removes that prohibition and installs
+the exact-approved required-answer submit gate, and `202608130003` adds the public
+résumé URL fact. Deployments must apply all three in order and must not stop at the
+temporary `001` state.
+
 ## 13. Legacy component disposition
 
 | Legacy component | Hosted disposition |
@@ -471,10 +589,20 @@ bundle/scan/progress RPCs.
 - Worker retries use bounded exponential backoff and a maximum attempt count.
 - CAPTCHA/security/MFA is `needs_attention`; workers never attempt bypass.
 - A changed form schema/revision invalidates approval and requires a new review.
-- Prefill success is never submission success; ambiguous submit state is
-  `needs_attention` and is not blindly retried.
+- A queued/running/prefill result is never submission success. Google Forms succeeds only
+  with `application_submitted` plus `submission_state=confirmed`. Any ambiguous
+  worker-submit state is `needs_attention`, may expose an allowlisted Live View, and is
+  not blindly retried.
 - LinkedIn guest/public-feed throttling produces a bounded retry or visible partial
   result, never an unbounded crawl.
+- A missing/invalid/quota-exhausted Hunter key returns a redacted foreground error; it
+  never falls back to a server key or turns the lookup into unattended work.
+- Résumé-guided planning fails before enqueue when there is no parsed active résumé or
+  usable search evidence. A public-source partial failure remains visible on its owned
+  durable job.
+- The outreach loop reports results per message and stops safely on hard Gmail quota or
+  reauthorization errors; it does not replay successful sends or bypass an individual
+  approval/duplicate/idempotency gate.
 - A provider policy/configuration mismatch is a capability error, not a retry loop.
 
 ## 15. Security posture required for a public product

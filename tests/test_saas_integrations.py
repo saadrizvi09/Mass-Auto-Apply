@@ -214,6 +214,108 @@ def test_groq_form_suggestions_exclude_sensitive_and_unknown_question_keys(
     assert result == {"years": 5}
 
 
+def test_form_suggestions_map_passout_dropdown_and_public_resume_without_groq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_request(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("Structured profile facts must not require a model request")
+
+    monkeypatch.setattr(groq.requests, "post", unexpected_request)
+    result = groq.generate_form_answer_suggestions(
+        "gsk_test_key",
+        "openai/gpt-oss-120b",
+        {
+            "full_name": "Saad Rizvi",
+            "email": "candidate@example.com",
+            "phone": "+91 9999999999",
+            "college": "Jamia Millia Islamia University",
+            "graduation_year": 2026,
+            "resume_url": "https://drive.google.com/file/d/resume-id/view?usp=sharing",
+        },
+        {"title": "Product Intern"},
+        "Candidate graduates in 2026.",
+        [
+            {"key": "field_1", "label": "Full Name", "type": "text", "required": True},
+            {"key": "field_2", "label": "Email Address", "type": "email", "required": True},
+            {"key": "field_3", "label": "Phone Number", "type": "tel", "required": True},
+            {"key": "field_4", "label": "College / University", "type": "text", "required": True},
+            {
+                "key": "field_5",
+                "label": "Graduation Year",
+                "type": "listbox",
+                "required": True,
+                "options": ["2025", "2026", "2027", "2028"],
+            },
+            {
+                "key": "field_6",
+                "label": "Resume Link",
+                "type": "url",
+                "required": True,
+                "options": [],
+            },
+        ],
+    )
+    assert result == {
+        "field_1": "Saad Rizvi",
+        "field_2": "candidate@example.com",
+        "field_3": "+91 9999999999",
+        "field_4": "Jamia Millia Islamia University",
+        "field_5": "2026",
+        "field_6": "https://drive.google.com/file/d/resume-id/view?usp=sharing",
+    }
+
+
+def test_profile_form_answers_is_available_without_a_groq_request() -> None:
+    assert groq.profile_form_answers(
+        {
+            "graduation_year": 2026,
+            "resume_url": "https://drive.google.com/file/d/resume-id/view?usp=sharing",
+        },
+        [
+            {
+                "key": "year",
+                "label": "Graduation Year",
+                "type": "listbox",
+                "options": ["2025", "2026", "2027"],
+            },
+            {"key": "cv_url", "label": "Resume Link", "type": "url"},
+        ],
+    ) == {
+        "year": "2026",
+        "cv_url": "https://drive.google.com/file/d/resume-id/view?usp=sharing",
+    }
+
+
+def test_form_suggestions_do_not_guess_missing_dropdown_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        groq.requests,
+        "post",
+        lambda *_args, **_kwargs: FakeResponse(
+            200,
+            {"choices": [{"message": {"content": '{"answers":{}}'}}]},
+        ),
+    )
+    result = groq.generate_form_answer_suggestions(
+        "gsk_test_key",
+        "openai/gpt-oss-120b",
+        {"graduation_year": 2026},
+        {"title": "Intern"},
+        "Graduating in 2026.",
+        [
+            {
+                "key": "grad",
+                "label": "Graduation Year",
+                "type": "listbox",
+                "required": True,
+                "options": ["2027", "2028"],
+            }
+        ],
+    )
+    assert result == {}
+
+
 def test_groq_resume_analysis_is_strictly_allowlisted_and_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

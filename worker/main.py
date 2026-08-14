@@ -123,6 +123,26 @@ class SupabaseQueueStore:
         terminal_status = result.get("outcome")
         if terminal_status not in {"succeeded", "needs_attention"}:
             raise ValueError("invalid terminal worker outcome")
+        submission_state = result.get("submission_state")
+        if (
+            terminal_status == "needs_attention"
+            and result.get("phase") == "submit"
+            and submission_state in {"uncertain", "confirmed"}
+        ):
+            # A provider click may already have happened. Persist the immutable
+            # form-revision fence and close the queue lease in one transaction;
+            # a pruned terminal queue row must never make this revision reusable.
+            row = _first_row(
+                await self._repository.rpc(
+                    "complete_application_form_submit_attention",
+                    {
+                        "job_id": job_id,
+                        "worker_id": worker_id,
+                        "result": result,
+                    },
+                )
+            )
+            return row is not None and row.get("status") == "needs_attention"
         row = _first_row(
             await self._repository.rpc(
                 "complete_automation_job",
@@ -198,6 +218,7 @@ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
 class WorkerConfig:
     worker_id: str
     poll_seconds: float = 2.0
+    max_idle_poll_seconds: float = 15.0
     lease_seconds: int = 120
     retry_base_seconds: int = 15
     max_retry_seconds: int = 300
@@ -214,9 +235,17 @@ class WorkerConfig:
             raise WorkerConfigurationError(
                 "WORKER_ID must use only letters, numbers, dots, colons, underscores, or hyphens"
             )
+        poll_seconds = _bounded_float("WORKER_POLL_SECONDS", 2.0, 0.1, 60.0)
+        max_idle_poll_seconds = _bounded_float(
+            "WORKER_MAX_IDLE_POLL_SECONDS",
+            max(15.0, poll_seconds),
+            poll_seconds,
+            300.0,
+        )
         return cls(
             worker_id=worker_id,
-            poll_seconds=_bounded_float("WORKER_POLL_SECONDS", 2.0, 0.1, 60.0),
+            poll_seconds=poll_seconds,
+            max_idle_poll_seconds=max_idle_poll_seconds,
             lease_seconds=_bounded_int("WORKER_LEASE_SECONDS", 120, 30, 3600),
             heartbeat_seconds=_bounded_float(
                 "WORKER_HEARTBEAT_SECONDS", 20.0, 1.0, 300.0
@@ -403,7 +432,15 @@ class Worker:
             base_seconds=max(self.config.poll_seconds, 0.1),
             maximum_seconds=self.config.max_queue_backoff_seconds,
         )
+        idle_backoff = BoundedBackoff(
+            base_seconds=max(self.config.poll_seconds, 0.1),
+            maximum_seconds=max(
+                self.config.poll_seconds,
+                self.config.max_idle_poll_seconds,
+            ),
+        )
         consecutive_errors = 0
+        consecutive_idle_polls = 0
         self.logger.info("Worker started for %d safe job kinds.", len(self.config.kinds))
         try:
             while not self.stop_event.is_set():
@@ -411,14 +448,18 @@ class Worker:
                     processed = await self.run_once()
                 except Exception:
                     consecutive_errors += 1
+                    consecutive_idle_polls = 0
                     delay = queue_backoff.delay(consecutive_errors)
                     self.logger.warning("Queue request failed; retrying in %.1f seconds.", delay)
                     await self._wait_or_stop(delay)
                     continue
 
                 consecutive_errors = 0
-                if not processed:
-                    await self._wait_or_stop(self.config.poll_seconds)
+                if processed:
+                    consecutive_idle_polls = 0
+                    continue
+                consecutive_idle_polls += 1
+                await self._wait_or_stop(idle_backoff.delay(consecutive_idle_polls))
         finally:
             try:
                 await self.store.close()
@@ -443,6 +484,11 @@ def _configure_logging() -> None:
         level=level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # httpx reports every successful Supabase poll at INFO. Those entries turn a
+    # healthy idle worker into thousands of noisy lines per day. Queue failures are
+    # still surfaced by the worker logger at WARNING with redacted messages.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def build_queue_store() -> SupabaseQueueStore:

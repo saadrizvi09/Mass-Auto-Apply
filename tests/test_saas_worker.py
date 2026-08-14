@@ -8,7 +8,13 @@ from typing import Any
 import pytest
 
 from worker.handlers import SUPPORTED_JOB_KINDS, AutomationJob, handle_job
-from worker.main import BoundedBackoff, SupabaseQueueStore, Worker, WorkerConfig
+from worker.main import (
+    BoundedBackoff,
+    SupabaseQueueStore,
+    Worker,
+    WorkerConfig,
+    _configure_logging,
+)
 
 
 def _record(**overrides: Any) -> dict[str, Any]:
@@ -291,6 +297,41 @@ def test_worker_closes_store_when_already_stopped() -> None:
     assert not store.claim_calls
 
 
+def test_idle_worker_backs_off_and_resets_immediately_after_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("worker.main.random.random", lambda: 0.5)
+    stop_event = asyncio.Event()
+    store = FakeQueueStore()
+    worker = Worker(
+        store,
+        WorkerConfig(
+            worker_id="worker-test-1",
+            poll_seconds=2.0,
+            max_idle_poll_seconds=15.0,
+        ),
+        stop_event=stop_event,
+    )
+    outcomes = iter((False, False, False, False, True, False))
+    delays: list[float] = []
+
+    async def run_once() -> bool:
+        return next(outcomes)
+
+    async def wait_or_stop(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) == 5:
+            stop_event.set()
+
+    monkeypatch.setattr(worker, "run_once", run_once)
+    monkeypatch.setattr(worker, "_wait_or_stop", wait_or_stop)
+
+    asyncio.run(worker.run_forever())
+
+    assert delays == [2.0, 4.0, 8.0, 15.0, 2.0]
+    assert store.closed is True
+
+
 def test_queue_backoff_is_exponential_jittered_and_bounded() -> None:
     backoff = BoundedBackoff(base_seconds=2.0, maximum_seconds=10.0)
 
@@ -309,6 +350,54 @@ def test_worker_config_rejects_missing_or_unsafe_identity(
     monkeypatch.setenv("WORKER_ID", "bad id containing spaces")
     with pytest.raises(ValueError, match="WORKER_ID"):
         WorkerConfig.from_env()
+
+
+def test_worker_config_reads_and_validates_adaptive_idle_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORKER_ID", "worker-test-1")
+    monkeypatch.setenv("WORKER_POLL_SECONDS", "3")
+    monkeypatch.setenv("WORKER_MAX_IDLE_POLL_SECONDS", "21")
+
+    config = WorkerConfig.from_env()
+
+    assert config.poll_seconds == 3.0
+    assert config.max_idle_poll_seconds == 21.0
+
+    monkeypatch.setenv("WORKER_MAX_IDLE_POLL_SECONDS", "2")
+    with pytest.raises(ValueError, match="WORKER_MAX_IDLE_POLL_SECONDS"):
+        WorkerConfig.from_env()
+
+
+def test_idle_poll_default_never_falls_below_a_slow_initial_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORKER_ID", "worker-test-1")
+    monkeypatch.setenv("WORKER_POLL_SECONDS", "30")
+    monkeypatch.delenv("WORKER_MAX_IDLE_POLL_SECONDS", raising=False)
+
+    config = WorkerConfig.from_env()
+
+    assert config.poll_seconds == 30.0
+    assert config.max_idle_poll_seconds == 30.0
+
+
+def test_worker_logging_suppresses_successful_http_transport_noise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured: list[dict[str, Any]] = []
+    httpx_logger = logging.getLogger("httpx")
+    httpcore_logger = logging.getLogger("httpcore")
+    monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: configured.append(kwargs))
+    monkeypatch.setattr(httpx_logger, "level", logging.NOTSET)
+    monkeypatch.setattr(httpcore_logger, "level", logging.NOTSET)
+    monkeypatch.setenv("WORKER_LOG_LEVEL", "INFO")
+
+    _configure_logging()
+
+    assert configured[0]["level"] == logging.INFO
+    assert httpx_logger.level == logging.WARNING
+    assert httpcore_logger.level == logging.WARNING
 
 
 class FakeRpcRepository:
@@ -389,3 +478,38 @@ def test_supabase_queue_store_uses_stable_rpc_contracts() -> None:
         ),
     ]
     assert repository.closed is True
+
+
+@pytest.mark.parametrize("submission_state", ["uncertain", "confirmed"])
+def test_submit_attention_atomically_fences_revision_and_completes_job(
+    submission_state: str,
+) -> None:
+    record = _record(status="running", kind="application_submit")
+    repository = FakeRpcRepository(
+        {
+            "complete_application_form_submit_attention": [
+                {**record, "status": "needs_attention"}
+            ]
+        }
+    )
+    store = SupabaseQueueStore(repository)
+    result = {
+        "outcome": "needs_attention",
+        "code": "submission_unconfirmed",
+        "phase": "submit",
+        "submission_state": submission_state,
+    }
+
+    assert asyncio.run(
+        store.complete_automation_job(record["id"], "worker-1", result)
+    ) is True
+    assert repository.calls == [
+        (
+            "complete_application_form_submit_attention",
+            {
+                "job_id": record["id"],
+                "worker_id": "worker-1",
+                "result": result,
+            },
+        )
+    ]

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from urllib.parse import parse_qs, urlsplit
+import ipaddress
+import re
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from .common import (
     NormalizedJob,
@@ -23,6 +25,24 @@ PROVIDER_LABELS: dict[str, str] = {
     "cutshort": "Cutshort",
     "instahyre": "Instahyre",
 }
+
+_PUBLIC_DNS_LABEL = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE
+)
+_NON_PUBLIC_HOST_SUFFIXES = (
+    ".internal",
+    ".intranet",
+    ".invalid",
+    ".lan",
+    ".local",
+    ".localdomain",
+    ".localhost",
+    ".onion",
+    ".private",
+    ".test",
+    ".example",
+)
+_ADDRESS_ALIAS_SUFFIXES = (".nip.io", ".sslip.io", ".localtest.me", ".lvh.me")
 
 
 def _host_is(host: str, *candidates: str) -> bool:
@@ -66,6 +86,58 @@ def detect_provider(url: object) -> str | None:
     if _host_is(host, "instahyre.com", "www.instahyre.com") and path.startswith(("/job", "/jobs")):
         return "instahyre"
     return None
+
+
+def public_company_form_target(url: object) -> dict[str, str] | None:
+    """Validate one explicitly saved generic company form and bind its exact host.
+
+    This stays separate from :func:`detect_provider`, so arbitrary URLs found by
+    Telegram, RSS, imports, or pasted text never become browser-automation
+    targets. Literal IPs, local/special-use names, credentials, and every explicit
+    port are rejected. Rejecting explicit ``:443`` too keeps the worker target
+    canonical and is stricter than merely rejecting non-443 ports.
+    """
+
+    if not isinstance(url, str):
+        return None
+    raw = url.strip()
+    if not raw or len(raw) > 2_048 or any(ord(character) < 32 for character in raw):
+        return None
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    host = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or not host
+        or not host.isascii()
+        or host.endswith(".")
+        or len(host) > 253
+        or "." not in host
+    ):
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return None
+    if host == "localhost" or host.endswith(_NON_PUBLIC_HOST_SUFFIXES):
+        return None
+    if host in {suffix.removeprefix(".") for suffix in _ADDRESS_ALIAS_SUFFIXES} or host.endswith(
+        _ADDRESS_ALIAS_SUFFIXES
+    ):
+        return None
+    labels = host.split(".")
+    if labels[-1].isdigit() or any(not _PUBLIC_DNS_LABEL.fullmatch(label) for label in labels):
+        return None
+    target_url = urlunsplit(("https", host, parsed.path or "/", parsed.query, ""))
+    return {"host": host, "target_url": target_url}
 
 
 def extract_provider_urls(text: object, *, limit: int = 20) -> list[dict[str, str]]:
@@ -130,4 +202,5 @@ __all__ = [
     "detect_provider",
     "discover_provider_urls",
     "extract_provider_urls",
+    "public_company_form_target",
 ]

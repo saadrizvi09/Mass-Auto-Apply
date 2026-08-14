@@ -7,7 +7,7 @@ import pytest
 
 from worker.browser_runtime import BrowserRuntime, ResolvedBrowserTask
 from worker.providers import get_adapter
-from worker.providers.base import ProviderAdapter, checkpoint_present
+from worker.providers.base import ProviderAdapter, canonical_form_target, checkpoint_present
 
 
 USER_ID = "00000000-0000-0000-0000-000000000002"
@@ -81,6 +81,7 @@ class FixtureLocator:
 class FixtureFormRoot:
     def __init__(self) -> None:
         self.controls = [FixtureControl()]
+        self.final_controls = [FixtureControl()]
 
     async def is_visible(self) -> bool:
         return True
@@ -96,6 +97,10 @@ class FixtureFormRoot:
             return FixtureLocator(self.controls)
         if 'input[type="email"]' in selector:
             return FixtureLocator(self.controls)
+        if selector == "textarea":
+            return FixtureLocator(self.controls)
+        if 'text-is("Send")' in selector or 'text-is("Submit")' in selector:
+            return FixtureLocator(self.final_controls)
         return FixtureLocator()
 
 
@@ -242,7 +247,7 @@ def test_provider_prepare_hook_opens_at_most_one_application_entry(
 ) -> None:
     adapter = get_adapter(provider)
     assert adapter is not None
-    unsupported = {"yc", "cutshort", "instahyre"}
+    unsupported = {"cutshort", "instahyre"}
     if provider in {"google_forms", "wellfound", *unsupported}:
         assert adapter.application_entry_selector is None
     else:
@@ -287,6 +292,25 @@ def test_prepare_hook_rejects_ambiguous_apply_controls_without_clicking() -> Non
 
     assert prepared.code == "application_entry_ambiguous"
     assert all(control.clicks == 0 for control in page.entry_controls)
+
+
+def test_custom_company_form_allows_one_same_host_query_addressed_transition() -> None:
+    start_url = "https://careers.acme.com/jobs/one"
+    form_url = (
+        "https://careers.acme.com/forms/application?opening=one&token=a%2Bb#review"
+    )
+    adapter = get_adapter("company_form", target_url=start_url)
+    assert adapter is not None
+    page = FixturePage(adapter, start_url, after_url=form_url)
+
+    prepared = asyncio.run(adapter.open_application(page))
+
+    assert prepared.ready
+    assert prepared.transitioned is True
+    assert page.entry_controls[0].clicks == 1
+    assert canonical_form_target("company_form", page.url) == (
+        "https://careers.acme.com/forms/application?opening=one&token=a%2Bb"
+    )
 
 
 @pytest.mark.parametrize(
@@ -471,6 +495,19 @@ def test_visible_login_prompt_prevents_any_application_transition(provider: str)
     assert page.entry_controls[0].clicks == 0
 
 
+def test_custom_company_form_never_scans_or_fills_a_login_prompt() -> None:
+    target_url = "https://careers.acme.com/jobs/one/apply"
+    adapter = get_adapter("company_form", target_url=target_url)
+    assert adapter is not None
+    page = FixturePage(adapter, target_url, login_visible=True)
+
+    prepared = asyncio.run(adapter.open_application(page))
+
+    assert prepared.code == "provider_login_required"
+    assert prepared.root is None
+    assert page.entry_controls[0].clicks == 0
+
+
 def test_prepare_hook_rejects_multiple_application_roots() -> None:
     adapter = get_adapter("greenhouse")
     assert adapter is not None
@@ -547,7 +584,7 @@ def test_browser_runtime_uses_deterministic_wellfound_application_query() -> Non
     assert result.form_url == start_url
 
 
-@pytest.mark.parametrize("provider", ["yc", "cutshort", "instahyre"])
+@pytest.mark.parametrize("provider", ["cutshort", "instahyre"])
 def test_runtime_reports_unsupported_authenticated_provider_transition(
     provider: str,
 ) -> None:
@@ -593,7 +630,18 @@ def test_authenticated_provider_entry_never_uses_a_bare_apply_control() -> None:
     assert wellfound.application_entry_selector is None
     assert wellfound.application_entry_query == (("autoOpenApplication", "true"),)
 
-    for provider in ("yc", "cutshort", "instahyre"):
+    yc = get_adapter("yc")
+    assert yc is not None
+    assert yc.application_entry_selector == (
+        'a:text-is("Apply"),button:text-is("Apply"),'
+        'a:text-is("Apply now"),button:text-is("Apply now"),'
+        'a:text-is("Apply Now"),button:text-is("Apply Now")'
+    )
+    assert ":has-text" not in yc.application_entry_selector
+    assert yc.application_transition_unsupported_message is None
+    assert yc.submission_unsupported_message is None
+
+    for provider in ("cutshort", "instahyre"):
         adapter = get_adapter(provider)
         assert adapter is not None
         assert adapter.application_entry_selector is None

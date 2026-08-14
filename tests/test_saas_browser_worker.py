@@ -25,6 +25,7 @@ from worker.providers.base import (
     safe_form_url,
     scan_form,
 )
+from worker.providers.company_form import public_company_form_host
 from worker.providers.base import ProviderResult
 from worker.handlers import handle_job
 
@@ -126,6 +127,86 @@ def test_google_forms_policy_scopes_short_links_without_opening_all_google_docs(
     assert not adapter.allows_url("https://docs.google.com/document/d/private")
 
 
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        "http://careers.acme.com/apply",
+        "https://localhost/apply",
+        "https://127.0.0.1/apply",
+        "https://10.0.0.1/apply",
+        "https://[::1]/apply",
+        "https://user:password@careers.acme.com/apply",
+        "https://careers.acme.com:443/apply",
+        "https://intranet/apply",
+        "https://jobs.acme.local/apply",
+        "https://127.0.0.1.nip.io/apply",
+    ],
+)
+def test_custom_company_form_rejects_non_public_or_credentialed_targets(
+    target_url: str,
+) -> None:
+    assert public_company_form_host(target_url) is None
+    assert get_adapter("company_form", target_url=target_url) is None
+
+
+def test_custom_company_form_is_bound_to_the_exact_validated_https_host() -> None:
+    target_url = "https://careers.acme.com/jobs/one/apply?source=public"
+    adapter = get_adapter("company_form", target_url=target_url)
+
+    assert adapter is not None
+    assert public_company_form_host(target_url) == "careers.acme.com"
+    assert adapter.allows_url(target_url)
+    assert adapter.allows_url("https://careers.acme.com/application/confirmation")
+    assert not adapter.allows_url("https://apply.careers.acme.com/jobs/one")
+    assert not adapter.allows_url("https://acme.com/jobs/one")
+    assert not adapter.allows_url("https://careers.acme.com:443/jobs/one")
+    assert not adapter.allows_url("http://careers.acme.com/jobs/one")
+    assert "next" not in " ".join(adapter.submit_selectors).casefold()
+    assert "continue" not in " ".join(adapter.submit_selectors).casefold()
+
+
+def test_custom_company_form_identity_preserves_bounded_query_and_drops_fragment() -> None:
+    first = canonical_form_target(
+        "company_form",
+        "https://careers.acme.com/application?opening=one&token=a%2Bb#private",
+    )
+    second = canonical_form_target(
+        "company_form",
+        "https://careers.acme.com/application?opening=two&token=a%2Bb#other",
+    )
+
+    assert first == (
+        "https://careers.acme.com/application?opening=one&token=a%2Bb"
+    )
+    assert second.endswith("?opening=two&token=a%2Bb")
+    page = FakePage(first, _fields())  # type: ignore[name-defined]
+    first_schema = bind_schema_to_target(asyncio.run(scan_form(page)), first)
+    second_schema = bind_schema_to_target(asyncio.run(scan_form(page)), second)
+    assert first_schema.schema_hash != second_schema.schema_hash
+
+
+def test_custom_company_form_identity_rejects_oversized_query() -> None:
+    target_url = "https://careers.acme.com/application?token=" + ("x" * 2_049)
+
+    assert canonical_form_target("company_form", target_url) == ""
+
+
+def test_yc_policy_is_limited_to_exact_job_and_confirmation_paths() -> None:
+    adapter = get_adapter("yc")
+
+    assert adapter is not None
+    assert adapter.allows_url("https://www.workatastartup.com/jobs/12345")
+    assert adapter.allows_url(
+        "https://www.workatastartup.com/companies/acme/jobs/12345-engineer"
+    )
+    assert adapter.allows_url(
+        "https://www.workatastartup.com/applications/submitted"
+    )
+    assert not adapter.allows_url("https://www.workatastartup.com/jobs")
+    assert not adapter.allows_url("https://www.workatastartup.com/companies/acme")
+    assert not adapter.allows_url("https://account.ycombinator.com/authenticate")
+
+
 def test_worker_registry_contains_no_ziprecruiter_adapter() -> None:
     assert set(ADAPTERS) == {
         "google_forms",
@@ -167,7 +248,13 @@ def test_schema_approval_hash_is_bound_to_canonical_form_identity() -> None:
 
 
 class FakeControl:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        text: str = "",
+        attributes: dict[str, str] | None = None,
+        options: list["FakeControl"] | None = None,
+    ) -> None:
         self.filled: str | None = None
         self.files: str | None = None
         self.checked: bool | None = None
@@ -175,12 +262,25 @@ class FakeControl:
         self.clicks = 0
         self.on_click: Any = None
         self.click_error: Exception | None = None
+        self.text = text
+        self.attributes = dict(attributes or {})
+        self.options = list(options or [])
 
     async def fill(self, value: str) -> None:
         self.filled = value
 
     async def set_input_files(self, value: str) -> None:
         self.files = value
+
+    async def evaluate(self, _script: str) -> dict[str, Any]:
+        if not self.files:
+            return {"count": 0}
+        return {
+            "count": 1,
+            "name": "resume.pdf",
+            "type": "application/pdf",
+            "size": 1_024,
+        }
 
     async def set_checked(self, value: bool) -> None:
         self.checked = value
@@ -196,6 +296,24 @@ class FakeControl:
 
     async def is_enabled(self) -> bool:
         return True
+
+    async def inner_text(self, **_kwargs: Any) -> str:
+        return self.text
+
+    async def get_attribute(self, name: str) -> str | None:
+        return self.attributes.get(name)
+
+    async def input_value(self) -> str:
+        return self.filled or ""
+
+    def locator(self, selector: str) -> "FakeLocator":
+        if '[role="option"]' in selector:
+            if 'aria-selected="true"' in selector:
+                return FakeLocator(
+                    [option for option in self.options if option.attributes.get("aria-selected") == "true"]
+                )
+            return FakeLocator(self.options)
+        return FakeLocator()
 
     async def click(self) -> None:
         self.clicks += 1
@@ -239,6 +357,8 @@ class FakeFormRoot:
         return self.page.fields
 
     def locator(self, selector: str) -> FakeLocator:
+        if '[role="listitem"]' in selector:
+            return FakeLocator(self.page.upload_prompt_containers)
         if "input:not" in selector:
             return FakeLocator(self.page.controls)
         if 'input[type="file"]' in selector:
@@ -255,6 +375,14 @@ class FakeFormRoot:
                     control
                     for control, field in zip(self.page.controls, self.page.fields)
                     if field.get("kind") == "email"
+                ]
+            )
+        if selector == "textarea":
+            return FakeLocator(
+                [
+                    control
+                    for control, field in zip(self.page.controls, self.page.fields)
+                    if field.get("kind") == "textarea"
                 ]
             )
         if "submit" in selector.lower():
@@ -285,13 +413,18 @@ class FakePage:
         confirmed_url: str | None = None,
         confirmed_body: str | None = None,
         redirect_url: str | None = None,
+        controls: list[FakeControl] | None = None,
+        options: list[FakeControl] | None = None,
+        upload_prompt_containers: list[FakeControl] | None = None,
     ) -> None:
         self.url = url
         self.target_url = url
         self.fields = fields
         self.body = body
         self.checkpoint_count = checkpoint_count
-        self.controls = [FakeControl() for _ in fields]
+        self.controls = controls or [FakeControl() for _ in fields]
+        self.options = list(options or [])
+        self.upload_prompt_containers = list(upload_prompt_containers or [])
         self.submit_controls = [FakeControl() for _ in range(submit_count)]
         self.redirect_url = redirect_url
         self.main_frame = object()
@@ -327,6 +460,8 @@ class FakePage:
             return FakeLocator([FakeControl()] * self.checkpoint_count)
         if "input:not" in selector:
             return FakeLocator(self.controls)
+        if '[role="option"]' in selector:
+            return FakeLocator(self.options)
         if "submit" in selector.lower():
             return FakeLocator(self.submit_controls)
         return FakeLocator()
@@ -400,6 +535,62 @@ def _task(
     )
 
 
+def _google_task(
+    phase: str,
+    schema_hash: str | None,
+    *,
+    answers: dict[str, Any] | None = None,
+    context_id: str | None = None,
+) -> ResolvedBrowserTask:
+    approval = None
+    if phase != "scan" and schema_hash:
+        approval = ApprovalSnapshot(
+            id=REVISION_ID,
+            revision=1,
+            schema_hash=schema_hash,
+            answers=answers or {},
+        )
+    return ResolvedBrowserTask(
+        job_id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="google_forms",
+        phase=phase,  # type: ignore[arg-type]
+        target_url="https://docs.google.com/forms/d/e/example/viewform",
+        context_id=context_id,
+        approval=approval,
+    )
+
+
+def _provider_task(
+    provider: str,
+    target_url: str,
+    phase: str,
+    schema_hash: str | None,
+    *,
+    answers: dict[str, Any] | None = None,
+    context_id: str | None = None,
+) -> ResolvedBrowserTask:
+    approval = None
+    if phase != "scan" and schema_hash:
+        approval = ApprovalSnapshot(
+            id=REVISION_ID,
+            revision=1,
+            schema_hash=schema_hash,
+            answers=answers or {},
+        )
+    return ResolvedBrowserTask(
+        job_id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider=provider,
+        phase=phase,  # type: ignore[arg-type]
+        target_url=target_url,
+        context_id=context_id,
+        approval=approval,
+    )
+
+
 class UnusedBrowserbase:
     pass
 
@@ -420,6 +611,149 @@ def test_prefill_uses_only_exact_approved_answers_and_never_submits() -> None:
     assert result.status == "needs_attention"
     assert page.controls[0].filled == "candidate@example.com"
     assert page.controls[1].filled is None
+    assert page.submit_controls[0].clicks == 0
+
+
+def _google_listbox_fields() -> list[dict[str, Any]]:
+    return _fields()[:1] + [
+        {
+            "dom_index": 1,
+            "key": "Graduation Year",
+            "label": "Graduation Year",
+            "kind": "listbox",
+            "required": True,
+            "disabled": False,
+            "answered": False,
+            "options": ["2025", "2026"],
+            "option_label": "",
+            "accept": "",
+        }
+    ]
+
+
+def test_google_listbox_scan_preserves_group_label_key_and_options() -> None:
+    class GoogleLikeRoot:
+        async def evaluate(self, script: str) -> list[dict[str, Any]]:
+            assert '[role="listbox"]' in script
+            assert "'combobox', 'listbox'" in script
+            return _google_listbox_fields()[1:]
+
+    schema = asyncio.run(scan_form(GoogleLikeRoot()))
+
+    assert schema.public_fields == [
+        {
+            "key": "Graduation Year",
+            "label": "Graduation Year",
+            "kind": "listbox",
+            "type": "listbox",
+            "required": True,
+            "disabled": False,
+            "prefilled": False,
+            "options": ["2025", "2026"],
+            "accepts_resume": False,
+        }
+    ]
+
+
+def test_file_scan_uses_the_google_question_group_label_for_resume_detection() -> None:
+    class GoogleFileRoot:
+        async def evaluate(self, script: str) -> list[dict[str, Any]]:
+            assert "'listbox', 'file'" in script
+            return [
+                {
+                    "dom_index": 0,
+                    "key": "file_upload",
+                    "label": "Upload your Resume / CV",
+                    "kind": "file",
+                    "required": True,
+                    "disabled": False,
+                    "answered": False,
+                    "options": [],
+                    "option_label": "",
+                    "accept": "application/pdf",
+                }
+            ]
+
+    schema = asyncio.run(scan_form(GoogleFileRoot()))
+
+    assert schema.public_fields[0]["label"] == "Upload your Resume / CV"
+    assert schema.public_fields[0]["accepts_resume"] is True
+
+
+def test_google_listbox_selects_exact_approved_year_and_verifies_state() -> None:
+    option_2025 = FakeControl(text="2025", attributes={"data-value": "2025"})
+    option_2026 = FakeControl(text="2026", attributes={"data-value": "2026"})
+    year = FakeControl(options=[option_2025, option_2026])
+
+    def choose_2026() -> None:
+        option_2026.attributes["aria-selected"] = "true"
+        year.text = "2026"
+
+    option_2026.on_click = choose_2026
+    page = FakePage(
+        _google_task("scan", None).target_url,
+        _google_listbox_fields(),
+        controls=[FakeControl(), year],
+        options=[option_2025, option_2026],
+    )
+    schema = _runtime_schema(page, "google_forms")
+    task = _google_task(
+        "prefill",
+        schema.schema_hash,
+        answers={
+            "Email address": "candidate@example.com",
+            "Graduation Year": " 2026 ",
+        },
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            task,
+            None,
+        )
+    )
+
+    assert result.code == "review_required"
+    assert result.filled_count == 2
+    assert option_2025.clicks == 0
+    assert option_2026.clicks == 1
+    assert option_2026.attributes["aria-selected"] == "true"
+
+
+def test_google_listbox_mismatch_fails_closed_before_submit() -> None:
+    option_2026 = FakeControl(text="2026", attributes={"data-value": "2026"})
+    year = FakeControl(options=[option_2026])
+    page = FakePage(
+        _google_task("scan", None).target_url,
+        _google_listbox_fields(),
+        controls=[FakeControl(), year],
+        options=[option_2026],
+        submit_count=1,
+    )
+    schema = _runtime_schema(page, "google_forms")
+    task = _google_task(
+        "submit",
+        schema.schema_hash,
+        answers={
+            "Email address": "candidate@example.com",
+            "Graduation Year": "2027",
+        },
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            task,
+            None,
+        )
+    )
+
+    assert result.code == "required_answers_missing"
+    assert result.missing_required == ("Graduation Year",)
+    assert option_2026.clicks == 0
     assert page.submit_controls[0].clicks == 0
 
 
@@ -452,6 +786,9 @@ def test_resume_is_uploaded_only_to_explicit_resume_or_cv_field() -> None:
     ]
     page = FakePage(_task("scan", None).target_url, fields)
     schema = _runtime_schema(page)
+    assert schema.public_fields[2]["accepts_resume"] is True
+    assert schema.public_fields[2]["accepted_file_types"] == ".pdf"
+    assert schema.public_fields[3]["accepts_resume"] is False
     task = _task(
         "prefill",
         schema.schema_hash,
@@ -471,6 +808,587 @@ def test_resume_is_uploaded_only_to_explicit_resume_or_cv_field() -> None:
     assert result.code == "review_required"
     assert page.controls[2].files == "/tmp/tenant-resume.pdf"
     assert page.controls[3].files is None
+
+
+def test_google_resume_upload_requires_optional_saved_browser_context() -> None:
+    fields = _fields() + [
+        {
+            "dom_index": 2,
+            "key": "resume_file",
+            "label": "Upload Resume / CV",
+            "kind": "file",
+            "required": True,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": "application/pdf",
+        }
+    ]
+    page = FakePage(_google_task("scan", None).target_url, fields)
+    schema = _runtime_schema(page, "google_forms")
+    task = _google_task(
+        "prefill",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            task,
+            "/tmp/tenant-resume.pdf",
+        )
+    )
+
+    assert result.code == "provider_login_required"
+    assert result.submission_state == "not_attempted"
+    assert page.controls[0].filled is None
+    assert page.controls[2].files is None
+
+
+def test_google_resume_upload_reuses_optional_saved_browser_context() -> None:
+    fields = _fields() + [
+        {
+            "dom_index": 2,
+            "key": "resume_file",
+            "label": "Upload Resume / CV",
+            "kind": "file",
+            "required": True,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": ".pdf",
+        }
+    ]
+    page = FakePage(_google_task("scan", None).target_url, fields)
+    schema = _runtime_schema(page, "google_forms")
+    task = _google_task(
+        "prefill",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+        context_id="google-context",
+    )
+    browserbase = FakeBrowserbase()
+    browser = FakeBrowser(page)
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(FakeChromium(browser)),
+    )
+
+    execution = asyncio.run(
+        runtime.execute(task, resume_path="/tmp/tenant-resume.pdf")
+    )
+
+    assert execution.result.code == "review_required"
+    assert page.controls[2].files == "/tmp/tenant-resume.pdf"
+    assert browserbase.created == [("google-context", True)]
+    assert browserbase.ephemeral == []
+    assert browserbase.released == []
+    assert browser.closed is False
+
+
+def test_multiple_resume_upload_controls_fail_closed_before_any_attachment() -> None:
+    fields = _fields() + [
+        {
+            "dom_index": index,
+            "key": key,
+            "label": label,
+            "kind": "file",
+            "required": True,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": "application/pdf",
+        }
+        for index, (key, label) in enumerate(
+            (("resume", "Upload resume"), ("cv", "Attach CV")), start=2
+        )
+    ]
+    page = FakePage(_task("scan", None).target_url, fields)
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            _task("scan", None),
+            None,
+        )
+    )
+
+    assert result.code == "resume_upload_ambiguous"
+    assert page.controls[2].files is None
+    assert page.controls[3].files is None
+
+
+def test_resume_upload_that_excludes_pdf_is_not_approved_for_automation() -> None:
+    fields = _fields() + [
+        {
+            "dom_index": 2,
+            "key": "resume_file",
+            "label": "Upload Resume",
+            "kind": "file",
+            "required": True,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": "application/msword,.docx",
+        }
+    ]
+    page = FakePage(_task("scan", None).target_url, fields)
+    schema = _runtime_schema(page)
+    assert schema.public_fields[2]["accepts_resume"] is False
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            _task("scan", None),
+            None,
+        )
+    )
+
+    assert result.code == "resume_upload_unsupported"
+    assert page.controls[2].files is None
+
+
+def test_required_unrelated_file_control_never_receives_the_private_resume() -> None:
+    fields = _fields() + [
+        {
+            "dom_index": 2,
+            "key": "identity_document",
+            "label": "Upload identity document",
+            "kind": "file",
+            "required": True,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": "application/pdf",
+        }
+    ]
+    page = FakePage(_task("scan", None).target_url, fields)
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            _task("scan", None),
+            None,
+        )
+    )
+
+    assert result.code == "required_file_upload_unsupported"
+    assert page.controls[2].files is None
+
+
+def test_provider_owned_resume_picker_is_never_clicked_or_guessed() -> None:
+    picker = FakeControl(text="Upload Resume Add file")
+    page = FakePage(
+        _google_task("scan", None).target_url,
+        _fields(),
+        upload_prompt_containers=[picker],
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            _google_task("scan", None),
+            None,
+        )
+    )
+
+    assert result.code == "provider_file_picker_unsupported"
+    assert picker.clicks == 0
+
+
+class GooglePickerFileInput(FakeControl):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.on_set_files: Any = None
+
+    async def set_input_files(self, value: str) -> None:
+        await super().set_input_files(value)
+        if self.on_set_files is not None:
+            self.on_set_files(value)
+
+    async def evaluate(self, _script: str) -> dict[str, Any]:
+        if not self.files:
+            return {"count": 0}
+        path = Path(self.files)
+        return {
+            "count": 1,
+            "name": path.name,
+            "type": "application/pdf",
+            "size": path.stat().st_size,
+        }
+
+
+class GooglePickerFrame:
+    def __init__(self, file_input: GooglePickerFileInput) -> None:
+        self.file_input = file_input
+        self.action = FakeControl(text="Upload")
+        self.body = ""
+
+    def locator(self, selector: str) -> FakeLocator:
+        if 'input[type="file"]' in selector:
+            return FakeLocator([self.file_input])
+        if '[role="button"]' in selector:
+            return FakeLocator([self.action])
+        if selector == "body":
+            return FakeLocator(body=self.body)
+        return FakeLocator()
+
+
+class GooglePickerFrameNode(FakeControl):
+    def __init__(self, picker: GooglePickerFrame) -> None:
+        super().__init__(
+            attributes={"src": "https://docs.google.com/picker?protocol=gadgets"}
+        )
+        self.picker = picker
+        self.visible = False
+
+    @property
+    def content_frame(self) -> GooglePickerFrame:
+        return self.picker
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+
+class GooglePickerQuestion(FakeControl):
+    def __init__(self) -> None:
+        super().__init__(text="Resume / CV *\nAdd file")
+        self.trigger = FakeControl(text="Add file")
+
+    def locator(self, selector: str) -> FakeLocator:
+        if 'input[type="file"]' in selector:
+            return FakeLocator()
+        if '[role="button"]' in selector:
+            return FakeLocator([self.trigger])
+        if selector == "body":
+            return FakeLocator(body=self.text)
+        return FakeLocator()
+
+
+class GooglePickerPage(FakePage):
+    def __init__(self) -> None:
+        self.question = GooglePickerQuestion()
+        self.file_input = GooglePickerFileInput(
+            attributes={"accept": "application/pdf"}
+        )
+        self.picker = GooglePickerFrame(self.file_input)
+        self.frame_node = GooglePickerFrameNode(self.picker)
+        super().__init__(
+            _google_task("scan", None).target_url,
+            _fields(),
+            upload_prompt_containers=[self.question],
+            submit_count=1,
+        )
+
+        def open_picker() -> None:
+            self.frame_node.visible = True
+
+        def show_selected_file(value: str) -> None:
+            self.picker.body = Path(value).name
+
+        def finish_upload() -> None:
+            path = Path(self.file_input.files or "resume.pdf")
+            self.picker.body = path.name
+            self.question.text += f"\n{path.name}"
+            self.frame_node.visible = False
+
+        self.question.trigger.on_click = open_picker
+        self.file_input.on_set_files = show_selected_file
+        self.picker.action.on_click = finish_upload
+
+    def locator(self, selector: str) -> Any:
+        if "iframe.picker-frame" in selector:
+            return FakeLocator([self.frame_node])
+        return super().locator(selector)
+
+
+def _google_picker_schema(page: GooglePickerPage) -> Any:
+    return bind_schema_to_target(
+        asyncio.run(
+            scan_form(FakeFormRoot(page), provider="google_forms")
+        ),
+        canonical_form_target("google_forms", page.url),
+    )
+
+
+def test_google_picker_scan_models_one_resume_question_without_opening_it() -> None:
+    page = GooglePickerPage()
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            _google_task("scan", None, context_id="tenant-google-context"),
+            None,
+        )
+    )
+
+    assert result.code == "application_form_scanned"
+    assert result.schema is not None
+    assert result.schema.public_fields[-1]["upload_mode"] == "google_picker"
+    assert result.schema.public_fields[-1]["accepts_resume"] is True
+    assert page.question.trigger.clicks == 0
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_google_picker_upload_uses_one_saved_context_and_verifies_exact_pdf(
+    tmp_path: Path,
+) -> None:
+    resume = tmp_path / "candidate-resume.pdf"
+    resume.write_bytes(b"%PDF-1.7\nprivate test resume")
+    page = GooglePickerPage()
+    schema = _google_picker_schema(page)
+    task = _google_task(
+        "prefill",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+        context_id="tenant-google-context",
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            task,
+            str(resume),
+        )
+    )
+
+    assert result.code == "review_required"
+    assert result.filled_count == 2
+    assert schema.public_fields[-1]["upload_mode"] == "google_picker"
+    assert page.file_input.files == str(resume)
+    assert page.question.trigger.clicks == 1
+    assert page.picker.action.clicks == 1
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_google_picker_resume_never_opens_without_saved_context(
+    tmp_path: Path,
+) -> None:
+    resume = tmp_path / "resume.pdf"
+    resume.write_bytes(b"%PDF-1.7\nprivate test resume")
+    page = GooglePickerPage()
+    schema = _google_picker_schema(page)
+    task = _google_task(
+        "prefill",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+        context_id=None,
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            task,
+            str(resume),
+        )
+    )
+
+    assert result.code == "provider_login_required"
+    assert result.submission_state == "not_attempted"
+    assert page.question.trigger.clicks == 0
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_google_picker_rejects_untrusted_iframe_before_attaching_or_submitting(
+    tmp_path: Path,
+) -> None:
+    resume = tmp_path / "resume.pdf"
+    resume.write_bytes(b"%PDF-1.7\nprivate test resume")
+    page = GooglePickerPage()
+    page.frame_node.attributes["src"] = "https://attacker.example/picker"
+    schema = _google_picker_schema(page)
+    task = _google_task(
+        "prefill",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+        context_id="tenant-google-context",
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            task,
+            str(resume),
+        )
+    )
+
+    assert result.code == "required_answers_missing"
+    assert result.submission_state == "not_attempted"
+    assert page.file_input.files is None
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_google_picker_requires_provider_visible_filename_before_upload_action(
+    tmp_path: Path,
+) -> None:
+    resume = tmp_path / "resume.pdf"
+    resume.write_bytes(b"%PDF-1.7\nprivate test resume")
+    page = GooglePickerPage()
+    page.file_input.on_set_files = None
+    schema = _google_picker_schema(page)
+    task = _google_task(
+        "prefill",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+        context_id="tenant-google-context",
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            task,
+            str(resume),
+        )
+    )
+
+    assert result.code == "required_answers_missing"
+    assert result.submission_state == "not_attempted"
+    assert page.file_input.files == str(resume)
+    assert page.picker.action.clicks == 0
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_google_picker_rejects_pdf_when_real_picker_excludes_it(
+    tmp_path: Path,
+) -> None:
+    resume = tmp_path / "resume.pdf"
+    resume.write_bytes(b"%PDF-1.7\nprivate test resume")
+    page = GooglePickerPage()
+    page.file_input.attributes["accept"] = "image/png,image/jpeg"
+    schema = _google_picker_schema(page)
+    task = _google_task(
+        "prefill",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+        context_id="tenant-google-context",
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            task,
+            str(resume),
+        )
+    )
+
+    assert result.code == "required_answers_missing"
+    assert result.submission_state == "not_attempted"
+    assert page.file_input.files is None
+    assert page.picker.action.clicks == 0
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_google_picker_multiple_resume_questions_fail_before_opening_any_picker() -> None:
+    page = GooglePickerPage()
+    second = GooglePickerQuestion()
+    second.text = "Attach another Resume *\nAdd file"
+    page.upload_prompt_containers.append(second)
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            _google_task("scan", None, context_id="tenant-google-context"),
+            None,
+        )
+    )
+
+    assert result.code == "resume_upload_ambiguous"
+    assert result.submission_state == "not_attempted"
+    assert page.question.trigger.clicks == 0
+    assert second.trigger.clicks == 0
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_uninspectable_upload_widget_fails_closed_before_fill_or_submit() -> None:
+    class BrokenUploadWidget(FakeControl):
+        def locator(self, _selector: str) -> FakeLocator:
+            raise RuntimeError("detached upload widget")
+
+    widget = BrokenUploadWidget(text="Upload Resume Add file")
+    page = FakePage(
+        _google_task("scan", None).target_url,
+        _fields(),
+        submit_count=1,
+        upload_prompt_containers=[widget],
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("google_forms"),  # type: ignore[arg-type]
+            _google_task("scan", None),
+            None,
+        )
+    )
+
+    assert result.code == "file_upload_inspection_failed"
+    assert page.controls[0].filled is None
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_unverified_resume_attachment_blocks_even_an_optional_resume_field() -> None:
+    class UnverifiedUploadControl(FakeControl):
+        async def evaluate(self, _script: str) -> dict[str, Any]:
+            return {"count": 0}
+
+    fields = _fields() + [
+        {
+            "dom_index": 2,
+            "key": "resume_file",
+            "label": "Optional Resume",
+            "kind": "file",
+            "required": False,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": ".pdf",
+        }
+    ]
+    controls = [FakeControl(), FakeControl(), UnverifiedUploadControl()]
+    page = FakePage(
+        _task("scan", None).target_url,
+        fields,
+        controls=controls,
+        submit_count=1,
+    )
+    schema = _runtime_schema(page)
+    task = _task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("greenhouse"),  # type: ignore[arg-type]
+            task,
+            "/tmp/tenant-resume.pdf",
+        )
+    )
+
+    assert result.code == "required_answers_missing"
+    assert result.missing_required == ("Optional Resume",)
+    assert page.submit_controls[0].clicks == 0
 
 
 def test_grouped_checkbox_answer_must_match_at_least_one_captured_option() -> None:
@@ -1064,6 +1982,323 @@ def test_prefill_keeps_bounded_live_review_session_without_exposing_cdp_url() ->
     assert browser.closed is False
 
 
+def test_google_forms_prefill_keeps_ephemeral_live_view_for_review() -> None:
+    target_url = "https://docs.google.com/forms/d/e/example/viewform"
+    page = FakePage(target_url, _fields(), submit_count=1)
+    schema = _runtime_schema(page, "google_forms")
+    task = ResolvedBrowserTask(
+        job_id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="google_forms",
+        phase="prefill",
+        target_url=target_url,
+        context_id=None,
+        approval=ApprovalSnapshot(
+            id=REVISION_ID,
+            revision=1,
+            schema_hash=schema.schema_hash,
+            answers={"Email address": "candidate@example.com"},
+        ),
+    )
+    browserbase = FakeBrowserbase()
+    browser = FakeBrowser(page)
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(
+            FakeChromium(browser)
+        ),
+    )
+
+    execution = asyncio.run(runtime.execute(task, resume_path=None))
+
+    assert execution.result.code == "review_required"
+    assert execution.result.submission_state == "not_attempted"
+    assert execution.details()["live_view_url"].startswith("https://")
+    assert browserbase.ephemeral == [True]
+    assert browserbase.released == []
+    assert browser.closed is False
+    assert page.submit_controls[0].clicks == 0
+
+
+@pytest.mark.parametrize(
+    ("confirmed_url", "confirmed_body"),
+    [
+        (
+            "https://docs.google.com/forms/d/e/example/viewform",
+            "Your response has been recorded.",
+        ),
+        (
+            "https://docs.google.com/forms/d/e/example/formResponse",
+            "Application form",
+        ),
+    ],
+)
+def test_google_forms_submit_clicks_once_and_requires_google_confirmation(
+    confirmed_url: str,
+    confirmed_body: str,
+) -> None:
+    page = FakePage(
+        _google_task("scan", None).target_url,
+        _fields(),
+        submit_count=1,
+        confirmed_url=confirmed_url,
+        confirmed_body=confirmed_body,
+    )
+    schema = _runtime_schema(page, "google_forms")
+    task = _google_task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    browserbase = FakeBrowserbase()
+    browser = FakeBrowser(page)
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(FakeChromium(browser)),
+    )
+
+    execution = asyncio.run(runtime.execute(task, resume_path=None))
+
+    assert execution.result.status == "succeeded"
+    assert execution.result.code == "application_submitted"
+    assert execution.result.submission_state == "confirmed"
+    assert page.submit_controls[0].clicks == 1
+    assert browserbase.ephemeral == [True]
+    assert browserbase.released == ["session-one"]
+    assert browser.closed is True
+    assert "live_view_url" not in execution.details()
+
+
+def test_google_forms_missing_required_fields_retains_actionable_live_view() -> None:
+    page = FakePage(
+        _google_task("scan", None).target_url,
+        _fields(),
+        submit_count=1,
+    )
+    schema = _runtime_schema(page, "google_forms")
+    task = _google_task("submit", schema.schema_hash, answers={})
+    browserbase = FakeBrowserbase()
+    browser = FakeBrowser(page)
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(FakeChromium(browser)),
+    )
+
+    execution = asyncio.run(runtime.execute(task, resume_path=None))
+    details = execution.details()
+
+    assert execution.result.code == "required_answers_missing"
+    assert execution.result.submission_state == "not_attempted"
+    assert details["missing_fields"] == ["Email address"]
+    assert details["live_view_url"].startswith("https://")
+    assert page.submit_controls[0].clicks == 0
+    assert browserbase.released == []
+    assert browser.closed is False
+
+
+def test_google_forms_unconfirmed_click_is_terminal_and_keeps_live_view() -> None:
+    page = FakePage(
+        _google_task("scan", None).target_url,
+        _fields(),
+        submit_count=1,
+    )
+    schema = _runtime_schema(page, "google_forms")
+    task = _google_task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    browserbase = FakeBrowserbase()
+    browser = FakeBrowser(page)
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(FakeChromium(browser)),
+    )
+
+    execution = asyncio.run(runtime.execute(task, resume_path=None))
+
+    assert execution.result.status == "needs_attention"
+    assert execution.result.code == "submission_unconfirmed"
+    assert execution.result.submission_state == "uncertain"
+    assert execution.details()["live_view_url"].startswith("https://")
+    assert page.submit_controls[0].clicks == 1
+    assert browserbase.released == []
+    assert browser.closed is False
+
+
+def test_google_forms_live_view_failure_never_retries_an_uncertain_click() -> None:
+    class FailingLiveViewBrowserbase(FakeBrowserbase):
+        def get_session_live_view(self, _session_id: str) -> dict[str, str]:
+            raise RuntimeError("live view temporarily unavailable")
+
+    page = FakePage(
+        _google_task("scan", None).target_url,
+        _fields(),
+        submit_count=1,
+    )
+    page.submit_controls[0].click_error = TimeoutError("response hidden")
+    schema = _runtime_schema(page, "google_forms")
+    task = _google_task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    browserbase = FailingLiveViewBrowserbase()
+    browser = FakeBrowser(page)
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(FakeChromium(browser)),
+    )
+
+    execution = asyncio.run(runtime.execute(task, resume_path=None))
+
+    assert execution.result.code == "submission_click_unconfirmed"
+    assert execution.result.submission_state == "uncertain"
+    assert page.submit_controls[0].clicks == 1
+    assert "live_view_url" not in execution.details()
+    assert browserbase.released == ["session-one"]
+    assert browser.closed is True
+
+
+def test_invalid_custom_company_target_is_rejected_before_a_metered_session() -> None:
+    task = _provider_task(
+        "company_form",
+        "https://127.0.0.1/private-application",
+        "scan",
+        None,
+    )
+
+    execution = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase()).execute(task, resume_path=None)  # type: ignore[arg-type]
+    )
+
+    assert execution.result.status == "needs_attention"
+    assert execution.result.code == "provider_url_forbidden"
+    assert execution.result.submission_state == "not_attempted"
+
+
+@pytest.mark.parametrize(
+    ("confirmed_body", "expected_code", "expected_state", "retained"),
+    [
+        ("Thank you for applying", "application_submitted", "confirmed", False),
+        ("Application form", "submission_unconfirmed", "uncertain", True),
+    ],
+)
+def test_custom_company_submit_is_exact_host_single_click_and_confirmation_bound(
+    confirmed_body: str,
+    expected_code: str,
+    expected_state: str,
+    retained: bool,
+) -> None:
+    target_url = "https://careers.acme.com/jobs/one/apply"
+    page = FakePage(
+        target_url,
+        _fields(),
+        submit_count=1,
+        confirmed_body=confirmed_body,
+    )
+    schema = _runtime_schema(page, "company_form")
+    task = _provider_task(
+        "company_form",
+        target_url,
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    browserbase = FakeBrowserbase()
+    browser = FakeBrowser(page)
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(FakeChromium(browser)),
+    )
+
+    execution = asyncio.run(runtime.execute(task, resume_path=None))
+
+    assert execution.result.code == expected_code
+    assert execution.result.submission_state == expected_state
+    assert page.controls[0].filled == "candidate@example.com"
+    assert page.submit_controls[0].clicks == 1
+    assert browserbase.ephemeral == [True]
+    assert bool(execution.live_view_url) is retained
+    assert (browserbase.released == []) is retained
+    assert browser.closed is (not retained)
+
+
+def test_custom_company_missing_required_field_pauses_before_click_with_live_view() -> None:
+    target_url = "https://careers.acme.com/jobs/one/apply"
+    page = FakePage(target_url, _fields(), submit_count=1)
+    schema = _runtime_schema(page, "company_form")
+    task = _provider_task(
+        "company_form",
+        target_url,
+        "submit",
+        schema.schema_hash,
+        answers={},
+    )
+    browserbase = FakeBrowserbase()
+    browser = FakeBrowser(page)
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(FakeChromium(browser)),
+    )
+
+    execution = asyncio.run(runtime.execute(task, resume_path=None))
+
+    assert execution.result.code == "required_answers_missing"
+    assert execution.details()["missing_fields"] == ["Email address"]
+    assert execution.details()["live_view_url"].startswith("https://")
+    assert page.submit_controls[0].clicks == 0
+    assert browserbase.released == []
+    assert browser.closed is False
+
+
+@pytest.mark.parametrize(
+    ("confirmed_body", "expected_code", "expected_state"),
+    [
+        ("Your application was sent", "application_submitted", "confirmed"),
+        ("Application form", "submission_unconfirmed", "uncertain"),
+    ],
+)
+def test_yc_dialog_submit_uses_exact_approved_answers_and_one_final_click(
+    confirmed_body: str,
+    expected_code: str,
+    expected_state: str,
+) -> None:
+    target_url = "https://www.workatastartup.com/jobs/12345"
+    page = FakePage(
+        target_url,
+        _fields(),
+        submit_count=1,
+        confirmed_body=confirmed_body,
+    )
+    schema = _runtime_schema(page, "yc")
+    task = _provider_task(
+        "yc",
+        target_url,
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+        context_id="tenant-yc-context",
+    )
+    adapter = get_adapter("yc")
+
+    assert adapter is not None
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            adapter,
+            task,
+            None,
+        )
+    )
+
+    assert result.code == expected_code
+    assert result.submission_state == expected_state
+    assert page.controls[0].filled == "candidate@example.com"
+    assert page.submit_controls[0].clicks == 1
+
+
 class FakeTenantRepository:
     def __init__(
         self,
@@ -1121,13 +2356,80 @@ def test_public_ats_can_resolve_to_an_ephemeral_session_without_saved_context() 
     assert task.context_id is None
 
 
-def test_account_provider_still_requires_a_saved_tenant_context() -> None:
+@pytest.mark.parametrize(
+    ("ciphertext", "expected_context"),
+    [(None, None), ("saved", "google-context")],
+)
+def test_google_forms_context_is_optional_but_reused_when_present(
+    ciphertext: str | None,
+    expected_context: str | None,
+) -> None:
     cipher = TokenCipher(TokenCipher.generate_key())
     bundle = _bundle(cipher)
     bundle.update(
         {
-            "provider": "wellfound",
-            "target_url": "https://wellfound.com/jobs/one",
+            "provider": "google_forms",
+            "target_url": "https://docs.google.com/forms/d/e/example/viewform",
+            "browser_context_id_ciphertext": (
+                cipher.encrypt("google-context") if ciphertext else None
+            ),
+        }
+    )
+    resources = SupabaseTenantResources(FakeTenantRepository(bundle), cipher)
+    job = SimpleNamespace(
+        id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="google_forms",
+        kind="application_scan",
+    )
+
+    task = asyncio.run(resources.resolve(job, "worker-1"))
+
+    assert task.context_id == expected_context
+
+
+def test_custom_company_form_resolves_without_a_saved_login_context() -> None:
+    cipher = TokenCipher(TokenCipher.generate_key())
+    bundle = _bundle(cipher)
+    bundle.update(
+        {
+            "provider": "company_form",
+            "target_url": "https://careers.acme.com/jobs/one/apply",
+            "browser_context_id_ciphertext": None,
+        }
+    )
+    resources = SupabaseTenantResources(FakeTenantRepository(bundle), cipher)
+    job = SimpleNamespace(
+        id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="company_form",
+        kind="application_scan",
+    )
+
+    task = asyncio.run(resources.resolve(job, "worker-1"))
+
+    assert task.context_id is None
+
+
+@pytest.mark.parametrize(
+    ("provider", "target_url"),
+    [
+        ("wellfound", "https://wellfound.com/jobs/one"),
+        ("yc", "https://www.workatastartup.com/jobs/12345"),
+    ],
+)
+def test_account_provider_still_requires_a_saved_tenant_context(
+    provider: str,
+    target_url: str,
+) -> None:
+    cipher = TokenCipher(TokenCipher.generate_key())
+    bundle = _bundle(cipher)
+    bundle.update(
+        {
+            "provider": provider,
+            "target_url": target_url,
             "browser_context_id_ciphertext": None,
         }
     )
@@ -1137,7 +2439,7 @@ def test_account_provider_still_requires_a_saved_tenant_context() -> None:
         id=JOB_ID,
         user_id=USER_ID,
         application_id=APPLICATION_ID,
-        provider="wellfound",
+        provider=provider,
         kind="application_scan",
     )
 
@@ -1314,3 +2616,48 @@ def test_clear_submission_is_recorded_before_worker_reports_success(
     assert outcome.status == expected_status
     assert outcome.code == expected_code
     assert resources.record_calls == 1
+
+
+def test_google_forms_uncertain_submit_completes_as_needs_attention_without_recording() -> None:
+    page = FakePage(_google_task("scan", None).target_url, _fields())
+    schema = _runtime_schema(page, "google_forms")
+    task = _google_task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    provider_result = ProviderResult(
+        status="needs_attention",
+        code="submission_unconfirmed",
+        message="Verify the provider result manually.",
+        provider="google_forms",
+        phase="submit",
+        form_url=task.target_url,
+        schema=schema,
+        filled_count=1,
+        submission_state="uncertain",
+    )
+    resources = FakeManagedResources(task, recorded=True)
+    handler = ManagedBrowserJobHandler(
+        resources,  # type: ignore[arg-type]
+        FakeManagedRuntime(
+            SimpleNamespace(result=provider_result, details=lambda: provider_result.details())
+        ),  # type: ignore[arg-type]
+        "worker-1",
+        ("google_forms",),
+        handle_job,
+    )
+    job = SimpleNamespace(
+        id=JOB_ID,
+        user_id=USER_ID,
+        application_id=APPLICATION_ID,
+        provider="google_forms",
+        kind="application_submit",
+    )
+
+    outcome = asyncio.run(handler(job))
+
+    assert outcome.status == "needs_attention"
+    assert outcome.code == "submission_unconfirmed"
+    assert outcome.details["submission_state"] == "uncertain"
+    assert resources.record_calls == 0

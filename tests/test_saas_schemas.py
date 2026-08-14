@@ -11,6 +11,7 @@ from app.saas.schemas import (
     JobCreate,
     ProfileUpdate,
     PublicAtsDiscoveryRequest,
+    ResumeGuidedDiscoveryRequest,
     ResumeRegister,
     SendApplicationRequest,
     UserSettingsUpdate,
@@ -42,6 +43,15 @@ def test_profile_urls_reject_template_placeholders() -> None:
     assert ProfileUpdate(
         linkedin_url="https://www.linkedin.com/in/saad-rizvi-447451256"
     ).linkedin_url == "https://www.linkedin.com/in/saad-rizvi-447451256"
+
+
+def test_public_resume_url_requires_real_https_url() -> None:
+    url = "https://drive.google.com/file/d/resume-id/view?usp=sharing"
+    assert ProfileUpdate(resume_url=url).resume_url == url
+    with pytest.raises(ValidationError, match="must use https"):
+        ProfileUpdate(resume_url="http://example.test/resume.pdf")
+    with pytest.raises(ValidationError, match="actual public resume URL"):
+        ProfileUpdate(resume_url="https://example.test/CHANGE-ME")
 
 
 def test_google_oauth_client_is_strict_and_secret_is_redacted_from_repr() -> None:
@@ -157,6 +167,44 @@ def test_form_approval_requires_an_exact_sha256_schema_hash() -> None:
 def test_public_ats_intake_rejects_non_http_urls() -> None:
     with pytest.raises(ValidationError):
         PublicAtsDiscoveryRequest(urls=["file:///etc/passwd"])
+
+
+def test_resume_guided_discovery_request_is_strict_and_bounded() -> None:
+    request = ResumeGuidedDiscoveryRequest(idempotency_key="resume-search-001")
+
+    assert request.location is None
+    assert request.remote_only is False
+    assert request.linkedin_limit == 20
+    assert request.feed_limit == 60
+
+    with pytest.raises(ValidationError):
+        ResumeGuidedDiscoveryRequest(
+            idempotency_key="resume-search-002",
+            user_id="00000000-0000-0000-0000-000000000001",
+        )
+    with pytest.raises(ValidationError):
+        ResumeGuidedDiscoveryRequest(
+            idempotency_key="resume-search-003",
+            resume_id="00000000-0000-0000-0000-000000000001",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("location", "x" * 121),
+        ("linkedin_limit", 26),
+        ("feed_limit", 201),
+        ("idempotency_key", "x" * 181),
+    ],
+)
+def test_resume_guided_discovery_request_rejects_oversized_values(
+    field: str, value: object
+) -> None:
+    payload: dict[str, object] = {"idempotency_key": "resume-search-004"}
+    payload[field] = value
+    with pytest.raises(ValidationError):
+        ResumeGuidedDiscoveryRequest(**payload)
 
 
 def test_url_normalization_is_stable_without_fetching() -> None:

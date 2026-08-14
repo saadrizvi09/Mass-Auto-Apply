@@ -10,6 +10,7 @@ INDEX_HTML = (ROOT / "public" / "index.html").read_text(encoding="utf-8")
 STYLES_CSS = (ROOT / "public" / "styles.css").read_text(encoding="utf-8")
 VERCEL_JSON = (ROOT / "vercel.json").read_text(encoding="utf-8")
 SUPABASE_CONFIG = (ROOT / "supabase" / "config.toml").read_text(encoding="utf-8")
+DEV_COMMAND = (ROOT / "dev.command").read_text(encoding="utf-8")
 
 
 def test_every_static_by_id_reference_exists_in_the_document() -> None:
@@ -71,6 +72,81 @@ def test_google_identity_callback_errors_are_safe_and_recoverable() -> None:
     assert 'byId("auth-social").hidden = false' in APP_JS
     assert "const originalNodes = Array.from(button.childNodes)" in APP_JS
     assert "button.replaceChildren(...originalNodes)" in APP_JS
+
+
+def test_loading_system_is_accessible_recoverable_and_checkpoint_driven() -> None:
+    boot = INDEX_HTML.split('id="boot-screen"', 1)[1].split('id="public-site"', 1)[0]
+    assert 'aria-live="polite"' in boot
+    assert 'aria-busy="true"' in boot
+    assert 'id="boot-title"' in boot
+    assert 'id="boot-detail"' in boot
+    assert 'data-boot-step="service"' in boot
+    assert 'data-boot-step="session"' in boot
+    assert 'data-boot-step="workspace"' in boot
+    assert 'id="boot-retry"' in boot
+    assert "function setBootCheckpoint" in APP_JS
+    assert "function showBootFailure" in APP_JS
+    assert 'byId("boot-retry").addEventListener("click", () => window.location.reload())' in APP_JS
+    assert "controller.abort()" in APP_JS
+    assert 'new AppError("The workspace service took too long to respond. Try again."' in APP_JS
+    assert ".boot-dossier" in STYLES_CSS
+    assert ".boot-checkpoints" in STYLES_CSS
+    assert ".boot-file-scan" in STYLES_CSS
+
+
+def test_workspace_loader_stays_up_until_data_is_ready_without_duplicate_opening() -> None:
+    workspace_open = APP_JS.split("async function showWorkspace", 1)[1].split(
+        "function captchaEnabled", 1
+    )[0]
+    assert "state.workspaceOpeningPromise" in workspace_open
+    assert "state.workspaceOpeningUserId === session.user.id" in workspace_open
+    assert "showBootFailure(error)" in workspace_open
+    assert workspace_open.index('byId("workspace").hidden = true') < workspace_open.index(
+        "await waitForWorkspaceLoad(identity)"
+    )
+    assert workspace_open.index("await waitForWorkspaceLoad(identity)") < workspace_open.index(
+        'byId("workspace").hidden = false'
+    )
+    assert workspace_open.index('byId("workspace").hidden = false') < workspace_open.index(
+        "finishBoot()"
+    )
+    assert "WORKSPACE_OPEN_TIMEOUT_MS = 30_000" in APP_JS
+    assert '"workspace_load_timeout"' in APP_JS
+
+
+def test_busy_buttons_keep_their_label_and_expose_real_pending_state() -> None:
+    busy = APP_JS.split("async function withBusy", 1)[1].split(
+        "function isCaptchaProtectedAuthButton", 1
+    )[0]
+    assert "const originalNodes = Array.from(button.childNodes)" in busy
+    assert 'button.setAttribute("aria-busy", "true")' in busy
+    assert "setBusyLabel(button, busyLabel)" in busy
+    assert 'className: "button-pending-spinner"' in busy
+    assert 'attrs: { "aria-hidden": "true" }' in busy
+    assert 'button.removeAttribute("aria-busy")' in busy
+    assert "button.replaceChildren(...originalNodes)" in busy
+    assert "originalAriaLabel" in busy
+    assert "button.disabled = originalDisabled" in busy
+    assert ".button-pending-spinner" in STYLES_CSS
+    assert 'button[data-busy="true"]' in STYLES_CSS
+
+
+def test_worker_progress_uses_real_status_checkpoints_in_a_dismissible_dock() -> None:
+    assert 'id="workflow-dock"' in INDEX_HTML
+    assert 'id="workflow-dock-checkpoints"' in INDEX_HTML
+    assert 'id="workflow-dock-dismiss"' in INDEX_HTML
+    assert 'aria-label="Dismiss workflow status"' in INDEX_HTML
+    assert 'id="resume-discovery-checkpoints"' in INDEX_HTML
+    assert 'id="resume-discovery-progress-bar"' not in INDEX_HTML
+    assert "function discoveryCheckpoint" in APP_JS
+    assert "function renderWorkflowDock" in APP_JS
+    assert "container.dataset.statusSignature === signature" in APP_JS
+    assert "state.workflowDockDismissedRunId === runId" in APP_JS
+    assert 'announce("Workflow status dismissed. Its full history remains in Activity.")' in APP_JS
+    assert "let percent" not in APP_JS
+    assert ".workflow-dock" in STYLES_CSS
+    assert ".discovery-checkpoint.status-running" in STYLES_CSS
+    assert "@media (prefers-reduced-motion: reduce)" in STYLES_CSS
 
 
 def test_google_identity_provider_is_enabled_without_committing_its_secret() -> None:
@@ -170,10 +246,17 @@ def test_supabase_browser_library_is_self_hosted() -> None:
 def test_discovery_and_exact_form_review_are_wired_into_workspace() -> None:
     for identifier in (
         "view-discovery",
-        "linkedin-discovery-form",
+        "view-form-pilot",
+        "resume-discovery-form",
+        "resume-discovery-role-list",
+        "resume-discovery-progress",
+        "resume-discovery-status",
         "discovery-remote-only",
-        "public-feeds-run",
-        "referral-ingest-form",
+        "google-form-intake-form",
+        "google-form-url",
+        "google-form-intake-status",
+        "google-form-queue",
+        "google-form-queue-refresh",
         "job-import-form",
         "ats-link-form",
         "ats-board-form",
@@ -181,10 +264,14 @@ def test_discovery_and_exact_form_review_are_wired_into_workspace() -> None:
         "discovery-job-list",
         "jobs-load-more",
         "application-form-review",
+        "form-application-id",
+        "form-workflow-progress",
+        "form-live-review-link",
         "form-revision-answers",
-        "suggest-form-answers",
-        "approve-form-revision",
-        "prefill-form-revision",
+        "form-submit-preflight",
+        "form-submit-preflight-status",
+        "form-submit-preflight-detail",
+        "form-submit-missing-list",
         "submit-form-revision",
     ):
         assert f'id="{identifier}"' in INDEX_HTML
@@ -195,20 +282,215 @@ def test_discovery_and_exact_form_review_are_wired_into_workspace() -> None:
     assert 'state.jobsHasMore' in APP_JS
     assert 'apiRequest("/discovery/ats/boards"' in APP_JS
     assert 'idempotency_key: discoveryRunKey("public-ats")' in APP_JS
+    assert 'apiRequest("/discovery/resume-guided"' in APP_JS
+    assert 'apiRequest("/discovery/google-forms?limit=100&offset=0"' in APP_JS
+    assert 'groq: true' in APP_JS
     assert 'kind="application_submit"' not in INDEX_HTML
     for copy in (
-        "Job Radar",
-        "LinkedIn Public Job Finder",
-        "Telegram Public Channel Scanner",
-        "Fetch LinkedIn jobs",
-        "Fetch Telegram &amp; RSS jobs",
+        "Résumé-guided job radar",
+        "Find jobs matched to your résumé",
+        "LinkedIn",
+        "Telegram",
+        "RSS",
+        "Find matching jobs",
+        "Form Pilot",
+        "Paste referral alert",
+        "Ready for preparation",
         "Worker required",
-        "no login or Easy Apply",
-        "not private groups",
+        "no LinkedIn login",
+        "private Telegram groups",
     ):
         assert copy in INDEX_HTML
-    assert "unsupported URLs are skipped" in INDEX_HTML
+    assert "Add Google Forms directly in Form Pilot" in INDEX_HTML
     assert "100 published jobs from this screen" in INDEX_HTML
+
+    discovery_view = INDEX_HTML.split('id="view-discovery"', 1)[1].split(
+        'id="view-form-pilot"', 1
+    )[0]
+    form_pilot_view = INDEX_HTML.split('id="view-form-pilot"', 1)[1].split(
+        'id="view-outreach"', 1
+    )[0]
+    assert 'id="google-form-queue"' not in discovery_view
+    assert 'id="referral-ingest-form"' not in discovery_view
+    assert 'id="referral-digest"' not in discovery_view
+    assert "Pasted leads" not in discovery_view
+    assert "Turn shared messages into jobs" not in discovery_view
+    assert 'class="panel discovery-search-panel span-2"' in discovery_view
+    assert 'id="google-form-queue"' in form_pilot_view
+    assert "Parse leads" in form_pilot_view
+    assert "Prepare forms" in form_pilot_view
+    assert "Review &amp; submit" in form_pilot_view
+    assert "One explicit approval" in form_pilot_view
+    assert "Approve &amp; submit in background" in form_pilot_view
+    assert 'id="referral-ingest-form"' in form_pilot_view
+    assert 'id="referral-digest"' in form_pilot_view
+    assert 'id="referral-ingest-status"' in form_pilot_view
+    assert 'id="referral-route-summary"' in form_pilot_view
+    assert 'data-form-intake-mode="digest"' in form_pilot_view
+    assert 'data-form-intake-mode="single"' in form_pilot_view
+    assert 'id="google-form-intake-form"' in form_pilot_view
+    assert 'id="google-form-url"' in form_pilot_view
+    assert "Add &amp; prepare form" in form_pilot_view
+    assert 'id="application-form-review"' in form_pilot_view
+    assert 'id="form-application-id"' in form_pilot_view
+
+    mass_email_review = INDEX_HTML.split('id="view-applications"', 1)[1].split(
+        'id="view-connections"', 1
+    )[0]
+    assert 'id="application-form-review"' not in mass_email_review
+    assert "This queue contains cold-email drafts only" in mass_email_review
+
+    digest_intake = APP_JS.split("async function ingestReferralDigest", 1)[1].split(
+        "async function importJobFile", 1
+    )[0]
+    assert 'apiRequest("/discovery/referrals"' in digest_intake
+    assert "loadJobs(true)" in digest_intake
+    assert "loadGoogleForms(true)" in digest_intake
+    assert "renderReferralRouteSummary(summary)" in digest_intake
+    assert 'No form was submitted and no email was sent' in APP_JS
+
+    direct_intake = APP_JS.split("async function addGoogleFormToPilot", 1)[1].split(
+        "async function queueAtsBoardDiscovery", 1
+    )[0]
+    assert 'providerForJob({ apply_url: url }) !== "google_forms"' in direct_intake
+    assert 'apiRequest("/discovery/ats"' in direct_intake
+    assert 'body: { urls: [url] }' in direct_intake
+    assert 'scanJobApplication(savedJob, "google_forms", button)' in direct_intake
+
+
+def test_resume_discovery_is_one_click_and_refreshes_results_automatically() -> None:
+    assert "DISCOVERY_POLL_INTERVAL_MS = 2_000" in APP_JS
+    assert "DISCOVERY_TERMINAL_STATUSES" in APP_JS
+    assert "monitorResumeDiscoveryRun" in APP_JS
+    assert "resumeDiscoveryMonitoring(identity)" in APP_JS
+    assert 'apiRequest(`/automation-jobs/${encodeURIComponent(jobId)}`' in APP_JS
+    assert "loadJobs(true, identity)" in APP_JS
+    assert "loadGoogleForms(true, identity)" in APP_JS
+    assert "saveDiscoveryRun(run, identity.userId)" in APP_JS
+    assert "Your current search is already running" in APP_JS
+    assert "Follow their progress in Activity, then refresh the results" not in APP_JS
+    assert "Your search is safely queued" in APP_JS
+    assert "restart ./dev.command" not in APP_JS
+
+
+def test_local_development_launcher_supervises_api_and_worker() -> None:
+    assert '"$SAAS_PYTHON" -m worker.main &' in DEV_COMMAND
+    assert '--reload-dir "$PROJECT_DIR/app"' in DEV_COMMAND
+    assert 'kill -0 "$WORKER_PID"' in DEV_COMMAND
+    assert 'kill -0 "$API_PID"' in DEV_COMMAND
+    assert "queued work cannot appear stuck" in DEV_COMMAND
+
+
+def test_outreach_is_a_bounded_review_gated_workflow() -> None:
+    for identifier in (
+        "view-outreach",
+        "outreach-prerequisites",
+        "hunter-setup-form",
+        "hunter-api-key",
+        "hunter-validate",
+        "hunter-quota",
+        "outreach-job-list",
+        "outreach-selection-count",
+        "outreach-find-contacts",
+        "outreach-contact-results",
+        "outreach-create-drafts",
+        "outreach-draft-list",
+        "outreach-send-approved",
+    ):
+        assert f'id="{identifier}"' in INDEX_HTML
+
+    outreach_view = INDEX_HTML.split('id="view-outreach"', 1)[1].split(
+        'id="view-jobs"', 1
+    )[0]
+    for step in (
+        "Select relevant jobs",
+        "Find recruiter emails with Hunter",
+        "Create drafts with Groq, then review",
+        "Send only approved messages",
+    ):
+        assert step in outreach_view
+    assert "Mass Cold Email" in INDEX_HTML
+    assert "Add your Hunter key" in outreach_view
+    assert 'id="hunter-key-message"' in outreach_view
+    assert outreach_view.index('id="hunter-setup-form"') < outreach_view.index('id="outreach-hero-heading"')
+    assert outreach_view.index('id="hunter-setup-form"') < outreach_view.index('id="outreach-job-list"')
+    assert "Select up to 10 saved jobs" in outreach_view
+    assert "Nothing is sent automatically" in outreach_view
+
+    assert 'headers.set("X-Hunter-Api-Key", key)' in APP_JS
+    assert 'title: "Mass Cold Email"' in APP_JS
+    assert 'id="referral-ingest-form"' not in outreach_view
+    assert 'id="referral-digest"' not in outreach_view
+    assert '"hunter-key-message"' in APP_JS
+    assert 'apiRequest("/hunter/validate"' in APP_JS
+    assert '/contacts/hunter?limit=5' in APP_JS
+    assert "state.outreachSelectedJobIds.size >= 10" in APP_JS
+    assert "selected: contacts[0]?.email" not in APP_JS
+    assert "contacts.some((contact) => contact.email === job.contact_email)" in APP_JS
+    assert 'application?.status === "approved"' in APP_JS
+    send_batch = APP_JS.split("async function sendApprovedOutreach", 1)[1].split(
+        "function renderOutreach", 1
+    )[0]
+    assert "await confirmAction({" in send_batch
+    assert "Final Gmail handoff" in send_batch
+    hunter_search = APP_JS.split("async function findOutreachContacts", 1)[1].split(
+        "function renderOutreachDrafts", 1
+    )[0]
+    assert "confirmAction" not in hunter_search
+    assert 'apiRequest("/hunter/validate", { method: "POST", hunter: true })' in hunter_search
+    assert "Hunter will validate the saved key automatically" in APP_JS
+    assert "findButton.disabled = !selected.length || !hunterKey" in APP_JS
+    assert 'id="outreach-credit-estimate"' in outreach_view
+    assert 'idempotency_key: `outreach-send-${application.id}-${crypto.randomUUID()}`' in APP_JS
+
+
+def test_mass_cold_email_contains_build_and_review_subtabs() -> None:
+    sidebar = INDEX_HTML.split('<nav class="workspace-nav"', 1)[1].split("</nav>", 1)[0]
+    assert 'data-view="outreach"' in sidebar
+    assert 'data-view="applications"' not in sidebar
+    assert 'id="draft-count-badge"' in sidebar
+    assert INDEX_HTML.count('data-mass-email-view="outreach"') == 2
+    assert INDEX_HTML.count('data-mass-email-view="applications"') == 2
+    assert INDEX_HTML.count('role="tablist"') >= 2
+    assert 'data-view-panel="outreach" role="tabpanel"' in INDEX_HTML
+    assert 'data-view-panel="applications" role="tabpanel"' in INDEX_HTML
+    assert "Build campaign" in INDEX_HTML
+    assert "Review &amp; send" in INDEX_HTML
+    assert 'url.searchParams.set("tab", "review")' in APP_JS
+    assert 'url.searchParams.get("tab") === "review"' in APP_JS
+    assert 'button.dataset.view === (massEmailView ? "outreach" : view)' in APP_JS
+    assert 'all("[data-mass-email-view]")' in APP_JS
+    assert 'button.tabIndex = active ? 0 : -1' in APP_JS
+    assert '["ArrowLeft", "ArrowRight", "Home", "End"]' in APP_JS
+
+
+def test_native_confirmations_use_accessible_modal_and_hunter_search_runs_directly() -> None:
+    for identifier in (
+        "action-dialog",
+        "action-dialog-title",
+        "action-dialog-message",
+        "action-dialog-cancel",
+        "action-dialog-confirm",
+    ):
+        assert f'id="{identifier}"' in INDEX_HTML
+    dialog = INDEX_HTML.split('id="action-dialog"', 1)[1].split("</dialog>", 1)[0]
+    assert 'aria-labelledby="action-dialog-title"' in dialog
+    assert 'aria-describedby="action-dialog-message"' in dialog
+    assert 'method="dialog"' in dialog
+    assert 'value="cancel"' in dialog
+    assert 'value="confirm"' in dialog
+    assert "window.confirm(" not in APP_JS
+    assert "function confirmAction" in APP_JS
+    assert "dialog.showModal()" in APP_JS
+    assert 'addEventListener("cancel"' in APP_JS
+    assert "event.target === dialog" in APP_JS
+    assert "trigger?.isConnected" in APP_JS
+    assert ".action-dialog::backdrop" in STYLES_CSS
+    assert '.action-dialog[data-tone="danger"]' in STYLES_CSS
+    hunter_search = APP_JS.split("async function findOutreachContacts", 1)[1].split(
+        "function renderOutreachDrafts", 1
+    )[0]
+    assert "confirmAction" not in hunter_search
 
 
 def test_jobs_fit_desk_uses_both_columns_and_resume_profile_controls() -> None:
@@ -226,6 +508,7 @@ def test_jobs_fit_desk_uses_both_columns_and_resume_profile_controls() -> None:
         "profile-college",
         "profile-degree",
         "profile-graduation-year",
+        "profile-resume-url",
     ):
         assert f'id="{identifier}"' in INDEX_HTML
     assert 'class="panel span-2"' not in jobs_view
@@ -234,6 +517,7 @@ def test_jobs_fit_desk_uses_both_columns_and_resume_profile_controls() -> None:
     assert "/analyze`" in APP_JS
     assert 'linkedin_url: "profile-linkedin"' in APP_JS
     assert 'github_url: "profile-github"' in APP_JS
+    assert 'resume_url: nullable("profile-resume-url")' in APP_JS
     assert 'graduation_year: "profile-graduation-year"' in APP_JS
     assert "function isPlaceholderProfileUrl" in APP_JS
     assert "mayReplacePlaceholder" in APP_JS
@@ -269,6 +553,13 @@ def test_resume_and_groq_setup_are_consolidated_on_profile() -> None:
     assert 'switchView("assets")' not in APP_JS
     assert 'if (view === "assets") view = "profile";' in APP_JS
     assert ".profile-source-grid" in STYLES_CSS
+    for selector in (
+        ".mass-email-key-panel",
+        ".mass-email-key-intro",
+        ".hunter-access-stamp",
+        ".hunter-key-message",
+    ):
+        assert selector in STYLES_CSS
 
 
 def test_groq_validation_displays_the_provider_status_instead_of_a_generic_error() -> None:
@@ -281,8 +572,8 @@ def test_groq_validation_displays_the_provider_status_instead_of_a_generic_error
 
 
 def test_local_frontend_assets_are_versioned_to_avoid_stale_validation_code() -> None:
-    assert 'href="/styles.css?v=20260813.1"' in INDEX_HTML
-    assert 'src="/app.js?v=20260813.1"' in INDEX_HTML
+    assert 'href="/styles.css?v=20260814.1"' in INDEX_HTML
+    assert 'src="/app.js?v=20260814.1"' in INDEX_HTML
 
 
 def test_ziprecruiter_is_not_presented_in_hosted_frontend() -> None:
@@ -295,3 +586,88 @@ def test_browser_prefill_live_view_is_rendered_only_for_browserbase_https() -> N
     assert 'job.result?.live_view_url' in APP_JS
     assert 'text: "Open live review"' in APP_JS
     assert 'host.endsWith(".browserbase.com")' in APP_JS
+
+
+def test_form_pilot_auto_suggests_and_submits_one_reviewed_revision_in_background() -> None:
+    assert 'apiRequest("/applications?channel=email&limit=50"' in APP_JS
+    assert 'apiRequest("/applications?channel=ats&limit=50"' in APP_JS
+    assert "formRevisionCanAutoSuggest" in APP_JS
+    assert "maybeSuggestFormAnswers(applicationId, latest)" in APP_JS
+    assert "state.formSuggestionAttempts.add(revision.id)" in APP_JS
+    assert 'byId("form-application-id").value' in APP_JS
+    assert "formRevisionPreflight" in APP_JS
+    assert "refreshFormSubmitPreflight" in APP_JS
+    assert "approveAndSubmitFormRevision" in APP_JS
+    assert '/approve`' in APP_JS
+    assert '/submit`' in APP_JS
+    assert 'idempotency_key: `form-submit-${revision.id}`' in APP_JS
+    assert "formSubmissionIsVerified" in APP_JS
+    assert 'job.result?.code === "application_submitted"' in APP_JS
+    assert 'job.result?.submission_state === "confirmed"' in APP_JS
+    assert "safeBrowserbaseLiveViewUrl(result.live_view_url)" in APP_JS
+    assert 'id="submit-form-revision"' in INDEX_HTML
+    assert "Approve &amp; submit in background" in INDEX_HTML
+    assert "Verified success" in APP_JS
+    assert "Needs attention" in APP_JS
+    assert "openFilledFormForFinalSubmit" not in APP_JS
+    assert "reserveFormReviewWindow" not in APP_JS
+    assert 'window.open("about:blank", "_blank")' in APP_JS  # provider-login Live View only
+    assert '/prefill`' not in APP_JS
+    assert 'id="approve-form-revision"' not in INDEX_HTML
+    assert 'id="prefill-form-revision"' not in INDEX_HTML
+    assert "queueFormRevisionStage" not in APP_JS
+    assert "click Google’s Submit button yourself" not in APP_JS
+    assert ".form-submit-preflight" in STYLES_CSS
+    assert ".form-submit-route" in STYLES_CSS
+    assert ".form-answer-row.has-preflight-error" in STYLES_CSS
+
+
+def test_captured_google_listboxes_render_as_exact_reviewable_options() -> None:
+    assert '["select", "combobox", "listbox", "radio", "dropdown", "multiselect", "checkbox"]' in APP_JS
+    assert 'control = createElement("select"' in APP_JS
+
+
+def test_explicit_company_form_marker_exposes_the_reviewed_scan_action() -> None:
+    assert "job?.metadata?.application_provider" in APP_JS
+    assert '"company_form"' in APP_JS
+
+
+def test_public_resume_url_is_distinct_from_private_resume_upload() -> None:
+    profile_view = INDEX_HTML.split('id="view-profile"', 1)[1].split(
+        'id="view-discovery"', 1
+    )[0]
+    assert 'id="profile-resume-url"' in profile_view
+    assert 'name="resume_url"' in profile_view
+    assert "Public résumé link" in profile_view
+    assert "separate from the private PDF" in profile_view
+    assert '"profile-resume-url": profile.resume_url' in APP_JS
+    assert 'resume_url: nullable("profile-resume-url")' in APP_JS
+    completeness = APP_JS.split("function renderProfileCompleteness", 1)[1].split(
+        "async function saveProfile", 1
+    )[0]
+    assert '["Public résumé link", byId("profile-resume-url").value]' in completeness
+    resume_apply = APP_JS.split("function applyResumeSuggestions", 1)[1].split(
+        "function renderJobIntelligence", 1
+    )[0]
+    assert "profile-resume-url" not in resume_apply
+
+
+def test_form_pilot_merges_server_profile_answers_without_an_extra_resume_input() -> None:
+    form_pilot_view = INDEX_HTML.split('id="view-form-pilot"', 1)[1].split(
+        'id="view-outreach"', 1
+    )[0]
+    assert 'id="profile-resume-url"' not in form_pilot_view
+    assert 'const profileAnswers = revision.profile_answers' in APP_JS
+    assert 'const answers = { ...storedAnswers, ...cachedAnswers, ...profileAnswers }' in APP_JS
+    assert "Sealed revisions deliberately receive an empty profile_answers object" in APP_JS
+    auto_suggest = APP_JS.split("function formRevisionCanAutoSuggest", 1)[1].split(
+        "function formControlHasAnswer", 1
+    )[0]
+    assert "getGroqKey()" not in auto_suggest
+    request_suggest = APP_JS.split("async function requestFormSuggestions", 1)[1].split(
+        "async function maybeSuggestFormAnswers", 1
+    )[0]
+    assert '...(getGroqKey() ? { groq: true } : {})' in request_suggest
+    assert 'id="suggest-form-answers"' not in form_pilot_view
+    assert "Regenerate with Groq" not in form_pilot_view
+    assert 'byId("suggest-form-answers").addEventListener' not in APP_JS

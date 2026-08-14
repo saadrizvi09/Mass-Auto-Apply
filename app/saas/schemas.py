@@ -108,6 +108,7 @@ class ProfileUpdate(StrictModel):
     linkedin_url: str | None = Field(default=None, max_length=2_048)
     github_url: str | None = Field(default=None, max_length=2_048)
     portfolio_url: str | None = Field(default=None, max_length=2_048)
+    resume_url: str | None = Field(default=None, max_length=2_048)
     education: list[dict[str, Any]] | None = None
     skills: list[str] | None = Field(default=None, max_length=200)
     preferences: dict[str, Any] | None = None
@@ -126,6 +127,19 @@ class ProfileUpdate(StrictModel):
         validated = _validated_http_url(value, "URL")
         if is_placeholder_profile_url(validated):
             raise ValueError("Enter your actual profile URL instead of a placeholder")
+        return validated
+
+    @field_validator("resume_url")
+    @classmethod
+    def validate_public_resume_url(cls, value: str | None) -> str | None:
+        validated = _validated_http_url(value, "Public resume URL")
+        if not validated:
+            return validated
+        parsed = urlsplit(validated)
+        if parsed.scheme != "https":
+            raise ValueError("Public resume URL must use https")
+        if is_placeholder_profile_url(validated):
+            raise ValueError("Enter your actual public resume URL instead of a placeholder")
         return validated
 
 
@@ -269,6 +283,18 @@ class ApproveApplicationRequest(StrictModel):
 
 class ReferralDigestIngest(StrictModel):
     text: str = Field(min_length=20, max_length=100_000)
+
+
+class ResumeGuidedDiscoveryRequest(StrictModel):
+    """Bounded inputs for deriving public-job searches from the active resume."""
+
+    location: str | None = Field(default=None, max_length=120)
+    remote_only: bool = False
+    linkedin_limit: int = Field(default=20, ge=1, le=25)
+    feed_limit: int = Field(default=60, ge=1, le=200)
+    idempotency_key: str = Field(
+        min_length=8, max_length=180, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$"
+    )
 
 
 class PublicFeedDiscoveryRequest(StrictModel):

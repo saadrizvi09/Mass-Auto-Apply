@@ -19,7 +19,9 @@ from app.saas.discovery import (
     parse_csv_bytes,
     parse_linkedin_guest_html,
     parse_referral_digest,
+    referral_digest_summary,
     parse_public_ats_board_url,
+    public_company_form_target,
     parse_rss_feed,
     parse_xlsx_bytes,
 )
@@ -70,6 +72,34 @@ def test_provider_detection_does_not_trust_lookalike_hosts() -> None:
     assert detect_provider("https://app.greenhouse.io/people/123") is None
     assert detect_provider("javascript:alert(1)") is None
     assert detect_provider("https://evil.example/?next=https://forms.gle/abc") is None
+
+
+def test_company_form_target_is_explicit_and_exact_host_bound() -> None:
+    url = "https://Careers.Acme.com/jobs/42/apply?source=autoapply#ignored"
+
+    assert detect_provider(url) is None
+    assert public_company_form_target(url) == {
+        "host": "careers.acme.com",
+        "target_url": "https://careers.acme.com/jobs/42/apply?source=autoapply",
+    }
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://careers.acme.com/apply",
+        "https://localhost/apply",
+        "https://127.0.0.1/apply",
+        "https://[::1]/apply",
+        "https://10.0.0.8/apply",
+        "https://user:password@careers.acme.com/apply",
+        "https://careers.acme.com:8443/apply",
+        "https://127.0.0.1.nip.io/apply",
+        "https://careers.internal/apply",
+    ],
+)
+def test_company_form_target_rejects_non_public_or_ambiguous_hosts(url: str) -> None:
+    assert public_company_form_target(url) is None
 
 
 def test_public_ats_urls_become_job_create_items() -> None:
@@ -245,6 +275,100 @@ def test_referral_digest_parses_form_and_email_jobs_without_network() -> None:
     assert jobs[1]["contact_email"] == "careers@beta.example"
     assert jobs[1]["metadata"]["cc"] == ["campus@beta.example"]
     _assert_job_contract(jobs)
+
+
+def test_referral_alert_parser_splits_mixed_apply_routes_and_ignores_promotions() -> None:
+    digest = """
+    Referral Alert 🔥
+
+    1) Company - Blinkit
+    Role - Associate Program Manager (Analyst)
+    Batch - 2023/2024/2025/2026
+    CTC - ₹20 - ₹25 LPA
+    Location - Gurugram
+    Job Responsibilities
+    • Drive end-to-end execution of strategic operational projects
+    How to Apply:
+    https://docs.google.com/forms/d/e/blinkit/viewform
+
+    2) Company - English Gurukul
+    Role - Junior Software Intern (+PPO)
+    Batch - 2024/2025/2026
+    Stipend - ₹30,000/month
+    Location - Remote
+    How to Apply:
+    Email: naveen@englishgurukul.in
+    Subject: Junior Developer Intern
+
+    For Free Hiring Updates Join:
+    https://www.whatsapp.com/channel/0029Vaihz2AHbFVAEBfBGb3I
+
+    3) Company - Livspace
+    Role - Product Intern (+PPO)
+    Batch - 2025/2026/2027/2028
+    Location - Bengaluru
+    How to Apply:
+    https://docs.google.com/forms/d/e/livspace/viewform
+
+    Join our Premium Referral Group:
+    https://topmate.io/sdejobsandinternships
+    Hey Everyone,
+    We have started our paid group to provide interview opportunities.
+    Believe us, you will get more value than expected.
+    """
+
+    jobs = parse_referral_digest(digest)
+
+    assert [(job["company"], job["title"]) for job in jobs] == [
+        ("Blinkit", "Associate Program Manager (Analyst)"),
+        ("English Gurukul", "Junior Software Intern (+PPO)"),
+        ("Livspace", "Product Intern (+PPO)"),
+    ]
+    assert jobs[0]["apply_url"] == "https://docs.google.com/forms/d/e/blinkit/viewform"
+    assert jobs[0]["metadata"]["provider"] == "google_forms"
+    assert jobs[0]["metadata"]["compensation"] == "₹20 - ₹25 LPA"
+    assert jobs[1]["apply_url"] is None
+    assert jobs[1]["contact_email"] == "naveen@englishgurukul.in"
+    assert jobs[1]["metadata"]["email_subject"] == "Junior Developer Intern"
+    assert jobs[2]["metadata"]["discovered_urls"] == [
+        "https://docs.google.com/forms/d/e/livspace/viewform"
+    ]
+    assert all("whatsapp.com" not in job["description"] for job in jobs)
+    assert all("topmate.io" not in job["description"] for job in jobs)
+    assert "paid group" not in jobs[2]["description"].lower()
+    assert "believe us" not in jobs[2]["description"].lower()
+    assert referral_digest_summary(digest, jobs) == {
+        "parsed": 3,
+        "google_forms": 2,
+        "email_apply": 1,
+        "ignored_promotional": 2,
+    }
+    _assert_job_contract(jobs)
+
+
+def test_referral_identity_is_stable_when_numbered_blocks_are_reordered() -> None:
+    first = """
+    1) Company - Acme
+    Role - Backend Intern
+    Email: careers@acme.example
+
+    2) Company - Beta
+    Role - Data Intern
+    Email: jobs@beta.example
+    """
+    reordered = """
+    1) Company - Beta
+    Role - Data Intern
+    Email: jobs@beta.example
+
+    2) Company - Acme
+    Role - Backend Intern
+    Email: careers@acme.example
+    """
+
+    original_ids = {job["company"]: job["external_id"] for job in parse_referral_digest(first)}
+    reordered_ids = {job["company"]: job["external_id"] for job in parse_referral_digest(reordered)}
+    assert reordered_ids == original_ids
 
 
 def test_csv_import_supports_flexible_headers_and_deduplicates() -> None:

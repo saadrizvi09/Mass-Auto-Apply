@@ -13,8 +13,8 @@
       content="default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co; frame-src https://challenges.cloudflare.com; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
     />
     <title>AutoApply Cloud — Your job search, thoughtfully organized</title>
-    <link rel="stylesheet" href="/styles.css?v=20260813.1" />
-    <script type="module" src="/app.js?v=20260813.1"></script>
+    <link rel="stylesheet" href="/styles.css?v=20260814.1" />
+    <script type="module" src="/app.js?v=20260814.1"></script>
   </head>
   <body>
     <a id="skip-link" class="skip-link" href="#public-main">Skip to main content</a>
@@ -22,10 +22,74 @@
     <div id="global-status" class="sr-only" role="status" aria-live="polite"></div>
     <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
-    <div id="boot-screen" class="boot-screen">
-      <div class="brand-mark" aria-hidden="true">A</div>
-      <p>Preparing your workspace…</p>
-      <span class="spinner" aria-hidden="true"></span>
+    <dialog
+      id="action-dialog"
+      class="action-dialog"
+      aria-labelledby="action-dialog-title"
+      aria-describedby="action-dialog-message"
+    >
+      <form id="action-dialog-form" class="action-dialog-card" method="dialog">
+        <aside class="action-dialog-ticket" aria-hidden="true">
+          <span id="action-dialog-ticket-label">Review</span>
+          <strong id="action-dialog-symbol">→</strong>
+          <small>AutoApply action desk</small>
+        </aside>
+        <div class="action-dialog-content">
+          <button id="action-dialog-close" class="action-dialog-close" type="submit" value="cancel" aria-label="Close dialog">×</button>
+          <p id="action-dialog-eyebrow" class="eyebrow">Before you continue</p>
+          <h2 id="action-dialog-title">Review this action</h2>
+          <p id="action-dialog-message">Check the details before continuing.</p>
+          <div class="action-dialog-rule" aria-hidden="true"><span></span></div>
+          <div class="action-dialog-actions">
+            <button id="action-dialog-cancel" class="button button-ghost" type="submit" value="cancel">Keep current state</button>
+            <button id="action-dialog-confirm" class="button button-primary" type="submit" value="confirm">Continue</button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+
+    <div
+      id="boot-screen"
+      class="boot-screen"
+      role="status"
+      aria-live="polite"
+      aria-busy="true"
+      aria-labelledby="boot-title"
+      aria-describedby="boot-detail"
+    >
+      <section class="boot-dossier">
+        <header class="boot-file-header">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true">A</span>
+            <span><strong>AutoApply</strong><small>Cloud</small></span>
+          </div>
+          <span class="boot-file-reference">Workspace file · secure handoff</span>
+        </header>
+        <div class="boot-file-copy">
+          <p class="eyebrow">Opening your application desk</p>
+          <h1 id="boot-title">Preparing your workspace</h1>
+          <p id="boot-detail">Checking that the workspace service is ready.</p>
+        </div>
+        <ol class="boot-checkpoints" aria-label="Workspace loading checkpoints">
+          <li class="is-active" data-boot-step="service" aria-current="step">
+            <span class="boot-checkpoint-mark" aria-hidden="true">01</span>
+            <span><strong>Service desk</strong><small>Checking connection</small></span>
+          </li>
+          <li data-boot-step="session">
+            <span class="boot-checkpoint-mark" aria-hidden="true">02</span>
+            <span><strong>Identity file</strong><small>Waiting to restore sign-in</small></span>
+          </li>
+          <li data-boot-step="workspace">
+            <span class="boot-checkpoint-mark" aria-hidden="true">03</span>
+            <span><strong>Workspace dossier</strong><small>Waiting for your data</small></span>
+          </li>
+        </ol>
+        <div id="boot-recovery" class="boot-recovery" hidden>
+          <p>The page stopped safely before showing incomplete workspace data.</p>
+          <button id="boot-retry" class="button button-primary button-small" type="button">Retry opening workspace</button>
+        </div>
+        <div class="boot-file-scan" aria-hidden="true"><span></span></div>
+      </section>
     </div>
 
     <div id="public-site" hidden>
@@ -313,28 +377,47 @@
         </a>
 
         <nav class="workspace-nav" aria-label="Workspace navigation">
-          <button class="nav-item is-active" type="button" data-view="overview" aria-current="page">
-            <span class="nav-icon" aria-hidden="true">⌂</span><span>Overview</span>
-          </button>
-          <button class="nav-item" type="button" data-view="profile">
-            <span class="nav-icon" aria-hidden="true">◯</span><span>Profile</span>
-          </button>
-          <button class="nav-item" type="button" data-view="discovery">
-            <span class="nav-icon" aria-hidden="true">⌕</span><span>Job Radar</span>
-          </button>
-          <button class="nav-item" type="button" data-view="jobs">
-            <span class="nav-icon" aria-hidden="true">◇</span><span>Jobs</span>
-          </button>
-          <button class="nav-item" type="button" data-view="applications">
-            <span class="nav-icon" aria-hidden="true">✎</span><span>Applications</span>
-            <span id="draft-count-badge" class="nav-badge" hidden>0</span>
-          </button>
-          <button class="nav-item" type="button" data-view="connections">
-            <span class="nav-icon" aria-hidden="true">⌁</span><span>Connections</span>
-          </button>
-          <button class="nav-item" type="button" data-view="automation">
-            <span class="nav-icon" aria-hidden="true">↻</span><span>Activity</span>
-          </button>
+          <div class="nav-group" aria-labelledby="nav-start-label">
+            <span id="nav-start-label" class="nav-group-label">Start</span>
+            <button class="nav-item is-active" type="button" data-view="overview" aria-current="page">
+              <span class="nav-icon" aria-hidden="true">⌂</span><span>Overview</span>
+            </button>
+            <button class="nav-item" type="button" data-view="profile">
+              <span class="nav-icon" aria-hidden="true">◯</span><span>Profile</span>
+            </button>
+          </div>
+
+          <div class="nav-group" aria-labelledby="nav-apply-label">
+            <span id="nav-apply-label" class="nav-group-label">Apply</span>
+            <button class="nav-item" type="button" data-view="discovery">
+              <span class="nav-icon" aria-hidden="true">⌕</span><span>Find jobs</span>
+            </button>
+            <button class="nav-item" type="button" data-view="form_pilot">
+              <span class="nav-icon" aria-hidden="true">▤</span><span>Form Pilot</span>
+              <span id="form-count-badge" class="nav-badge" hidden>0</span>
+            </button>
+            <button class="nav-item" type="button" data-view="outreach">
+              <span class="nav-icon" aria-hidden="true">@</span><span>Mass Cold Email</span>
+              <span id="draft-count-badge" class="nav-badge" hidden>0</span>
+            </button>
+          </div>
+
+          <div class="nav-group" aria-labelledby="nav-library-label">
+            <span id="nav-library-label" class="nav-group-label">Library</span>
+            <button class="nav-item" type="button" data-view="jobs">
+              <span class="nav-icon" aria-hidden="true">◇</span><span>Jobs</span>
+            </button>
+          </div>
+
+          <div class="nav-group" aria-labelledby="nav-system-label">
+            <span id="nav-system-label" class="nav-group-label">System</span>
+            <button class="nav-item" type="button" data-view="connections">
+              <span class="nav-icon" aria-hidden="true">⌁</span><span>Connections</span>
+            </button>
+            <button class="nav-item" type="button" data-view="automation">
+              <span class="nav-icon" aria-hidden="true">↻</span><span>Activity</span>
+            </button>
+          </div>
         </nav>
 
         <div class="sidebar-bottom">
@@ -367,6 +450,27 @@
             <button class="button button-primary button-small" type="button" data-view-target="jobs">Add a job</button>
           </div>
         </header>
+
+        <aside
+          id="workflow-dock"
+          class="workflow-dock"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          aria-busy="false"
+          aria-labelledby="workflow-dock-title"
+          hidden
+        >
+          <span class="workflow-dock-file" aria-hidden="true">RUN</span>
+          <div class="workflow-dock-copy">
+            <span class="workflow-dock-kicker">Live application file</span>
+            <strong id="workflow-dock-title">Public-source search is waiting</strong>
+            <small id="workflow-dock-detail">The worker status will appear here.</small>
+          </div>
+          <div id="workflow-dock-checkpoints" class="workflow-dock-checkpoints" aria-label="Collector checkpoints"></div>
+          <button class="button button-light button-small" type="button" data-view-target="automation">Open activity</button>
+          <button id="workflow-dock-dismiss" class="icon-button inverse" type="button" aria-label="Dismiss workflow status" title="Dismiss" hidden>×</button>
+        </aside>
 
         <section id="view-overview" class="view-panel" data-view-panel="overview">
           <div id="onboarding-banner" class="onboarding-banner" hidden>
@@ -550,6 +654,11 @@
                   <div class="field"><label for="profile-linkedin">LinkedIn profile URL</label><input id="profile-linkedin" name="linkedin_url" type="url" inputmode="url" maxlength="2048" placeholder="https://linkedin.com/in/..." /></div>
                   <div class="field"><label for="profile-github">GitHub profile URL</label><input id="profile-github" name="github_url" type="url" inputmode="url" maxlength="2048" placeholder="https://github.com/..." /></div>
                   <div class="field full-width"><label for="profile-portfolio">Portfolio</label><input id="profile-portfolio" name="portfolio_url" type="url" inputmode="url" maxlength="2048" placeholder="https://..." /></div>
+                  <div class="field full-width">
+                    <label for="profile-resume-url">Public résumé link</label>
+                    <input id="profile-resume-url" name="resume_url" type="url" inputmode="url" maxlength="2048" pattern="https://.*" placeholder="https://drive.google.com/..." aria-describedby="profile-resume-url-hint" />
+                    <small id="profile-resume-url-hint">Use an HTTPS link an employer can open. This is separate from the private PDF stored in your workspace and is never extracted from it.</small>
+                  </div>
                 </div>
                 <label class="check-row"><input id="profile-remote" name="remote" type="checkbox" /><span>Open to remote roles</span></label>
                 <label class="check-row"><input id="profile-complete" name="onboarding_completed" type="checkbox" /><span>Mark onboarding complete</span></label>
@@ -577,93 +686,121 @@
         <section id="view-discovery" class="view-panel" data-view-panel="discovery" hidden>
           <section class="discovery-hero" aria-labelledby="discovery-hero-heading">
             <div class="discovery-hero-copy">
-              <p class="eyebrow">Public job radar</p>
-              <h2 id="discovery-hero-heading">Pull fresh roles from the public job wire.</h2>
-              <p>Search public LinkedIn listings, scan approved Telegram channels and RSS feeds, or import leads. Every result lands in your review queue.</p>
+              <p class="eyebrow">Résumé-guided job radar</p>
+              <h2 id="discovery-hero-heading">Let your evidence tune the public job wire.</h2>
+              <p>Groq selects grounded role directions from your active résumé, then one bounded run checks LinkedIn guest listings, approved Telegram channels, and public RSS feeds.</p>
             </div>
-            <div class="source-ledger" aria-label="Available discovery sources">
-              <span><strong>LIVE FEEDS</strong> Telegram channel scanner</span>
-              <span><strong>GUEST SEARCH</strong> LinkedIn public job finder</span>
-              <span><strong>PASTED LEADS</strong> Referral message extractor</span>
-              <span><strong>STRUCTURED</strong> CSV, Excel + ATS boards</span>
+            <div class="source-ledger" aria-label="Job discovery workflow">
+              <span><strong>RÉSUMÉ PLAN</strong> Groq-grounded role directions</span>
+              <span><strong>PUBLIC ROUTE</strong> LinkedIn, Telegram + RSS</span>
+              <span><strong>LIVE STATUS</strong> Automatic progress and result refresh</span>
+              <span><strong>ONE CLICK</strong> Search, wait, and refresh automatically</span>
             </div>
           </section>
 
           <div id="discovery-result-banner" class="notice" hidden role="status"></div>
 
           <div class="discovery-grid">
-            <section class="panel discovery-search-panel" aria-labelledby="public-search-heading">
-              <div class="panel-heading">
-                <div><p class="eyebrow">Live collectors</p><h2 id="public-search-heading">Fetch jobs from public sources</h2></div>
-                <span class="status-pill status-success">No login needed</span>
+            <section class="panel discovery-search-panel span-2" aria-labelledby="public-search-heading">
+              <div class="panel-heading panel-heading-wrap">
+                <div><p class="eyebrow">Résumé-guided collectors</p><h2 id="public-search-heading">Find jobs matched to your résumé</h2></div>
+                <span class="status-pill status-info">Groq + worker</span>
               </div>
-              <form id="linkedin-discovery-form" class="stack-form source-run-form">
-                <div class="source-run-heading"><span class="source-stamp linkedin-stamp">LI</span><div><strong>LinkedIn Public Job Finder</strong><small>Unofficial guest search · up to 20 listings · no login or Easy Apply.</small></div><span class="status-pill status-warning">Worker required</span></div>
-                <div class="form-grid two-columns">
-                  <div class="field"><label for="discovery-keywords">Role or keywords</label><input id="discovery-keywords" maxlength="100" required placeholder="Backend engineer" /></div>
-                  <div class="field"><label for="discovery-location">Location</label><input id="discovery-location" maxlength="120" placeholder="India or Remote" /></div>
-                </div>
-                <label class="check-row"><input id="discovery-remote-only" type="checkbox" /><span>Remote-only results</span></label>
-                <button class="button button-primary button-small" type="submit">Fetch LinkedIn jobs</button>
+
+              <div class="resume-source-route" aria-label="Search route: LinkedIn, then Telegram, then RSS">
+                <span class="resume-source-stop"><span class="source-stamp linkedin-stamp" aria-hidden="true">LI</span><strong>LinkedIn</strong></span>
+                <span class="source-route-arrow" aria-hidden="true">→</span>
+                <span class="resume-source-stop"><span class="source-stamp feed-stamp" aria-hidden="true">TG</span><strong>Telegram</strong></span>
+                <span class="source-route-arrow" aria-hidden="true">→</span>
+                <span class="resume-source-stop"><span class="source-stamp rss-stamp" aria-hidden="true">RSS</span><strong>RSS</strong></span>
+              </div>
+
+              <form id="resume-discovery-form" class="stack-form resume-discovery-form">
+                <section id="resume-discovery-plan" class="resume-discovery-plan" aria-labelledby="resume-discovery-plan-heading">
+                  <div>
+                    <p class="eyebrow">Groq search plan</p>
+                    <h3 id="resume-discovery-plan-heading">Roles chosen from your evidence</h3>
+                  </div>
+                  <div id="resume-discovery-role-list" class="search-plan-chips" aria-live="polite">
+                    <span class="chip status-neutral">Waiting for résumé analysis</span>
+                  </div>
+                  <small>Only résumé-grounded role directions are used. Review the selected roles when the plan appears.</small>
+                </section>
+
+                <details class="search-settings">
+                  <summary><span>Search settings</span><small>Optional location and remote filter</small></summary>
+                  <div class="form-grid two-columns">
+                    <div class="field">
+                      <label for="discovery-location">Location</label>
+                      <input id="discovery-location" name="location" maxlength="120" autocomplete="address-level2" placeholder="India or Remote" />
+                    </div>
+                    <div class="field resume-remote-field">
+                      <span class="field-label">Work arrangement</span>
+                      <label class="check-row"><input id="discovery-remote-only" name="remote_only" type="checkbox" /><span>Remote-only results</span></label>
+                    </div>
+                  </div>
+                </details>
+
+                <button id="resume-discovery-run" class="button button-primary" type="submit">Find matching jobs</button>
+                <section id="resume-discovery-progress" class="discovery-run-progress" role="status" aria-live="polite" aria-busy="false" hidden>
+                  <div class="discovery-run-progress-heading"><strong id="resume-discovery-progress-title">Searching public sources…</strong><span id="resume-discovery-progress-count">0 of 2</span></div>
+                  <div id="resume-discovery-checkpoints" class="discovery-checkpoints" aria-label="Public-source collector checkpoints"></div>
+                  <p id="resume-discovery-progress-detail">LinkedIn, Telegram, and RSS results will appear here automatically.</p>
+                </section>
+                <p id="resume-discovery-status" class="form-message" role="status" aria-live="polite"></p>
+                <small class="source-safety-note">Uses bounded public pages only: no LinkedIn login, private Telegram groups, or Easy Apply automation.</small>
               </form>
-              <div class="source-divider" aria-hidden="true"></div>
-              <div class="source-run-form">
-                <div class="source-run-heading"><span class="source-stamp feed-stamp">TG</span><div><strong>Telegram Public Channel Scanner</strong><small>Scans 6 approved public channels and 4 RSS feeds—not private groups.</small></div><span class="status-pill status-warning">Worker required</span></div>
-                <button id="public-feeds-run" class="button button-ghost button-small" type="button">Fetch Telegram &amp; RSS jobs</button>
-              </div>
             </section>
 
-            <section class="panel referral-ingest-panel" aria-labelledby="referral-ingest-heading">
-              <div class="panel-heading">
-                <div><p class="eyebrow">Pasted leads</p><h2 id="referral-ingest-heading">Turn referral messages into saved jobs</h2></div>
-                <span class="status-pill status-success">Runs now</span>
-              </div>
-              <form id="referral-ingest-form" class="stack-form">
-                <div class="field">
-                  <label for="referral-digest">Paste the forwarded message</label>
-                  <textarea id="referral-digest" rows="10" minlength="20" maxlength="100000" required placeholder="Paste a referral email, WhatsApp digest, or community post containing job links…"></textarea>
-                  <small>Links and surrounding role/company text are normalized before saving.</small>
-                </div>
-                <button class="button button-accent button-small" type="submit">Extract and save jobs</button>
-              </form>
-            </section>
+            <details class="panel span-2 advanced-intake">
+              <summary>
+                <span class="advanced-intake-summary-copy">
+                  <span class="eyebrow">Advanced intake</span>
+                  <strong>Import files or specific application links</strong>
+                  <small>CSV, Excel, supported application URLs, and public company boards.</small>
+                </span>
+                <span class="advanced-intake-marker" aria-hidden="true">+</span>
+              </summary>
 
-            <section class="panel import-panel" aria-labelledby="job-import-heading">
-              <div class="panel-heading">
-                <div><p class="eyebrow">Batch intake</p><h2 id="job-import-heading">Import jobs from CSV or Excel</h2></div>
-                <span class="status-pill status-neutral">4 MB · 200 rows</span>
-              </div>
-              <form id="job-import-form" class="mini-upload-zone">
-                <input id="job-import-file" class="file-input" type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required />
-                <label for="job-import-file"><span class="upload-icon" aria-hidden="true">⇧</span><strong>Choose a CSV or XLSX</strong><small id="job-import-file-label">Title and company are required; common header names are accepted.</small></label>
-                <button class="button button-primary button-small" type="submit">Import job list</button>
-              </form>
-            </section>
+              <div class="advanced-intake-grid">
+                <section class="advanced-intake-section" aria-labelledby="job-import-heading">
+                  <div class="panel-heading">
+                    <div><p class="eyebrow">Batch intake</p><h2 id="job-import-heading">Import jobs from CSV or Excel</h2></div>
+                    <span class="status-pill status-neutral">4 MB · 200 rows</span>
+                  </div>
+                  <form id="job-import-form" class="mini-upload-zone">
+                    <input id="job-import-file" class="file-input" type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required />
+                    <label for="job-import-file"><span class="upload-icon" aria-hidden="true">⇧</span><strong>Choose a CSV or XLSX</strong><small id="job-import-file-label">Title and company are required; common header names are accepted.</small></label>
+                    <button class="button button-primary button-small" type="submit">Import job list</button>
+                  </form>
+                </section>
 
-            <section class="panel ats-link-panel" aria-labelledby="ats-link-heading">
-              <div class="panel-heading">
-                <div><p class="eyebrow">Application finder</p><h2 id="ats-link-heading">Save supported application links</h2></div>
-                <span class="status-pill status-success">Runs now</span>
+                <section class="advanced-intake-section" aria-labelledby="ats-link-heading">
+                  <div class="panel-heading">
+                    <div><p class="eyebrow">Application finder</p><h2 id="ats-link-heading">Save supported application links</h2></div>
+                    <span class="status-pill status-success">Runs now</span>
+                  </div>
+                  <form id="ats-link-form" class="stack-form">
+                    <div class="field">
+                      <label for="ats-links">Job or application URLs</label>
+                      <textarea id="ats-links" rows="5" required placeholder="One URL per line: Greenhouse, Lever, Ashby, YC, Wellfound, Cutshort, or Instahyre"></textarea>
+                      <small>Recognized links are saved for review. Add Google Forms directly in Form Pilot.</small>
+                    </div>
+                    <button class="button button-ghost button-small" type="submit">Detect and save links</button>
+                  </form>
+                  <div class="source-divider" aria-hidden="true"></div>
+                  <form id="ats-board-form" class="stack-form">
+                    <div class="source-run-heading"><span class="source-stamp ats-stamp" aria-hidden="true">ALL</span><div><strong>Fetch every public role from a company board</strong><small>Uses public Greenhouse, Lever, and Ashby board APIs.</small></div><span class="status-pill status-warning">Worker required</span></div>
+                    <div class="field">
+                      <label for="ats-board-links">Company board URLs</label>
+                      <textarea id="ats-board-links" rows="4" required placeholder="https://jobs.lever.co/company-name"></textarea>
+                      <small>Up to 8 boards and 100 published jobs from this screen. No ATS account is used.</small>
+                    </div>
+                    <button class="button button-primary button-small" type="submit">Fetch board jobs</button>
+                  </form>
+                </section>
               </div>
-              <form id="ats-link-form" class="stack-form">
-                <div class="field">
-                  <label for="ats-links">Job or application URLs</label>
-                  <textarea id="ats-links" rows="7" required placeholder="One URL per line: Greenhouse, Lever, Ashby, Google Forms, YC, Wellfound, Cutshort, or Instahyre"></textarea>
-                  <small>Recognized links are saved for review; unsupported URLs are skipped.</small>
-                </div>
-                <button class="button button-ghost button-small" type="submit">Detect and save links</button>
-              </form>
-              <div class="source-divider" aria-hidden="true"></div>
-              <form id="ats-board-form" class="stack-form">
-                <div class="source-run-heading"><span class="source-stamp ats-stamp" aria-hidden="true">ALL</span><div><strong>Fetch every public role from a company board</strong><small>Uses public Greenhouse, Lever, and Ashby board APIs.</small></div><span class="status-pill status-warning">Worker required</span></div>
-                <div class="field">
-                  <label for="ats-board-links">Company board URLs</label>
-                  <textarea id="ats-board-links" rows="4" required placeholder="https://jobs.lever.co/company-name"></textarea>
-                  <small>Up to 8 boards and 100 published jobs from this screen. No ATS account is used.</small>
-                </div>
-                <button class="button button-primary button-small" type="submit">Fetch board jobs</button>
-              </form>
-            </section>
+            </details>
 
             <section class="panel span-2 discovery-results-panel" aria-labelledby="discovery-results-heading">
               <div class="panel-heading panel-heading-wrap">
@@ -671,6 +808,293 @@
                 <div class="button-row"><button id="discovery-refresh" class="button button-ghost button-small" type="button">Refresh results</button><button class="text-link" type="button" data-view-target="jobs">Open all jobs <span aria-hidden="true">→</span></button></div>
               </div>
               <div id="discovery-job-list" class="discovery-clippings" aria-live="polite"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="view-form-pilot" class="view-panel" data-view-panel="form_pilot" hidden>
+          <section class="form-pilot-hero" aria-labelledby="form-pilot-hero-heading">
+            <div class="form-pilot-hero-copy">
+              <p class="eyebrow">Referral application router</p>
+              <h2 id="form-pilot-hero-heading">Paste a referral alert. Route every application.</h2>
+              <p>Turn one forwarded hiring digest into structured jobs, Google Forms ready for preparation, and email opportunities ready for outreach. A form can leave this desk only after you review its answers and choose the final one-time action.</p>
+            </div>
+            <ol class="form-pilot-route" aria-label="Google Form workflow">
+              <li><span>01</span><strong>Parse leads</strong><small>Digest or form link</small></li>
+              <li><span>02</span><strong>Prepare forms</strong><small>Scan + résumé answers</small></li>
+              <li><span>03</span><strong>Review &amp; submit</strong><small>One explicit approval</small></li>
+            </ol>
+          </section>
+
+          <div class="form-pilot-workspace">
+            <section class="panel form-pilot-intake" aria-labelledby="referral-ingest-heading">
+              <div class="form-pilot-stage-heading">
+                <span class="form-pilot-stage-number" aria-hidden="true">01</span>
+                <div><p class="eyebrow">Route applications</p><h2 id="referral-ingest-heading">Paste referral alert</h2></div>
+              </div>
+              <p id="form-pilot-intake-copy" class="form-intro">Paste the complete Telegram, WhatsApp, or email digest. AutoApply separates each numbered role and keeps the useful application route.</p>
+
+              <div class="form-intake-mode" role="group" aria-label="Choose what to paste">
+                <button class="form-intake-mode-button is-active" type="button" data-form-intake-mode="digest" aria-pressed="true">
+                  <strong>Referral digest</strong><small>Many jobs in one message</small>
+                </button>
+                <button class="form-intake-mode-button" type="button" data-form-intake-mode="single" aria-pressed="false">
+                  <strong>Single form link</strong><small>One Google Form URL</small>
+                </button>
+              </div>
+
+              <form id="referral-ingest-form" class="stack-form referral-ingest-form">
+                <div class="field">
+                  <label for="referral-digest">Paste the full referral message</label>
+                  <textarea id="referral-digest" name="referral_digest" rows="14" minlength="20" maxlength="100000" required placeholder="Referral Alert 🔥&#10;&#10;1) Company - Blinkit&#10;Role - Associate Program Manager&#10;Location - Gurugram&#10;How to Apply:&#10;https://docs.google.com/forms/…"></textarea>
+                  <small>Understands numbered Company, Role, Batch, CTC/Stipend, Location, Google Form, email, subject, and skill sections.</small>
+                </div>
+                <button class="button button-accent" type="submit">Parse &amp; route applications</button>
+                <p id="referral-ingest-status" class="form-message" role="status" aria-live="polite"></p>
+              </form>
+
+              <section id="referral-route-summary" class="referral-route-summary" aria-labelledby="referral-route-summary-heading" hidden>
+                <div class="referral-route-summary-heading">
+                  <div><p class="eyebrow">Routing complete</p><h3 id="referral-route-summary-heading">Applications sorted</h3></div>
+                  <span id="referral-route-total" class="status-pill status-success">0 found</span>
+                </div>
+                <div class="referral-route-ledger">
+                  <div><strong id="referral-route-forms">0</strong><span>Google Forms</span><small>Moved to preparation</small></div>
+                  <div><strong id="referral-route-emails">0</strong><span>Email applications</span><small>Available for outreach</small></div>
+                </div>
+                <p id="referral-route-ignored" class="referral-route-note"></p>
+              </section>
+
+              <form id="google-form-intake-form" class="stack-form single-form-intake" hidden>
+                <div class="field">
+                  <label for="google-form-url">Google Form URL</label>
+                  <input id="google-form-url" name="google_form_url" type="url" inputmode="url" maxlength="2048" required placeholder="https://forms.gle/…" />
+                  <small>Supports forms.gle and docs.google.com/forms links.</small>
+                </div>
+                <button class="button button-accent" type="submit">Add &amp; prepare form</button>
+                <p id="google-form-intake-status" class="form-message" role="status" aria-live="polite"></p>
+              </form>
+            </section>
+
+            <section class="panel form-pilot-inbox" aria-labelledby="google-form-queue-heading">
+              <div class="panel-heading panel-heading-wrap">
+                <div class="form-pilot-stage-heading">
+                  <span class="form-pilot-stage-number" aria-hidden="true">02</span>
+                  <div><p class="eyebrow">Prepare forms</p><h2 id="google-form-queue-heading">Ready for preparation</h2></div>
+                </div>
+                <span id="google-form-count" class="status-pill status-neutral">0 forms</span>
+              </div>
+              <p class="form-intro">Choose <strong>Prepare form</strong> to capture its questions. Groq then suggests grounded answers automatically; you review them before approving one background submission.</p>
+              <p id="google-form-queue-status" class="form-message" role="status" aria-live="polite"></p>
+              <div id="google-form-queue" class="google-form-queue-list form-pilot-queue">
+                <div class="empty-state compact-empty-state">
+                  <span class="empty-state-icon" aria-hidden="true">GF</span>
+                  <strong>No Google Forms waiting</strong>
+                  <p>Parse a referral alert, add a single form, or run Find jobs. Detected forms will appear here automatically.</p>
+                </div>
+              </div>
+              <div class="form-pilot-actions">
+                <button id="google-form-queue-refresh" class="button button-ghost button-small" type="button">Refresh forms</button>
+                <button id="form-pilot-review-jump" class="button button-primary button-small" type="button">03 · Review prepared answers</button>
+              </div>
+            </section>
+          </div>
+
+          <section id="form-pilot-review" class="panel form-pilot-review" aria-labelledby="form-pilot-review-heading">
+            <div class="form-pilot-review-header">
+              <div class="form-pilot-stage-heading">
+                <span class="form-pilot-stage-number" aria-hidden="true">03</span>
+                <div><p class="eyebrow">Review prepared answers</p><h2 id="form-pilot-review-heading">Your final form desk</h2></div>
+              </div>
+              <span id="form-application-status-pill" class="status-pill status-neutral">Choose a prepared form</span>
+            </div>
+            <p class="form-intro">Groq fills only answers grounded in your résumé and profile. Review every field here, then use one explicit action to seal this exact revision and queue its background submission. Form Pilot reports only provider-verified success; anything uncertain stops for your attention.</p>
+            <input id="form-application-id" type="hidden" />
+            <p id="form-application-job-context" class="draft-context">Choose <strong>Prepare form</strong> or <strong>Review prepared form</strong> above to begin.</p>
+            <section id="application-form-review" class="form-revision-review" aria-labelledby="application-form-review-heading">
+              <div class="form-revision-heading">
+                <div><p class="eyebrow">Captured form revision</p><h3 id="application-form-review-heading">Review application answers</h3></div>
+                <span id="form-revision-status" class="status-pill status-neutral">Not scanned</span>
+              </div>
+              <p id="form-revision-context" class="form-intro">Prepare a Google Form to capture its visible questions.</p>
+              <div id="form-workflow-progress" class="form-workflow-progress" role="status" aria-live="polite" hidden>
+                <span class="form-workflow-orbit" aria-hidden="true"><span></span></span>
+                <div class="form-workflow-progress-copy">
+                  <div class="form-workflow-progress-heading">
+                    <strong id="form-workflow-progress-title">Preparing your form</strong>
+                    <span id="form-workflow-progress-value">Starting</span>
+                  </div>
+                  <p id="form-workflow-progress-detail">Form Pilot is waiting for the isolated worker.</p>
+                  <div class="progress-track" aria-hidden="true"><span id="form-workflow-progress-bar"></span></div>
+                </div>
+              </div>
+              <div id="form-revision-answers" class="form-answer-list"></div>
+              <section id="form-submit-preflight" class="form-submit-preflight" aria-labelledby="form-submit-preflight-heading" aria-live="polite" hidden>
+                <div class="form-submit-preflight-heading">
+                  <span class="form-submit-ticket-mark" aria-hidden="true">✓</span>
+                  <div>
+                    <p class="eyebrow">One-time submission check</p>
+                    <h4 id="form-submit-preflight-heading">Review readiness</h4>
+                  </div>
+                  <span id="form-submit-preflight-status" class="status-pill status-neutral">Waiting</span>
+                </div>
+                <p id="form-submit-preflight-detail">Prepare a form to check every required answer before submission.</p>
+                <ul id="form-submit-missing-list" class="form-submit-missing-list" aria-label="Answers needing attention" hidden></ul>
+                <ol class="form-submit-route" aria-label="Background submission progress">
+                  <li data-form-submit-stage="review"><span>01</span><strong>Review</strong></li>
+                  <li data-form-submit-stage="queue"><span>02</span><strong>Queue</strong></li>
+                  <li data-form-submit-stage="submit"><span>03</span><strong>Submit</strong></li>
+                  <li data-form-submit-stage="verify"><span>04</span><strong>Verify</strong></li>
+                </ol>
+              </section>
+              <div class="form-actions wrap-actions form-review-actions">
+                <button id="submit-form-revision" class="button button-accent form-submit-button" type="button" aria-describedby="form-submit-preflight-detail form-revision-message">Approve &amp; submit in background</button>
+                <a id="form-live-review-link" class="button button-ghost" href="#" target="_blank" rel="noopener noreferrer" hidden>Open Live View to finish</a>
+              </div>
+              <p id="form-revision-message" class="form-message" role="status" aria-live="polite"></p>
+            </section>
+          </section>
+        </section>
+
+        <section id="view-outreach" class="view-panel" data-view-panel="outreach" role="tabpanel" aria-label="Build campaign" hidden>
+          <nav class="mass-email-tabs" aria-label="Mass Cold Email workspace" role="tablist">
+            <button class="mass-email-tab is-active" type="button" role="tab" tabindex="0" data-mass-email-view="outreach" aria-controls="view-outreach" aria-selected="true">
+              <span class="mass-email-tab-index" aria-hidden="true">01</span>
+              <span><strong>Build campaign</strong><small>Select jobs, find contacts, and draft</small></span>
+            </button>
+            <button class="mass-email-tab" type="button" role="tab" tabindex="-1" data-mass-email-view="applications" aria-controls="view-applications" aria-selected="false">
+              <span class="mass-email-tab-index" aria-hidden="true">02</span>
+              <span><strong>Review &amp; send</strong><small>Approve exact messages and Gmail sends</small></span>
+              <span class="mass-email-tab-badge" data-draft-tab-count hidden>0</span>
+            </button>
+          </nav>
+
+          <section class="panel mass-email-key-panel" aria-labelledby="hunter-access-heading">
+            <div class="mass-email-key-intro">
+              <span class="hunter-access-stamp" aria-hidden="true">H</span>
+              <div>
+                <p class="eyebrow">Start here · Contact finder</p>
+                <h2 id="hunter-access-heading">Add your Hunter key</h2>
+                <p>Save and validate your key before searching recruiter contacts. The key stays in this browser and is sent only for validation or a contact search you start.</p>
+              </div>
+              <span id="hunter-key-status" class="status-pill status-neutral" role="status" aria-live="polite">Key not saved</span>
+            </div>
+
+            <form id="hunter-setup-form" class="hunter-setup-form hunter-setup-top" autocomplete="off">
+              <div class="field">
+                <label for="hunter-api-key">Hunter API key</label>
+                <input id="hunter-api-key" name="hunter_api_key" type="password" maxlength="512" spellcheck="false" autocomplete="off" placeholder="Enter your Hunter key" />
+                <small>Need a key? <a class="text-link" href="https://hunter.io/api-keys" target="_blank" rel="noopener noreferrer">Open Hunter API keys <span aria-hidden="true">↗</span></a></small>
+              </div>
+              <div class="hunter-key-actions">
+                <button class="button button-primary button-small" type="submit">Save in browser</button>
+                <button id="hunter-validate" class="button button-ghost button-small" type="button">Validate</button>
+                <button id="hunter-delete" class="button button-danger-quiet button-small" type="button">Delete</button>
+              </div>
+              <div class="hunter-quota-row"><span>Hunter search allowance</span><strong id="hunter-quota" aria-live="polite">Not checked</strong></div>
+              <p id="hunter-key-message" class="form-message hunter-key-message" role="status" aria-live="polite"></p>
+            </form>
+          </section>
+
+          <section class="outreach-hero" aria-labelledby="outreach-hero-heading">
+            <div>
+              <p class="eyebrow">Review-gated mass cold email</p>
+              <h2 id="outreach-hero-heading">Find the right contact. Draft carefully. Send after review.</h2>
+              <p>Select up to 10 saved jobs, find public professional contacts with Hunter, create grounded drafts with Groq, then review every message before Gmail can send it.</p>
+            </div>
+            <ol class="outreach-route" aria-label="Mass cold email workflow stages">
+              <li><span>1</span><strong>Relevant jobs</strong></li>
+              <li><span>2</span><strong>Hunter contacts</strong></li>
+              <li><span>3</span><strong>Groq drafts</strong></li>
+              <li><span>4</span><strong>Gmail send</strong></li>
+            </ol>
+          </section>
+
+          <div id="outreach-prerequisites" class="notice outreach-prerequisites" role="status" aria-live="polite">
+            Checking your profile, active résumé, Groq key, Hunter key, and Gmail connection…
+          </div>
+
+          <div class="outreach-workflow">
+            <section class="panel outreach-stage" aria-labelledby="outreach-stage-jobs-heading">
+              <span class="outreach-stage-number" aria-hidden="true">1</span>
+              <div class="outreach-stage-content">
+                <div class="panel-heading panel-heading-wrap">
+                  <div><p class="eyebrow">Choose deliberately</p><h2 id="outreach-stage-jobs-heading">Select relevant jobs</h2></div>
+                  <span id="outreach-selection-count" class="status-pill status-neutral" role="status" aria-live="polite">0 of 10 selected</span>
+                </div>
+                <p id="outreach-selection-note" class="form-intro">Choose no more than 10 roles whose requirements genuinely match your résumé. Mass Cold Email never applies or sends on selection.</p>
+                <div id="outreach-job-list" class="outreach-choice-list">
+                  <div class="empty-state compact-empty-state">
+                    <span class="empty-state-icon" aria-hidden="true">◇</span>
+                    <strong>No relevant jobs loaded</strong>
+                    <p>Save and rank jobs first, then return here to choose a focused outreach batch.</p>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel outreach-stage" aria-labelledby="outreach-stage-contacts-heading">
+              <span class="outreach-stage-number" aria-hidden="true">2</span>
+              <div class="outreach-stage-content">
+                <div class="panel-heading panel-heading-wrap">
+                  <div><p class="eyebrow">Public contact discovery</p><h2 id="outreach-stage-contacts-heading">Find recruiter emails with Hunter</h2></div>
+                </div>
+                <p class="form-intro">Search every selected company for public HR and recruiting contacts. A saved key is validated automatically when you start; each company may use one Hunter search credit. Contacts remain leads for review, not proof of a personal relationship.</p>
+
+                <div class="outreach-stage-actions">
+                  <button id="outreach-find-contacts" class="button button-primary" type="button" aria-describedby="outreach-selection-note">Find contacts for selected jobs</button>
+                  <span id="outreach-credit-estimate" class="outreach-credit-estimate" role="status">Select jobs to see the Hunter credit estimate.</span>
+                </div>
+                <p id="outreach-contact-status" class="form-message" role="status" aria-live="polite"></p>
+                <div id="outreach-contact-results" class="outreach-result-list">
+                  <div class="empty-state compact-empty-state">
+                    <span class="empty-state-icon" aria-hidden="true">@</span>
+                    <strong>No contacts searched yet</strong>
+                    <p>Validated results will show the person, role, company, confidence, and source for review.</p>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel outreach-stage" aria-labelledby="outreach-stage-drafts-heading">
+              <span class="outreach-stage-number" aria-hidden="true">3</span>
+              <div class="outreach-stage-content">
+                <div class="panel-heading panel-heading-wrap">
+                  <div><p class="eyebrow">Grounded drafting</p><h2 id="outreach-stage-drafts-heading">Create drafts with Groq, then review</h2></div>
+                  <span class="status-pill status-warning">Approval required</span>
+                </div>
+                <p class="form-intro">Groq may draft from the selected job, your saved facts, and the reviewed contact. It cannot invent referrals, relationships, achievements, or qualifications.</p>
+                <div class="outreach-stage-actions">
+                  <button id="outreach-create-drafts" class="button button-primary" type="button">Create drafts for reviewed contacts</button>
+                  <button class="button button-ghost" type="button" data-view-target="applications">Open Review &amp; send</button>
+                </div>
+                <p id="outreach-draft-status" class="form-message" role="status" aria-live="polite"></p>
+                <div id="outreach-draft-list" class="outreach-result-list">
+                  <div class="empty-state compact-empty-state">
+                    <span class="empty-state-icon" aria-hidden="true">✎</span>
+                    <strong>No cold-email drafts yet</strong>
+                    <p>Every generated message remains a draft until you review and approve its exact content.</p>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel outreach-stage outreach-send-stage" aria-labelledby="outreach-stage-send-heading">
+              <span class="outreach-stage-number" aria-hidden="true">4</span>
+              <div class="outreach-stage-content">
+                <div class="panel-heading panel-heading-wrap">
+                  <div><p class="eyebrow">Approved Gmail handoff</p><h2 id="outreach-stage-send-heading">Send only approved messages</h2></div>
+                  <span class="status-pill status-info">Gmail connection required</span>
+                </div>
+                <div class="outreach-review-gate">
+                  <strong>Review gate</strong>
+                  <p>Nothing is sent automatically. Each exact message must be reviewed and approved in Review &amp; send; edits invalidate approval and require another review.</p>
+                </div>
+                <div class="outreach-stage-actions">
+                  <button id="outreach-send-approved" class="button button-accent" type="button">Send approved messages with Gmail</button>
+                </div>
+                <p id="outreach-send-status" class="form-message" role="status" aria-live="polite"></p>
+              </div>
             </section>
           </div>
         </section>
@@ -748,7 +1172,27 @@
           </div>
         </section>
 
-        <section id="view-applications" class="view-panel" data-view-panel="applications" hidden>
+        <section id="view-applications" class="view-panel" data-view-panel="applications" role="tabpanel" aria-label="Review and send" hidden>
+          <nav class="mass-email-tabs" aria-label="Mass Cold Email workspace" role="tablist">
+            <button class="mass-email-tab" type="button" role="tab" tabindex="-1" data-mass-email-view="outreach" aria-controls="view-outreach" aria-selected="false">
+              <span class="mass-email-tab-index" aria-hidden="true">01</span>
+              <span><strong>Build campaign</strong><small>Select jobs, find contacts, and draft</small></span>
+            </button>
+            <button class="mass-email-tab is-active" type="button" role="tab" tabindex="0" data-mass-email-view="applications" aria-controls="view-applications" aria-selected="true">
+              <span class="mass-email-tab-index" aria-hidden="true">02</span>
+              <span><strong>Review &amp; send</strong><small>Approve exact messages and Gmail sends</small></span>
+              <span class="mass-email-tab-badge" data-draft-tab-count hidden>0</span>
+            </button>
+          </nav>
+
+          <section class="mass-email-review-intro" aria-labelledby="mass-email-review-heading">
+            <div>
+              <p class="eyebrow">Your approval desk</p>
+              <h2 id="mass-email-review-heading">Nothing leaves until you approve the exact content.</h2>
+            </div>
+            <p>This queue contains cold-email drafts only. Open a message, make any edits, approve the current version, then send it through your connected Gmail account.</p>
+          </section>
+
           <div class="content-grid application-layout">
             <section class="panel applications-panel" aria-labelledby="application-list-heading">
               <div class="panel-heading panel-heading-wrap">
@@ -794,21 +1238,6 @@
                   <button id="clear-application" class="link-button" type="button">Close editor</button>
                 </div>
               </fieldset>
-              <section id="application-form-review" class="form-revision-review" hidden aria-labelledby="application-form-review-heading">
-                <div class="form-revision-heading">
-                  <div><p class="eyebrow">Captured form revision</p><h3 id="application-form-review-heading">Review application answers</h3></div>
-                  <span id="form-revision-status" class="status-pill status-neutral">Not scanned</span>
-                </div>
-                <p id="form-revision-context" class="form-intro">Scan this application form before approving any answers.</p>
-                <div id="form-revision-answers" class="form-answer-list"></div>
-                <div class="form-actions wrap-actions">
-                  <button id="suggest-form-answers" class="button button-ghost" type="button">Suggest with Groq</button>
-                  <button id="approve-form-revision" class="button button-primary" type="button">Approve this revision</button>
-                  <button id="prefill-form-revision" class="button button-ghost" type="button">Prefill in browser</button>
-                  <button id="submit-form-revision" class="button button-accent" type="button">Submit approved revision</button>
-                </div>
-                <p id="form-revision-message" class="form-message" role="status"></p>
-              </section>
               <p id="application-editor-message" class="form-message" role="status"></p>
             </form>
           </div>

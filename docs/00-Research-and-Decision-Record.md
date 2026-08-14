@@ -1,7 +1,7 @@
 # AutoApply Cloud — Research and Decision Record
 
 **Status:** Approved for implementation
-**Date:** 2026-08-11
+**Date:** 2026-08-11; implementation contract updated 2026-08-13
 **Scope:** Conversion of the local, single-user AutoApply application into a public,
 multi-user product whose web control plane deploys to Vercel.
 
@@ -175,24 +175,47 @@ The hosted managed-browser provider set is `google_forms`, `greenhouse`, `lever`
 `ashby`, `yc`, `wellfound`, `cutshort`, and `instahyre`. ZipRecruiter is removed from the
 hosted catalog and worker rather than represented as a fragile integration. This set is
 a connection/provider registry, not a claim of eight end-to-end application flows.
-Greenhouse and one-page Google Forms have aligned application handlers; branching or
-multi-page Google Forms are unsupported. Lever and Ashby have safe mappings with
-read-only live scan evidence, but remain disabled pending controlled prefill and submit
-confirmation tests. Wellfound still needs a signed-in canary. YC, Cutshort, and
-Instahyre are connection-only and intentionally stop until tenant-aware multi-step state
-machines are implemented and validated. Where an application handler is enabled, the
-worker splits handling into
-three observable jobs:
+Greenhouse has the initial aligned generic application handler. One-page Google Forms
+use a narrower, user-controlled flow; branching or multi-page Google Forms are
+unsupported. Lever and Ashby have safe mappings with read-only live scan evidence, but
+remain disabled pending controlled submit-confirmation tests. Wellfound still needs a
+signed-in canary. The worker contains a YC adapter and an exact-host generic public
+company-form adapter, but both are launch-gated controlled-canary paths rather than
+enabled public capabilities. Cutshort and Instahyre remain connection-only until
+tenant-aware multi-step state machines are implemented and validated. A generic
+provider handler may split work into three observable jobs:
 
 1. **scan** records the provider URL, detected field schema, proposed answers, and résumé;
-2. **prefill** fills only a user-approved immutable form revision and does not submit;
-3. **submit** revalidates that exact revision and requires a separate explicit action.
+2. **prefill** is an observable diagnostic/canary stage that fills only a user-approved
+   immutable revision without submission; and
+3. **submit** revalidates that exact revision, required-answer preflight, and provider
+   schema before one approved external action.
+
+Google Forms use that third worker job in the normal public flow. Their sequence is:
+
+1. an explicit **Prepare form** action queues a durable scan and records the detected
+   schema and proposed revision;
+2. after scan success, the signed-in browser automatically calls the foreground Groq
+   suggestion endpoint once for the eligible revision when a valid local key exists;
+3. the user reviews and edits the exact revision inside Form Pilot, then explicitly
+   chooses **Approve & submit in background**;
+4. the API atomically seals the latest exact revision, verifies complete required
+   answers, and queues one idempotent `application_submit`; and
+5. the worker rescans, fills only the sealed values, activates the unambiguous submit
+   control once, and reports success only after freshly observed provider confirmation.
+
+The automatic suggestion request is neither approval nor submission. It is deduplicated
+per revision in browser state, carries the key only for that foreground request, and
+cannot be performed by the worker after the browser closes. The explicit combined
+approval action is the Google Forms submission boundary; a queued or running job is not
+success. Only `application_submitted` with `submission_state=confirmed` is success.
 
 The first approval may atomically replace proposed answers with the exact answers shown
 to the user and then seals them. Any later answer change—or any selected résumé, target
 URL, or detected field-schema change—requires a new revision. CAPTCHA, MFA, expired
 login, unfamiliar required fields, and ambiguous success confirmations stop as
-`needs_attention`; none is bypassed or interpreted as success.
+`needs_attention`; none is bypassed or interpreted as success. Live View is retained
+only for that attention fallback, not as a required final step on successful runs.
 
 This capability does not override a target site's terms. An implemented adapter remains
 disabled until the operator supplies Browserbase credentials, an always-on worker, and
@@ -212,23 +235,31 @@ returned 33 fields (28 required), Lever returned 51 (30 required), and an Ashby
 Every probe reported zero filled fields and `submission_state=not_attempted`. A stale
 Ashby search result correctly returned `application_form_not_found`; resolving a current
 listed `applyUrl` removed that false test input. These are read-only selector and
-lifecycle checks, not approval to enable public prefill or submission. Controlled test
-postings are still required for immutable approval, prefill-only review, explicit
-submit, confirmation evidence, cancellation, and idempotency.
+lifecycle checks, not approval to enable public submission. Controlled test postings
+are still required for immutable approval, required-answer preflight, submit-control
+uniqueness, confirmation evidence, cancellation, and idempotency. A Google Forms canary
+must prove that an exact approved revision is the only submitted payload, that success
+requires a freshly observed confirmation, and that uncertain outcomes stop at
+`needs_attention` without blind retry.
 
 The same Free project also preserved a `keepAlive` session as `RUNNING` after the
 Playwright client disconnected, returned a Live View URL, and accepted explicit session
 release and context deletion. This is observed behavior for the configured project,
 not a guarantee that Browserbase will retain that capability or pricing; deployment
-must keep the review-handoff canary in its release gate.
+must keep the needs-attention Live View canary in its release gate.
 
 ### 7. A browser-persisted Groq key and autonomous jobs are different modes
 
 The requested bring-your-own Groq key will be stored in that user's browser
 `localStorage`. It is never written to Supabase or Vercel. The browser sends it in an
-authorization header only for an active draft-generation request. This satisfies
-browser persistence but means a background worker cannot generate new text after that
-browser closes; queued jobs must contain already-approved generated content.
+authorization header only for an active foreground AI request, including résumé
+analysis, email drafting, and the automatic post-scan Form Pilot suggestion request.
+This satisfies browser persistence but means a background worker cannot generate new
+text after that browser closes; queued jobs must contain already-approved generated
+content. Form Pilot therefore observes a completed scan in the signed-in page,
+automatically requests at most one suggestion set for that eligible revision, and then
+requires the user to review the exact answers before explicitly approving their
+background submission.
 
 Groq recommends never exposing keys in frontend code and using a backend proxy. This
 product therefore never calls Groq directly from JavaScript; the key transits the HTTPS
@@ -254,6 +285,13 @@ Résumé uploads use five deterministic, private filenames per account. Storage 
 and uniqueness enforce the object ceiling, while `register_resume` locks the user,
 verifies the object exists, and changes the active résumé in one transaction. This
 closes upload/registration races without routing PDF bytes through Vercel.
+
+Employer-visible URL fields use a separate fact boundary. `profiles.graduation_year`
+deterministically answers recognized passout/graduation-year questions. A recognized
+résumé/CV link question may use only the user's explicit public HTTPS
+`profiles.resume_url`; the private Storage path, an expiring signed URL, or a link guessed
+from the uploaded PDF is never substituted. Both values remain editable facts that the
+user reviews before sealing a form revision.
 
 Tenant Gmail send history normally cascades on account deletion. That alone would let a
 sender delete/recreate an AutoApply account and reset provider-level caps. The product
@@ -289,10 +327,13 @@ and [Turnstile CSP](https://developers.cloudflare.com/turnstile/reference/conten
 | Gmail reply scanning | Schema-ready, disabled | Requires restricted read scopes |
 | LinkedIn manual handoff | Implement | Profile URL and user-controlled external navigation |
 | Hosted LinkedIn Easy Apply | Disabled | No candidate API; prohibited automation |
-| Greenhouse and one-page Google Forms browser flow | Aligned scan → approved prefill → explicit submit | Browserbase context and durable worker required; live staging is still a launch gate |
+| Greenhouse browser flow | Aligned scan → exact review → separately authorized submit | Browserbase context and durable worker required; live staging is still a launch gate |
+| One-page Google Forms browser flow | Scan → browser auto-suggest → explicit exact approval-bound background submit → verified confirmation | Browserbase and a continuously deployed worker outside Vercel are required; Live View is only a `needs_attention` fallback |
 | Lever/Ashby browser flow | Read-only live scan passed; full flow remains fail-closed | Do not enable until controlled prefill and submit-confirmation canaries pass |
 | Wellfound browser flow | Safe fail-closed mapping pending signed-in canary | Do not enable until a controlled Browserbase canary passes |
-| YC/Cutshort/Instahyre browser flow | Connection-only; application worker stops safely | Tenant-aware multi-step state machines and controlled live validation are still required |
+| YC browser flow | Adapter implemented but controlled-canary gated | Do not advertise or enable until a signed-in tenant-aware end-to-end canary passes |
+| Generic company forms | Exact-host adapter implemented but internal/gated | Not a public catalog or allowlist capability; controlled targets and confirmation canaries are required before enablement |
+| Cutshort/Instahyre browser flow | Connection-only; application worker stops safely | Tenant-aware multi-step state machines and controlled live validation are still required |
 | Multi-page or branching Google Forms | Unsupported | Requires a per-section review/state model before enablement |
 | ZipRecruiter | Excluded from hosted product | No hosted catalog, connection, queue, or worker handler |
 | Local SQLite/browser data import | Not automatic | Existing snapshot contains one person's data |
@@ -302,11 +343,13 @@ and [Turnstile CSP](https://developers.cloudflare.com/turnstile/reference/conten
 The implementation is complete when a new public user can pass the configured auth
 challenge, sign up, maintain an isolated profile, use up to five private PDF slots,
 save/remove a per-user Groq key in their browser, add a job/JD,
-ingest and review credential-free discovery results, generate and edit a tailored draft,
+ingest and review credential-free discovery results, generate and edit a tailored email draft,
 connect Gmail with web OAuth using the available platform client or an explicitly
 configured user-managed Web client, explicitly approve and send one message, scan a
-currently supported application form, approve an immutable form revision, separately
-prefill and submit it,
+   currently supported one-page Google Form, automatically request grounded suggestions
+   from the signed-in browser, review the immutable form revision in Form Pilot, explicitly
+   approve it for background submission, and receive success only after verified provider
+   confirmation (or a Live View fallback when the run needs attention),
 track applications, inspect durable job status, and see accurate connection capabilities.
 It includes a Supabase migration, Vercel entrypoint, worker protocol, automated tests,
 and deployment instructions.

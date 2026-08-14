@@ -71,8 +71,46 @@ def test_connection_only_providers_never_claim_form_automation() -> None:
 
     assert by_id["wellfound"]["can_connect"] is True
     assert by_id["wellfound"]["can_scan"] is True
-    assert by_id["google_forms"]["can_connect"] is False
+    assert by_id["google_forms"]["can_connect"] is True
+    assert by_id["google_forms"]["connection_required"] is False
     assert by_id["google_forms"]["can_scan"] is True
+    assert by_id["google_forms"]["can_prefill"] is True
+    assert by_id["google_forms"]["can_auto_apply"] is True
+    assert "without a connection" in by_id["google_forms"]["reason"]
+    assert "signed-in file upload" in by_id["google_forms"]["reason"]
+    assert "explicit review" in by_id["google_forms"]["reason"]
+
+
+def test_google_forms_optional_login_is_not_exposed_until_browserbase_is_ready() -> None:
+    google_forms = get_provider(
+        "google_forms",
+        "google_forms",
+        google_configured=False,
+        browserbase_configured=False,
+    )
+
+    assert google_forms is not None
+    assert google_forms["available"] is False
+    assert google_forms["can_connect"] is False
+    assert google_forms["connection_required"] is False
+
+
+def test_explicit_company_form_is_review_gated_without_a_saved_login() -> None:
+    company_form = get_provider(
+        "company_form",
+        "company_form",
+        google_configured=False,
+        browserbase_configured=True,
+    )
+
+    assert company_form is not None
+    assert company_form["available"] is True
+    assert company_form["can_connect"] is False
+    assert company_form["connection_required"] is False
+    assert company_form["can_scan"] is True
+    assert company_form["can_prefill"] is True
+    assert company_form["can_auto_apply"] is True
+    assert company_form["requires_review"] is True
 
 
 def test_gmail_mime_has_pdf_attachment_and_safe_headers() -> None:

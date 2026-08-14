@@ -1,16 +1,23 @@
 # AutoApply Cloud — Vercel production deployment checklist
 
-Last reviewed: 2026-08-11
+Last reviewed: 2026-08-13
 
 Use this file when moving the current local SaaS application to a public domain. It
 covers the Vercel control plane, Supabase, Google login, Gmail sending, Turnstile, the
 separate worker, Browserbase, and the checks required before opening the product to
-other users.
+other users. The deployed sidebar journey is **Profile → Find jobs → Form Pilot →
+Mass Cold Email**. The final destination contains **Build campaign → Review & send**
+email-only subtabs. Form Pilot separately owns Google Form scan, browser-side answer
+suggestions, exact review, and the user's one explicit **Approve & submit in
+background** action. The worker may submit only that immutable approved revision and
+may report success only after a fresh provider confirmation. Browserbase Live View is
+an observable `needs_attention` fallback, not the normal completion step.
 
 > [!IMPORTANT]
 > Vercel hosts the static frontend and short-lived FastAPI control plane. It does not
-> host the continuous polling worker. A complete deployment therefore needs Vercel,
-> Supabase, and a separate persistent Docker worker host.
+> host the continuous Python process that polls the Supabase automation queue. A
+> complete deployment therefore needs Vercel, Supabase, and a separate persistent
+> Docker worker host.
 
 ## 1. Record the final production values
 
@@ -39,14 +46,16 @@ origin for `SITE_URL` and Gmail OAuth.
 - Vercel Function request and response bodies are limited to 4.5 MB. The résumé flow
   already uploads directly from the browser to private Supabase Storage, so do not
   change it to proxy PDFs through FastAPI.
-- The current worker is an infinite polling process and cannot run as a Vercel Function.
-  Hobby Cron is not a replacement for a two-second queue poller.
+- The current worker runs `python -m worker.main` as an infinite Supabase queue poller.
+  It has no HTTP port and cannot run as a Vercel Function. Hobby Cron is not a
+  replacement for a persistent adaptive queue poller.
 - Vercel Hobby is for personal, non-commercial use. A free non-commercial beta can use
   it, but a public commercial product requires Vercel Pro or a different host.
 - Browserbase Free is suitable for controlled prototypes, not unrestricted public
-  browser automation. The current reviewed prefill flow uses paid-only session
-  keep-alive behavior. Keep browser automation disabled until the account plan and
-  provider canaries support it.
+  browser automation. Normal Google Forms success does not depend on retaining a Live
+  View session; keep-alive is relevant only when an attention fallback must remain
+  available. Keep browser automation disabled until account limits, worker capacity,
+  and provider canaries support it.
 
 References: [Vercel FastAPI](https://vercel.com/docs/frameworks/backend/fastapi),
 [Function limits](https://vercel.com/docs/functions/limitations),
@@ -122,8 +131,29 @@ supabase db push
 supabase db lint --linked --level warning
 ```
 
-- [ ] Confirm every migration through `202608110008_resume_profile_fields.sql` was
-      applied in order.
+- [ ] Confirm every migration through
+      `202608140001_form_submit_attention_snapshot.sql` was applied in filename order.
+- [ ] Do not stop at `202608130001_google_forms_manual_submit.sql`. That migration was a
+      temporary fail-closed prohibition. The forward migration
+      `202608130002_google_forms_approved_submit.sql` removes it and installs the strict
+      latest-revision/required-answer gate for Google Forms background submission.
+- [ ] Confirm `202608130002_google_forms_approved_submit.sql` created
+      `guard_google_forms_approved_submit`, the
+      `automation_jobs_google_forms_approved_submit` trigger, and the
+      `automation_jobs_one_submit_revision_key_idx` unique partial index; confirm the
+      superseded `guard_google_forms_manual_submit` function/trigger no longer exists.
+- [ ] Confirm `202608130003_profile_public_resume_url.sql` added
+      `profiles.resume_url` with the public HTTPS constraint and authenticated update
+      grant. This column is not a private Storage object path or an expiring signed URL.
+- [ ] Confirm `202608130004_company_form_provider.sql` and
+      `202608130005_profile_form_answer_sync.sql` are installed. The latter's refresh
+      RPC must remain service-role-only and must refuse active, submitted, or uncertain
+      application attempts.
+- [ ] Confirm `202608140001_form_submit_attention_snapshot.sql` installed the
+      service-role-only `complete_application_form_submit_attention` RPC. An uncertain
+      or provider-confirmed click must atomically persist a durable form-revision fence
+      and close the worker job; deleting an old terminal queue row must not make that
+      revision reusable.
 - [ ] Confirm all public tenant tables have Row Level Security enabled.
 - [ ] Confirm the `resumes` Storage bucket is private, PDF-only, 6 MB maximum, and uses
       user-prefixed fixed slots.
@@ -347,6 +377,9 @@ left empty only if the product intentionally supports user-owned Google clients 
 Do not configure these in Vercel:
 
 - `GROQ_API_KEY`: each user supplies a key stored only in that browser profile.
+- `HUNTER_API_KEY`: each user supplies a browser-held key. The API receives it only as
+  transient `X-Hunter-Api-Key` on explicit validation/contact-search requests and does
+  not persist it.
 - `SUPABASE_JWKS_URL`: the application does not consume it.
 - Turnstile secret: it belongs in Supabase Auth.
 - Supabase Google-login secret: it belongs in Supabase Auth.
@@ -407,8 +440,31 @@ Any environment-variable change requires a new deployment.
 
 ## 14. Deploy the worker separately
 
-The worker is a background process with no HTTP port or built-in health endpoint. Use a
-host that supports an always-running Docker/background worker and automatic restart.
+The worker is a continuous Python/Supabase queue poller with no HTTP port or built-in
+health endpoint. Locally, `./dev.command` starts it alongside FastAPI and stops both on
+Control-C. Hosted deployment needs outbound HTTPS, an always-running Docker/background
+process, and automatic restart.
+
+### 14.1 Select the hosting model
+
+| Option | Decision for the current worker |
+| --- | --- |
+| [Northflank Sandbox](https://northflank.com/pricing) | Recommended only for free testing or a risk-accepted public beta. Its Sandbox tier advertises always-on free services, and [a Northflank service can run without ports](https://northflank.com/docs/v1/application/getting-started/build-and-deploy-your-code), which matches this container. It is explicitly not AutoApply's production recommendation; assume no SLA or permanent free entitlement. |
+| [OCI Always Free Compute](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm) | More durable zero-cost, self-managed option. Run the container under a restart supervisor, patch and secure the VM, and monitor it. Home-region capacity can be unavailable and Oracle may reclaim instances it classifies as idle, so keep a reprovisioning plan and do not promise uninterrupted free production. |
+| [AWS Free Tier](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/free-tier-FAQ.html) | Temporary option, not an indefinite free-worker plan. New-customer free plans currently end after six months or when credits are exhausted; configure budgets and a migration/paid plan before expiry. Legacy-account eligibility can differ. |
+| [Cloud Run Jobs](https://cloud.google.com/run/docs/create-jobs) | Future architecture only. Jobs run tasks and exit, so the current infinite loop is incompatible. First implement a bounded **drain-and-exit** mode with scheduled invocations, safe lease/heartbeat shutdown, retries, and a clean terminal exit. |
+| [Hugging Face Spaces](https://huggingface.co/docs/hub/spaces-overview) | Do not use for the current worker. Free Spaces sleep when unused and follow an interactive web-app lifecycle, while this process exposes no port. |
+| [Koyeb Free](https://www.koyeb.com/docs/run-and-scale/scale-to-zero) | Do not use for the current worker. Its free Web Service scales to zero after one hour without inbound traffic; this outbound Supabase poller has no traffic-driven wake path. Do not generate synthetic traffic to avoid sleep. |
+| [Vercel Functions](https://vercel.com/docs/functions/limitations) | Do not use for the current worker. Functions are request-bounded; Vercel remains the frontend and short-lived API control plane. |
+
+Northflank's free Sandbox is therefore the simplest managed beta test, not production.
+OCI Always Free is the more durable zero-cost path when self-management is acceptable,
+but it still has capacity/reclamation risk. Recheck current limits, pricing, terms, and
+regional availability immediately before deploying; no provider guarantees perpetual
+free production hosting.
+
+### 14.2 Build and configure
+
 Build from the repository root because the Dockerfile also copies `app/saas/`:
 
 ```bash
@@ -426,7 +482,8 @@ SUPABASE_SECRET_KEY=ROTATED_SERVER_SECRET
 SUPABASE_HTTP_TIMEOUT_SECONDS=15
 
 WORKER_ID=autoapply-worker-prod-1
-WORKER_POLL_SECONDS=5
+WORKER_POLL_SECONDS=2
+WORKER_MAX_IDLE_POLL_SECONDS=15
 WORKER_LEASE_SECONDS=120
 WORKER_HEARTBEAT_SECONDS=20
 WORKER_LOG_LEVEL=INFO
@@ -437,25 +494,49 @@ BROWSERBASE_PROJECT_ID=YOUR_BROWSERBASE_PROJECT_ID
 ALLOWED_BROWSER_PROVIDERS=
 ```
 
+The worker checks quickly while work is active, then exponentially backs off consecutive
+empty claims toward `WORKER_MAX_IDLE_POLL_SECONDS`. Any claimed job resets the idle
+delay. A healthy idle deployment does not print each successful Supabase HTTP request;
+monitor worker lifecycle, claimed-job, completion, and warning entries instead.
+
 - [ ] Give every worker replica a unique `WORKER_ID`.
 - [ ] Use the exact Vercel encryption key, Browserbase credentials, and provider
       allowlist.
 - [ ] A discovery-only worker needs Supabase URL/secret and worker identity; managed
       browser jobs additionally need encryption and Browserbase settings.
 - [ ] Start with `ALLOWED_BROWSER_PROVIDERS` empty.
-- [ ] Once paid keep-alive support and controlled canaries pass, begin with only:
+- [ ] Once Browserbase capacity and controlled canaries pass, begin with only:
 
   ```dotenv
   ALLOWED_BROWSER_PROVIDERS=google_forms,greenhouse
   ```
 
-- [ ] Canary every other provider independently before adding it.
+- [ ] Canary every other provider independently before adding it. YC has an adapter but
+      remains launch-gated pending a controlled signed-in end-to-end canary. The generic
+      exact-host `company_form` adapter is internal/gated and is not a public provider
+      catalog or allowlist entry. Do not advertise or enable either from code presence
+      alone.
+- [ ] Before enabling Google Forms résumé upload, connect one isolated test Google
+      Browserbase context and run a non-submitting file-upload canary. It must find
+      exactly one explicit résumé/CV `Add file` question, keep the picker on an exact
+      trusted Google picker host/path, expose exactly one PDF-compatible input, attach
+      only the lease-bound private PDF, verify matching filename/MIME/byte length, and
+      observe that filename in the original question after the picker closes. A missing
+      context, login/MFA/CAPTCHA, multiple upload destinations, non-PDF restriction,
+      unexpected iframe, or unverified completion must stop before the form's Submit
+      control. Mocked tests are not evidence that current Google markup passed.
 - [ ] Monitor process uptime, oldest queued job age, expired leases, repeated queue
       errors, Browserbase 429s, and session failures.
 - [ ] Test SIGTERM recovery: an interrupted job should be reclaimable after lease expiry.
 
 Credential-free Telegram/RSS, LinkedIn guest discovery, and public ATS discovery use the
-worker but do not require Browserbase. Managed browser prefill/review does.
+worker but do not require Browserbase. `POST /api/v1/discovery/resume-guided` uses the
+transient `X-Groq-Api-Key` in the Vercel request to derive bounded search terms, then
+queues LinkedIn guest and public-feed work without the key. The worker filters
+Telegram/RSS results against those terms. LinkedIn guest discovery remains unofficial,
+bounded, credential-free, and unrelated to Easy Apply. Managed-browser scan,
+approval-bound submission, verified confirmation, and any needs-attention Live View do
+require Browserbase.
 
 References: [Browserbase pricing](https://www.browserbase.com/pricing) and
 [Browserbase contexts](https://docs.browserbase.com/platform/browser/core-features/contexts).
@@ -469,7 +550,10 @@ References: [Browserbase pricing](https://www.browserbase.com/pricing) and
       `/api/openapi.json` return expected responses.
 - [ ] `/api/v1/profile` without a bearer token returns 401.
 - [ ] `/api/v1/config` contains the exact production Site URL and no secret, OAuth token,
-      encryption key, or user Groq key.
+      encryption key, user Groq key, or user Hunter key.
+- [ ] Confirm `X-Groq-Api-Key` and `X-Hunter-Api-Key` are redacted from function,
+      worker, proxy, and observability logs; neither user key is configured in Vercel or
+      the worker host.
 - [ ] Confirm CSP, referrer, permissions, nosniff, and frame-deny headers on public pages.
 - [ ] Confirm API responses are `private, no-store`.
 - [ ] Inspect every `/api/v1/health` check. `status=ready` alone does not prove Gmail,
@@ -485,10 +569,94 @@ References: [Browserbase pricing](https://www.browserbase.com/pricing) and
 - [ ] PDF résumé upload goes directly to Supabase Storage; parse/analyze/delete work.
 - [ ] Résumé analysis fills only blank profile fields for review, including LinkedIn,
       GitHub, college, degree, and passout year when explicitly present.
+- [ ] A common passout/year-of-graduation question is filled deterministically from
+      `profiles.graduation_year`. A recognized résumé/CV link question is filled only
+      from the user's separately saved public HTTPS `profiles.resume_url`; the private
+      uploaded PDF path, a signed Storage URL, and a guessed/extracted link are never
+      substituted for it.
 - [ ] Jobs are ranked by explainable résumé alignment and the UI states that this is not
       a hiring prediction.
 - [ ] A user's browser-held Groq key validates and produces a grounded draft without
       appearing in logs, API responses, Supabase, or another user's browser namespace.
+- [ ] From **Find jobs**, `POST /api/v1/discovery/resume-guided` with a transient
+      `X-Groq-Api-Key` requires a parsed active résumé, returns a bounded plan, and
+      queues LinkedIn guest plus Telegram/RSS work without persisting the key.
+- [ ] The same **Find matching jobs** screen polls both returned automation-job IDs,
+      prevents duplicate clicks while they are active, and automatically refreshes jobs
+      and Form Pilot when they reach a terminal state. Activity remains diagnostics, not
+      a required step in the normal journey.
+- [ ] The worker retains Telegram/RSS matches using the résumé-derived Groq terms;
+      LinkedIn guest results remain bounded/unofficial and expose no login or Easy Apply
+      behavior.
+- [ ] In **Form Pilot**, `GET /api/v1/discovery/google-forms` returns only the signed-in
+      tenant's deduplicated inbox. Loading it performs no scan; the user explicitly
+      chooses **Prepare form**. Poll the returned scan job until the immutable revision
+      is ready; Activity is diagnostics rather than a required navigation step.
+- [ ] When an eligible unapproved revision loads, Form Pilot automatically applies
+      deterministic Profile facts and calls the suggestion endpoint at most once. A
+      browser-held Groq key is used only for unresolved questions; the review desk has
+      no duplicate AI-fill button. Suggestions remain editable/browser-visible, exclude
+      protected or unknown keys, never grant approval, and missing keys/Groq failure
+      leave unknown fields for explicit review.
+- [ ] Saving `profiles.resume_url` creates a new unapproved revision only when the
+      previous snapshot is safe to supersede. An approved revision with an uncertain
+      submit click remains immutable and cannot be refreshed or retried automatically.
+- [ ] A textual Resume/CV link field receives only the saved public HTTPS Profile URL.
+      One explicit native PDF-compatible Resume/CV upload receives the tenant's active
+      private PDF, and the worker verifies filename, MIME, and byte size after attaching.
+      Google Forms may instead expose one Google-owned Resume/CV picker; it is allowed
+      only with the tenant's saved Google browser context, an allowlisted picker frame,
+      one PDF input, and an exact visible filename confirmation. Ambiguous, unrelated
+      required-file, untrusted-picker, and incompatible-file cases stop before submission.
+- [ ] Google Forms remains optionally connectable: an ordinary public form uses an
+      ephemeral browser, while a signed-in file-upload form returns
+      `provider_login_required` until that tenant completes the isolated Google browser
+      login in Connections. Gmail OAuth does not substitute for browser cookies.
+- [ ] In **Form Pilot → Referral digest**, paste a representative full numbered hiring
+      message. `POST /api/v1/discovery/referrals` extracts Company, Role, Batch,
+      CTC/Stipend/compensation, Location, form URLs, and application emails; filters
+      WhatsApp/channel/Topmate or premium-group promotion links; reports routing counts;
+      sends Google Forms to Form Pilot; and makes email applications available in Mass
+      Cold Email. Confirm that parsing neither submits a form nor sends an email.
+- [ ] Pasting a forms.gle or docs.google.com/forms URL into Form Pilot saves it through
+      `POST /api/v1/discovery/ats`, queues preparation only after the explicit button
+      press, and rejects non-Google ATS URLs from this dedicated input.
+- [ ] Google Forms found by résumé-guided discovery or imported links are routed to
+      Form Pilot. Referral-digest intake stays in Form Pilot Stage 01 rather than adding
+      a second pasted-leads panel to **Find jobs**.
+- [ ] Form Pilot keeps the captured questions, suggestion review, exact approval,
+      submit progress, confirmation, and any needs-attention handoff in Form Pilot. It does not move an ATS/
+      Google Form application into **Mass Cold Email**.
+- [ ] The normal Google Forms action is one explicit **Approve & submit in background**
+      click. It seals the exact latest revision, refuses incomplete required answers,
+      and queues one idempotent `application_submit` job bound to that revision. It does
+      not require a separate prefill or activity-page click.
+- [ ] The worker rescans the allowlisted target, rejects a changed schema or stale
+      approval, fills only the sealed answers and selected résumé, activates exactly one
+      unambiguous Submit control, and waits for a freshly observed provider confirmation.
+      UI success requires `code=application_submitted` and
+      `submission_state=confirmed`; a queued/running job is never described as submitted.
+- [ ] Login/MFA/CAPTCHA, an unknown required field, missing public résumé URL, changed
+      form, ambiguous submit control, timeout, or uncertain confirmation becomes
+      `needs_attention` without a blind retry. Only that fallback may expose the
+      allowlisted Browserbase Live View so the user can inspect and continue safely.
+- [ ] A user's browser-held Hunter key validates through
+      `POST /api/v1/hunter/validate` and reaches
+      `POST /api/v1/jobs/{id}/contacts/hunter` only as transient
+      `X-Hunter-Api-Key`; no key appears in API responses, Supabase, logs, Vercel, or the
+      worker environment.
+- [ ] **Mass Cold Email** is the only related sidebar item and exposes **Build campaign**
+      and **Review & send** as subtabs. Build campaign enforces a ten-job maximum, shows
+      projected Hunter credit use inline before the explicit lookup, and requires the
+      user to choose a contact before Groq drafting. Both subtabs list email-channel
+      applications only; no ATS/form revision or form-answer editor appears there.
+- [ ] In the second **Review & send** subtab, every exact draft is approved individually;
+      edits invalidate approval, and a separate final confirmation precedes sending.
+- [ ] Approved outreach sends run sequentially through the existing Gmail endpoint;
+      daily-cap, duplicate-recipient, and idempotency gates remain authoritative, and a
+      retry cannot create a second message.
+- [ ] Product copy and behavior never represent the reviewed max-ten workflow as
+      autonomous or unreviewed bulk cold email.
 - [ ] Gmail connect, reviewed send, disconnect, and Google-side revocation work.
 - [ ] CSV/XLSX/referral/ATS imports work within their documented limits.
 - [ ] A synthetic worker job is claimed, heartbeated, completed, and visible in Activity.
@@ -506,10 +674,11 @@ Recommended order:
 4. Configure Supabase Site URL, redirects, Google provider, SMTP, and Turnstile.
 5. Configure Google identity and Gmail clients.
 6. Deploy the stable staging Vercel build.
-7. Deploy and validate the discovery-only worker.
-8. Run two-user and OAuth/Gmail smoke tests.
+7. Deploy and validate the continuous worker on a persistent host outside Vercel.
+8. Run two-user, OAuth/Gmail, queue, and exact-approved Google Forms smoke tests.
 9. Promote/deploy production.
-10. Keep browser provider allowlists empty until paid capability and canaries pass.
+10. Keep browser provider allowlists empty until capacity and canaries pass; YC and the
+    custom company-form adapter remain gated even though implementation code exists.
 
 If cutover fails:
 
@@ -536,3 +705,10 @@ If cutover fails:
 - [Gmail OAuth scopes](https://developers.google.com/workspace/gmail/api/auth/scopes)
 - [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/get-started/)
 - [Browserbase pricing](https://www.browserbase.com/pricing)
+- [Northflank pricing](https://northflank.com/pricing)
+- [Northflank build and deploy](https://northflank.com/docs/v1/application/getting-started/build-and-deploy-your-code)
+- [OCI Always Free resources](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm)
+- [AWS Free Tier FAQ](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/free-tier-FAQ.html)
+- [Cloud Run Jobs](https://cloud.google.com/run/docs/create-jobs)
+- [Hugging Face Spaces lifecycle](https://huggingface.co/docs/hub/spaces-overview)
+- [Koyeb scale-to-zero](https://www.koyeb.com/docs/run-and-scale/scale-to-zero)

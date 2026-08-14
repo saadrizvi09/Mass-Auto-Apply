@@ -5,6 +5,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from worker.discovery_runtime import DiscoveryJobHandler
 from worker.handlers import AutomationJob, handle_job
 
@@ -117,6 +119,134 @@ def test_combined_feed_run_fairly_includes_telegram_and_rss() -> None:
     assert outcome.status == "succeeded"
     serialized = repository.calls[0][1]["jobs"]
     assert [item["source"] for item in serialized] == ["telegram", "rss"] * 5
+
+
+def test_public_feed_search_terms_filter_each_source_before_fair_merge() -> None:
+    repository = FakeRepository()
+
+    def source_jobs(source: str) -> list[dict[str, Any]]:
+        return [
+            {
+                **_job(),
+                "source": source,
+                "external_id": f"{source}-javascript",
+                "apply_url": f"https://example.com/{source}/javascript",
+                "title": "Javascript Developer",
+                "company": "Unrelated Co",
+            },
+            {
+                **_job(),
+                "source": source,
+                "external_id": f"{source}-platform",
+                "apply_url": f"https://example.com/{source}/platform",
+                "title": "Senior Platform-Engineer",
+                "company": "Relevant Co",
+            },
+            {
+                **_job(),
+                "source": source,
+                "external_id": f"{source}-java",
+                "apply_url": f"https://example.com/{source}/java",
+                "title": "Developer",
+                "company": "Relevant Co",
+                "description": "Build services with Java and Spring.",
+            },
+        ]
+
+    handler = DiscoveryJobHandler(
+        repository,
+        worker_id="worker-1",
+        fallback=handle_job,
+        telegram_discovery=lambda: source_jobs("telegram"),
+        rss_discovery=lambda: source_jobs("rss"),
+    )
+    job = AutomationJob.from_record(
+        _record(
+            "discover_public_feeds",
+            "public_feeds",
+            {
+                "source_ids": ["telegram", "rss"],
+                "limit": 4,
+                "search_terms": ["PLATFORM ENGINEER", "java"],
+            },
+        )
+    )
+
+    outcome = asyncio.run(handler(job))
+
+    assert outcome.status == "succeeded"
+    rows = repository.calls[0][1]["jobs"]
+    assert [(row["source"], row["external_id"]) for row in rows] == [
+        ("telegram", "telegram-platform"),
+        ("rss", "rss-platform"),
+        ("telegram", "telegram-java"),
+        ("rss", "rss-java"),
+    ]
+
+
+def test_public_feed_empty_search_terms_preserve_unfiltered_manual_run() -> None:
+    repository = FakeRepository()
+    handler = DiscoveryJobHandler(
+        repository,
+        worker_id="worker-1",
+        fallback=handle_job,
+        telegram_discovery=lambda: [{**_job(), "source": "telegram"}],
+        rss_discovery=lambda: [],
+    )
+    job = AutomationJob.from_record(
+        _record(
+            "discover_public_feeds",
+            "public_feeds",
+            {"source_ids": ["telegram"], "limit": 10, "search_terms": []},
+        )
+    )
+
+    outcome = asyncio.run(handler(job))
+
+    assert outcome.status == "succeeded"
+    assert len(repository.calls[0][1]["jobs"]) == 1
+
+
+@pytest.mark.parametrize(
+    "search_terms",
+    [
+        "backend engineer",
+        ["term"] * 21,
+        ["x" * 101],
+        ["   "],
+        [42],
+    ],
+)
+def test_public_feed_rejects_invalid_search_terms_before_network(
+    search_terms: object,
+) -> None:
+    network_calls = 0
+
+    def telegram() -> list[dict[str, Any]]:
+        nonlocal network_calls
+        network_calls += 1
+        return []
+
+    repository = FakeRepository()
+    handler = DiscoveryJobHandler(
+        repository,
+        worker_id="worker-1",
+        fallback=handle_job,
+        telegram_discovery=telegram,
+    )
+    job = AutomationJob.from_record(
+        _record(
+            "discover_public_feeds",
+            "public_feeds",
+            {"source_ids": ["telegram"], "search_terms": search_terms},
+        )
+    )
+
+    outcome = asyncio.run(handler(job))
+
+    assert outcome.code == "discovery_payload_invalid"
+    assert network_calls == 0
+    assert repository.calls == []
 
 
 def test_linkedin_worker_applies_hard_bounds_before_network_discovery() -> None:

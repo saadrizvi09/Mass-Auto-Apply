@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -34,7 +35,9 @@ from app.saas.discovery import (
     detect_provider,
     discover_provider_urls,
     parse_referral_digest,
+    referral_digest_summary,
     parse_spreadsheet_bytes,
+    public_company_form_target,
 )
 from app.saas.gmail import (
     GMAIL_SEND_SCOPE,
@@ -51,7 +54,13 @@ from app.saas.groq import (
     analyze_resume_profile,
     generate_application_draft,
     generate_form_answer_suggestions,
+    profile_form_answers,
     validate_groq_key,
+)
+from app.saas.hunter import (
+    HunterProviderError,
+    search_hunter_contacts,
+    validate_hunter_key,
 )
 from app.saas.matching import enrich_jobs_with_fit, recommended_roles
 from app.saas.providers import browser_provider_allowed, get_provider, provider_catalog
@@ -74,6 +83,7 @@ from app.saas.schemas import (
     PublicAtsDiscoveryRequest,
     PublicFeedDiscoveryRequest,
     ReferralDigestIngest,
+    ResumeGuidedDiscoveryRequest,
     ProfileUpdate,
     ResumeRegister,
     SendApplicationRequest,
@@ -99,6 +109,15 @@ MANAGED_BROWSER_LIFECYCLE_PROVIDERS = frozenset(
         "wellfound",
         "cutshort",
         "instahyre",
+    }
+)
+APPLICATION_AUTOMATION_PROVIDERS = MANAGED_BROWSER_LIFECYCLE_PROVIDERS | {
+    "company_form"
+}
+COMPANY_FORM_METADATA_KEYS = frozenset(
+    {
+        "company_form_host",
+        "company_form_target_url",
     }
 )
 PERSISTENT_CONTEXT_REQUIRED_PROVIDERS = frozenset(
@@ -194,6 +213,156 @@ def _model_changes(model: Any) -> dict[str, Any]:
     return model.model_dump(mode="json", exclude_unset=True)
 
 
+def _company_form_metadata(
+    value: Any, target: Mapping[str, str] | None
+) -> dict[str, Any]:
+    """Strip client-supplied binding fields, then add one server-derived marker."""
+
+    metadata = dict(value) if isinstance(value, Mapping) else {}
+    for key in COMPANY_FORM_METADATA_KEYS:
+        metadata.pop(key, None)
+    if metadata.get("application_provider") == "company_form":
+        metadata.pop("application_provider", None)
+    if target is not None:
+        metadata.update(
+            {
+                "application_provider": "company_form",
+                "company_form_host": target["host"],
+                "company_form_target_url": target["target_url"],
+            }
+        )
+    return metadata
+
+
+def _bounded_text_list(
+    value: Any,
+    *,
+    limit: int,
+    max_length: int,
+) -> list[str]:
+    """Keep a stable, case-insensitively unique list from model/user output."""
+
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        clean = " ".join(item.split())[:max_length].strip()
+        key = clean.casefold()
+        if not clean or key in seen:
+            continue
+        seen.add(key)
+        result.append(clean)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _nested_google_form_urls(value: Any, *, max_values: int = 2_000) -> list[str]:
+    """Find bounded Google Form URLs already present in tenant-owned metadata."""
+
+    found: list[str] = []
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    visited = 0
+    while pending and visited < max_values:
+        item, depth = pending.pop()
+        visited += 1
+        if isinstance(item, str):
+            if detect_provider(item) == "google_forms" and normalized_http_url(item):
+                found.append(item.strip())
+            continue
+        if depth >= 4:
+            continue
+        if isinstance(item, Mapping):
+            pending.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            pending.extend((child, depth + 1) for child in item[:500])
+    return list(dict.fromkeys(found))
+
+
+def _public_automation_job(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose only fields useful for following a newly queued run."""
+
+    allowed = (
+        "id",
+        "kind",
+        "provider",
+        "status",
+        "idempotency_key",
+        "progress",
+        "created_at",
+        "updated_at",
+    )
+    return {key: value.get(key) for key in allowed if key in value}
+
+
+def _required_answer_preflight(revision: Mapping[str, Any]) -> dict[str, Any]:
+    """Build bounded, non-secret submit preflight metadata for the worker."""
+
+    schema = revision.get("question_schema")
+    answers = revision.get("answers")
+    questions = schema if isinstance(schema, list) else []
+    approved_answers = answers if isinstance(answers, Mapping) else {}
+    required_keys: list[str] = []
+    missing_keys: list[str] = []
+    missing_labels: list[str] = []
+    resume_keys: list[str] = []
+
+    def normalized_key(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
+
+    normalized_answers = {
+        normalized_key(key): value
+        for key, value in approved_answers.items()
+        if isinstance(key, str) and normalized_key(key)
+    }
+
+    def answer_present(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, (list, tuple, set, Mapping)):
+            return bool(value)
+        return True
+
+    for index, item in enumerate(questions[:200]):
+        if not isinstance(item, Mapping) or item.get("required") is not True:
+            continue
+        key_value = item.get("key") or item.get("id") or item.get("name")
+        key = " ".join(str(key_value or f"field_{index + 1}").split())[:160]
+        if not key:
+            key = f"field_{index + 1}"
+        label_value = item.get("label") or item.get("title") or item.get("text") or key
+        label = " ".join(str(label_value).split())[:160] or key
+        required_keys.append(key)
+        field_type = str(item.get("type") or item.get("kind") or "").lower()
+        # Only a captured file control may be satisfied by the worker's private
+        # active PDF.  A text/URL field labelled "Resume Link" still requires a
+        # user-approved public URL; never substitute a private storage path.
+        if field_type == "file" and item.get("accepts_resume") is True:
+            resume_keys.append(key)
+            continue
+        answer = normalized_answers.get(normalized_key(key))
+        if answer is None:
+            answer = normalized_answers.get(normalized_key(label))
+        if not answer_present(answer):
+            missing_keys.append(key)
+            missing_labels.append(label)
+
+    return {
+        "required_count": len(required_keys),
+        "answered_count": len(required_keys) - len(missing_keys),
+        "missing_count": len(missing_keys),
+        "missing_keys": missing_keys,
+        "missing_labels": missing_labels,
+        "resume_upload_keys": resume_keys,
+        "complete": not missing_keys,
+    }
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -241,6 +410,20 @@ def _groq_error(error: GroqProviderError) -> ApiError:
         status_code = 429
     elif error.code in {"groq_unavailable", "groq_timeout"}:
         status_code = 503
+    else:
+        status_code = 422
+    return ApiError(status_code, error.code, str(error))
+
+
+def _hunter_error(error: HunterProviderError) -> ApiError:
+    if error.code in {"hunter_missing_key", "hunter_invalid_key"}:
+        status_code = 400
+    elif error.code in {"hunter_quota_exhausted"}:
+        status_code = 429
+    elif error.code in {"hunter_unavailable", "hunter_timeout"}:
+        status_code = 503
+    elif error.code in {"hunter_forbidden"}:
+        status_code = 403
     else:
         status_code = 422
     return ApiError(status_code, error.code, str(error))
@@ -591,6 +774,60 @@ def create_app(
             raise ApiError(503, "data_store_invalid_response", "The job could not be queued.")
         return row
 
+    async def load_company_form_binding(
+        user: AuthUser, job: Mapping[str, Any]
+    ) -> tuple[dict[str, str], dict[str, Any]] | None:
+        """Resolve the service-owned binding for one explicitly saved company form."""
+
+        job_id = job.get("id")
+        source_url = job.get("apply_url")
+        if not job_id or not isinstance(source_url, str):
+            return None
+        target = public_company_form_target(source_url)
+        if target is None or detect_provider(source_url) is not None:
+            return None
+        binding = await store_service.secret().fetch_one(
+            "company_form_targets",
+            filters={"job_id": str(job_id), "user_id": str(user.user_id)},
+        )
+        if (
+            binding is None
+            or binding.get("source_url") != source_url
+            or binding.get("exact_host") != target["host"]
+            or binding.get("target_url") != target["target_url"]
+        ):
+            return None
+        return target, binding
+
+    async def save_company_form_binding(
+        user: AuthUser,
+        job: Mapping[str, Any],
+        source_url: str,
+        target: Mapping[str, str],
+    ) -> None:
+        job_id = job.get("id")
+        if not job_id:
+            raise ApiError(503, "data_store_invalid_response", "The job could not be bound.")
+        await store_service.secret().upsert(
+            "company_form_targets",
+            {
+                "job_id": str(job_id),
+                "user_id": str(user.user_id),
+                "source_url": source_url,
+                "target_url": target["target_url"],
+                "exact_host": target["host"],
+            },
+            on_conflict="job_id",
+            returning=False,
+        )
+
+    async def delete_company_form_binding(user: AuthUser, job_id: UUID | str) -> None:
+        await store_service.secret().delete(
+            "company_form_targets",
+            filters={"job_id": str(job_id), "user_id": str(user.user_id)},
+            returning=False,
+        )
+
     async def require_managed_connection(
         provider: str,
         user: AuthUser,
@@ -609,7 +846,7 @@ def create_app(
             "submit": "can_auto_apply",
         }[operation]
         if (
-            provider not in MANAGED_BROWSER_LIFECYCLE_PROVIDERS
+            provider not in APPLICATION_AUTOMATION_PROVIDERS
             or capability is None
             or not capability[capability_key]
             or not browser_provider_allowed(provider, runtime_settings.allowed_browser_providers)
@@ -755,7 +992,10 @@ def create_app(
             jobs = await run_in_threadpool(parse_referral_digest, body.text, limit=200)
         except (TypeError, ValueError) as exc:
             raise ApiError(422, "referral_digest_invalid", str(exc)) from exc
-        return await ingest_discovered_jobs(jobs, user)
+        result = await ingest_discovered_jobs(jobs, user)
+        summary = referral_digest_summary(body.text, jobs)
+        summary["saved"] = result.get("count", 0)
+        return {**result, "summary": summary}
 
     @application.post("/api/v1/discovery/import", status_code=201, tags=["discovery"])
     async def import_discovery_file(
@@ -866,6 +1106,251 @@ def create_app(
         )
         return _data(row)
 
+    @application.post(
+        "/api/v1/discovery/resume-guided",
+        status_code=status.HTTP_202_ACCEPTED,
+        tags=["discovery", "groq"],
+    )
+    async def queue_resume_guided_discovery(
+        body: ResumeGuidedDiscoveryRequest,
+        groq_key: str | None = Header(default=None, alias="X-Groq-Api-Key"),
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        """Derive a bounded public-source search plan from the active résumé."""
+
+        if not groq_key or len(groq_key) > 512:
+            raise ApiError(400, "groq_key_required", "Save a valid Groq API key first.")
+        client = store_service.user(user.access_token)
+        resume = await client.fetch_one(
+            "resumes",
+            columns="id,parse_status,parsed_text",
+            filters={"user_id": str(user.user_id), "is_active": True},
+        )
+        if (
+            resume is None
+            or resume.get("parse_status") != "parsed"
+            or not isinstance(resume.get("parsed_text"), str)
+            or not resume["parsed_text"].strip()
+        ):
+            raise ApiError(
+                409,
+                "resume_not_parsed",
+                "Upload and parse an active résumé before searching from it.",
+            )
+        profile = await client.fetch_one(
+            "profiles",
+            columns="skills,preferences,location",
+            filters={"user_id": str(user.user_id)},
+        ) or {}
+        preferences = await client.fetch_one(
+            "discovery_preferences",
+            columns="locations",
+            filters={"user_id": str(user.user_id)},
+        ) or {}
+
+        await client.rpc("reserve_groq_request", {"operation_input": "generate"})
+        try:
+            analysis = await run_in_threadpool(
+                analyze_resume_profile,
+                groq_key,
+                runtime_settings.groq_model,
+                resume["parsed_text"],
+            )
+        except GroqProviderError as exc:
+            raise _groq_error(exc) from exc
+
+        profile_preferences = profile.get("preferences")
+        saved_roles = _bounded_text_list(
+            profile_preferences.get("target_roles")
+            if isinstance(profile_preferences, Mapping)
+            else None,
+            limit=5,
+            max_length=100,
+        )
+        analyzed_roles = _bounded_text_list(
+            analysis.get("target_roles"), limit=5, max_length=100
+        )
+        fallback_roles = _bounded_text_list(
+            recommended_roles(profile, resume["parsed_text"]),
+            limit=5,
+            max_length=100,
+        )
+        roles = saved_roles or analyzed_roles or fallback_roles
+        analyzed_skills = _bounded_text_list(
+            analysis.get("skills"), limit=12, max_length=80
+        )
+        saved_skills = _bounded_text_list(
+            profile.get("skills"), limit=12, max_length=80
+        )
+        keywords = _bounded_text_list(
+            [*analyzed_skills, *saved_skills], limit=12, max_length=80
+        )
+        search_terms = _bounded_text_list(
+            [*roles, *keywords], limit=20, max_length=100
+        )
+        if not roles or not search_terms:
+            raise ApiError(
+                422,
+                "resume_search_terms_missing",
+                "The résumé did not contain enough evidence to derive a job search.",
+            )
+
+        saved_locations = _bounded_text_list(
+            preferences.get("locations"), limit=1, max_length=120
+        )
+        profile_location = profile.get("location")
+        location = (
+            body.location
+            or (saved_locations[0] if saved_locations else None)
+            or (" ".join(profile_location.split())[:120] if isinstance(profile_location, str) else None)
+            or "India"
+        )
+        linkedin_query = roles[0][:100]
+        linkedin_job = await enqueue_job(
+            user=user,
+            kind="discover_linkedin_guest",
+            provider="linkedin",
+            application_id=None,
+            payload={
+                "keywords": linkedin_query,
+                "location": location,
+                "remote": body.remote_only,
+                "limit": body.linkedin_limit,
+            },
+            idempotency_key=f"{body.idempotency_key}:linkedin",
+        )
+        feed_job = await enqueue_job(
+            user=user,
+            kind="discover_public_feeds",
+            provider="public_feeds",
+            application_id=None,
+            payload={
+                "source_ids": ["telegram", "rss"],
+                "limit": body.feed_limit,
+                "search_terms": search_terms,
+            },
+            idempotency_key=f"{body.idempotency_key}:feeds",
+        )
+        return _data(
+            {
+                "plan": {
+                    "roles": roles,
+                    "keywords": keywords,
+                    "search_terms": search_terms,
+                    "linkedin_query": linkedin_query,
+                    "location": location,
+                    "remote_only": body.remote_only,
+                    "sources": ["linkedin_guest", "telegram", "rss"],
+                },
+                "automation_jobs": [
+                    _public_automation_job(linkedin_job),
+                    _public_automation_job(feed_job),
+                ],
+            }
+        )
+
+    @application.get("/api/v1/discovery/google-forms", tags=["discovery", "applications"])
+    async def list_google_form_queue(
+        limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0, le=1_000),
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        """List direct and metadata-discovered Google Forms for review."""
+
+        client = store_service.user(user.access_token)
+        jobs = await client.fetch_many(
+            "jobs",
+            filters={"user_id": str(user.user_id)},
+            order="created_at.desc",
+            limit=1_000,
+        )
+        if len(jobs) == 1_000:
+            jobs.extend(
+                await client.fetch_many(
+                    "jobs",
+                    filters={"user_id": str(user.user_id)},
+                    order="created_at.desc",
+                    limit=1_000,
+                    offset=1_000,
+                )
+            )
+        applications = await client.fetch_many(
+            "applications",
+            filters={"user_id": str(user.user_id)},
+            order="created_at.desc",
+            limit=1_000,
+        )
+        if len(applications) == 1_000:
+            applications.extend(
+                await client.fetch_many(
+                    "applications",
+                    filters={"user_id": str(user.user_id)},
+                    order="created_at.desc",
+                    limit=1_000,
+                    offset=1_000,
+                )
+            )
+        application_by_job: dict[str, dict[str, Any]] = {}
+        for application_row in applications:
+            if application_row.get("channel") != "ats":
+                continue
+            job_id = application_row.get("job_id")
+            if job_id is not None and str(job_id) not in application_by_job:
+                application_by_job[str(job_id)] = dict(application_row)
+
+        by_url: dict[str, dict[str, Any]] = {}
+        for job in jobs:
+            apply_url = job.get("apply_url")
+            if not isinstance(apply_url, str) or detect_provider(apply_url) != "google_forms":
+                continue
+            normalized = normalized_http_url(apply_url)
+            if not normalized:
+                continue
+            job_id = str(job.get("id"))
+            by_url[normalized] = {
+                "id": f"job:{job_id}",
+                "job_id": job_id,
+                "parent_job_id": job_id,
+                "title": job.get("title"),
+                "company": job.get("company"),
+                "location": job.get("location"),
+                "source": job.get("source"),
+                "created_at": job.get("created_at"),
+                "apply_url": apply_url,
+                "saved": True,
+                "application": application_by_job.get(job_id),
+            }
+
+        for job in jobs:
+            for form_url in _nested_google_form_urls(job.get("metadata")):
+                normalized = normalized_http_url(form_url)
+                if not normalized or normalized in by_url:
+                    continue
+                parent_job_id = str(job.get("id"))
+                digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:20]
+                by_url[normalized] = {
+                    "id": f"form:{digest}",
+                    "job_id": None,
+                    "parent_job_id": parent_job_id,
+                    "title": job.get("title"),
+                    "company": job.get("company"),
+                    "location": job.get("location"),
+                    "source": job.get("source"),
+                    "created_at": job.get("created_at"),
+                    "apply_url": form_url,
+                    "saved": False,
+                    "application": None,
+                }
+
+        entries = list(by_url.values())
+        page = entries[offset : offset + limit]
+        return {
+            "items": page,
+            "count": len(page),
+            "total": len(entries),
+            "has_more": offset + len(page) < len(entries),
+        }
+
     @application.get("/api/v1/profile", tags=["profile"])
     async def get_profile(user: AuthUser = Depends(current_user)) -> dict[str, Any]:
         client = store_service.user(user.access_token)
@@ -902,6 +1387,53 @@ def create_app(
             row = await client.fetch_one("profiles", filters={"user_id": str(user.user_id)})
         if row is None:
             raise ApiError(404, "profile_not_found", "The profile was not found.")
+        # Refresh only deterministic answers in current, non-terminal form
+        # snapshots. The database creates a new unapproved revision atomically;
+        # an active, confirmed, failed, or uncertain submit attempt is never
+        # touched. Profile saving itself remains successful if an older database
+        # deployment has not installed this optional synchronization RPC yet.
+        revisions = await client.fetch_many(
+            "application_form_revisions",
+            filters={"user_id": str(user.user_id)},
+            order="created_at.desc",
+            limit=50,
+        )
+        seen_applications: set[str] = set()
+        for revision in revisions:
+            application_id = str(revision.get("application_id") or "")
+            if not application_id or application_id in seen_applications:
+                continue
+            seen_applications.add(application_id)
+            questions = revision.get("question_schema")
+            if (
+                revision.get("status") not in {"scanned", "prefilled", "approved"}
+                or not isinstance(questions, list)
+                or not isinstance(revision.get("answers"), Mapping)
+            ):
+                continue
+            profile_answers = profile_form_answers(row, questions)
+            if not profile_answers:
+                continue
+            merged_answers = dict(revision["answers"])
+            merged_answers.update(profile_answers)
+            if merged_answers == revision["answers"]:
+                continue
+            try:
+                await store_service.secret().rpc(
+                    "refresh_application_form_profile_answers_for_user",
+                    {
+                        "user_id_input": str(user.user_id),
+                        "revision_id_input": str(revision["id"]),
+                        "expected_revision_input": int(revision.get("revision") or 0),
+                        "expected_schema_hash_input": revision.get("schema_hash"),
+                        "answers_input": merged_answers,
+                    },
+                )
+            except (TypeError, ValueError):
+                # A malformed historical snapshot is skipped. Database/API
+                # failures must remain visible; silently swallowing them would
+                # make the Profile look saved while prepared forms stay stale.
+                continue
         return _data(row)
 
     @application.get("/api/v1/settings", tags=["profile"])
@@ -1213,6 +1745,16 @@ def create_app(
             validate_groq_key, groq_key, runtime_settings.groq_model
         )
 
+    @application.post("/api/v1/hunter/validate", tags=["hunter"])
+    async def validate_hunter(
+        hunter_key: str | None = Header(default=None, alias="X-Hunter-Api-Key"),
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        del user
+        if not hunter_key or len(hunter_key) > 512:
+            raise ApiError(400, "hunter_missing_key", "Enter a valid Hunter API key.")
+        return await run_in_threadpool(validate_hunter_key, hunter_key)
+
     @application.get("/api/v1/jobs", tags=["jobs"])
     async def list_jobs(
         job_status: str | None = Query(default=None, alias="status", max_length=40),
@@ -1264,7 +1806,17 @@ def create_app(
     async def create_job(
         body: JobCreate, user: AuthUser = Depends(current_user)
     ) -> dict[str, Any]:
-        values = body.model_dump(mode="json") | {
+        values = body.model_dump(mode="json")
+        company_target: dict[str, str] | None = None
+        # Generic company forms are automation-eligible only after an authenticated
+        # user explicitly saves the URL. Discovery/import paths never create this
+        # marker and fixed providers retain their immutable detection rules.
+        if body.apply_url and detect_provider(body.apply_url) is None:
+            company_target = public_company_form_target(body.apply_url)
+        values["metadata"] = _company_form_metadata(
+            values.get("metadata"), company_target
+        )
+        values |= {
             "user_id": str(user.user_id),
             "normalized_url": normalized_http_url(body.apply_url),
             "status": "saved",
@@ -1272,21 +1824,75 @@ def create_app(
         row = _first(await store_service.user(user.access_token).insert("jobs", values))
         if row is None:
             raise ApiError(503, "data_store_invalid_response", "The job could not be saved.")
+        if company_target is not None and body.apply_url is not None:
+            await save_company_form_binding(
+                user, row, body.apply_url, company_target
+            )
         return _data(row)
 
     @application.get("/api/v1/jobs/{job_id}", tags=["jobs"])
     async def get_job(job_id: UUID, user: AuthUser = Depends(current_user)) -> dict[str, Any]:
         return _data(await _required_row(store_service.user(user.access_token), "jobs", user, job_id))
 
+    @application.post("/api/v1/jobs/{job_id}/contacts/hunter", tags=["jobs", "hunter"])
+    async def find_job_contacts_with_hunter(
+        job_id: UUID,
+        limit: int = Query(default=5, ge=1, le=10),
+        hunter_key: str | None = Header(default=None, alias="X-Hunter-Api-Key"),
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        if not hunter_key or len(hunter_key) > 512:
+            raise ApiError(400, "hunter_missing_key", "Save a valid Hunter API key first.")
+        job = await _required_row(
+            store_service.user(user.access_token), "jobs", user, job_id
+        )
+        company = job.get("company")
+        if not isinstance(company, str) or not company.strip():
+            raise ApiError(
+                422,
+                "hunter_company_required",
+                "Add the company name before searching for contacts.",
+            )
+        try:
+            result = await run_in_threadpool(
+                search_hunter_contacts,
+                hunter_key,
+                company=company,
+                limit=limit,
+            )
+        except HunterProviderError as exc:
+            raise _hunter_error(exc) from exc
+        return _data(
+            {
+                "job_id": str(job_id),
+                "company": company,
+                "domain": result.get("domain"),
+                "contacts": result.get("contacts", []),
+            }
+        )
+
     @application.patch("/api/v1/jobs/{job_id}", tags=["jobs"])
     async def patch_job(
         job_id: UUID, body: JobUpdate, user: AuthUser = Depends(current_user)
     ) -> dict[str, Any]:
         client = store_service.user(user.access_token)
-        await _required_row(client, "jobs", user, job_id)
+        existing = await _required_row(client, "jobs", user, job_id)
         values = _model_changes(body)
+        company_target: dict[str, str] | None = None
         if "apply_url" in values:
             values["normalized_url"] = normalized_http_url(values["apply_url"])
+            apply_url = values["apply_url"]
+            if apply_url and detect_provider(apply_url) is None:
+                company_target = public_company_form_target(apply_url)
+            values["metadata"] = _company_form_metadata(
+                values.get("metadata", existing.get("metadata")), company_target
+            )
+        elif "metadata" in values:
+            existing_binding = await load_company_form_binding(user, existing)
+            trusted_target = existing_binding[0] if existing_binding is not None else None
+            values["metadata"] = _company_form_metadata(
+                values.get("metadata"), trusted_target
+            )
         if values.get("status") == "archived":
             values["archived_at"] = _iso(_now())
         elif "status" in values:
@@ -1297,6 +1903,12 @@ def create_app(
             row = await _required_row(client, "jobs", user, job_id)
         if row is None:
             raise ApiError(404, "job_not_found", "The job was not found.")
+        if "apply_url" in values:
+            apply_url = values.get("apply_url")
+            if company_target is not None and isinstance(apply_url, str):
+                await save_company_form_binding(user, row, apply_url, company_target)
+            else:
+                await delete_company_form_binding(user, job_id)
         return _data(row)
 
     @application.delete("/api/v1/jobs/{job_id}", tags=["jobs"])
@@ -1392,7 +2004,12 @@ def create_app(
         client = store_service.user(user.access_token)
         job = await _required_row(client, "jobs", user, job_id)
         provider = detect_provider(job.get("apply_url"))
-        if provider not in MANAGED_BROWSER_LIFECYCLE_PROVIDERS:
+        company_binding: tuple[dict[str, str], dict[str, Any]] | None = None
+        if provider is None:
+            company_binding = await load_company_form_binding(user, job)
+            if company_binding is not None:
+                provider = "company_form"
+        if provider not in APPLICATION_AUTOMATION_PROVIDERS:
             raise ApiError(
                 409,
                 "application_provider_unsupported",
@@ -1427,12 +2044,27 @@ def create_app(
             )
         if application_row is None:
             raise ApiError(503, "data_store_invalid_response", "The application review could not be created.")
+        scan_payload: dict[str, Any] = {"job_id": str(job_id)}
+        if provider == "company_form":
+            if company_binding is None:
+                raise ApiError(
+                    409,
+                    "company_form_target_invalid",
+                    "Save a public HTTPS company application URL before scanning.",
+                )
+            company_target = company_binding[0]
+            scan_payload.update(
+                {
+                    "company_form_host": company_target["host"],
+                    "company_form_target_url": company_target["target_url"],
+                }
+            )
         queued = await enqueue_job(
             user=user,
             kind="application_scan",
             provider=provider,
             application_id=application_row["id"],
-            payload={"job_id": str(job_id)},
+            payload=scan_payload,
             idempotency_key=body.idempotency_key,
         )
         return {
@@ -1446,6 +2078,7 @@ def create_app(
     @application.get("/api/v1/applications", tags=["applications"])
     async def list_applications(
         application_status: str | None = Query(default=None, alias="status", max_length=40),
+        channel: Literal["email", "ats", "manual"] | None = Query(default=None),
         limit: int = Query(default=50, ge=1, le=50),
         offset: int = Query(default=0, ge=0, le=10_000),
         user: AuthUser = Depends(current_user),
@@ -1453,6 +2086,8 @@ def create_app(
         filters: dict[str, Any] = {"user_id": str(user.user_id)}
         if application_status:
             filters["status"] = application_status
+        if channel:
+            filters["channel"] = channel
         rows = await store_service.user(user.access_token).fetch_many(
             "applications", filters=filters, order="created_at.desc", limit=limit, offset=offset
         )
@@ -1583,7 +2218,30 @@ def create_app(
             order="created_at.desc",
             limit=50,
         )
-        return _items(rows)
+        # Profile facts are read at review time rather than copied into the
+        # worker's immutable scan. This lets an already prepared, but unsealed,
+        # form pick up a newly saved public resume URL (and other deterministic
+        # facts) without adding duplicate inputs to Form Pilot or requiring a
+        # Groq round trip. Never overlay a sealed revision: the values displayed
+        # for an approval must remain byte-for-byte aligned with the worker's
+        # approved snapshot.
+        profile = await client.fetch_one(
+            "profiles", filters={"user_id": str(user.user_id)}
+        ) or {}
+        hydrated: list[dict[str, Any]] = []
+        for raw in rows:
+            row = dict(raw)
+            questions = row.get("question_schema")
+            unsealed = (
+                row.get("approved_at") is None
+                and row.get("status") in {"scanned", "prefilled"}
+                and isinstance(questions, list)
+            )
+            row["profile_answers"] = (
+                profile_form_answers(profile, questions) if unsealed else {}
+            )
+            hydrated.append(row)
+        return _items(hydrated)
 
     @application.post(
         "/api/v1/application-form-revisions/{revision_id}/suggest",
@@ -1594,8 +2252,6 @@ def create_app(
         groq_key: str | None = Header(default=None, alias="X-Groq-Api-Key"),
         user: AuthUser = Depends(current_user),
     ) -> dict[str, Any]:
-        if not groq_key or len(groq_key) > 512:
-            raise ApiError(400, "groq_key_required", "Save a valid Groq API key in this browser first.")
         client = store_service.user(user.access_token)
         revision = await _required_row(
             client, "application_form_revisions", user, revision_id
@@ -1618,6 +2274,42 @@ def create_app(
         profile = await client.fetch_one(
             "profiles", filters={"user_id": str(user.user_id)}
         ) or {}
+        deterministic_answers = profile_form_answers(profile, question_schema)
+        allowed_questions = [
+            item
+            for item in question_schema[:150]
+            if isinstance(item, Mapping)
+            and isinstance(item.get("key") or item.get("id") or item.get("name"), str)
+            and isinstance(item.get("label") or item.get("title") or item.get("text"), str)
+        ]
+        resolved_keys = set(deterministic_answers)
+        unresolved = [
+            item
+            for item in allowed_questions
+            if str(item.get("key") or item.get("id") or item.get("name")) not in resolved_keys
+        ]
+        if not unresolved:
+            return {
+                "data": {
+                    "revision_id": str(revision_id),
+                    "revision": revision.get("revision"),
+                    "schema_hash": revision.get("schema_hash"),
+                    "answers": deterministic_answers,
+                    "source": "profile",
+                }
+            }
+        if not groq_key or len(groq_key) > 512:
+            # Deterministic profile facts remain useful without AI. Unknown/open
+            # questions stay blank for the user instead of blocking known fields.
+            return {
+                "data": {
+                    "revision_id": str(revision_id),
+                    "revision": revision.get("revision"),
+                    "schema_hash": revision.get("schema_hash"),
+                    "answers": deterministic_answers,
+                    "source": "profile_partial",
+                }
+            }
         await client.rpc("reserve_groq_request", {"operation_input": "generate"})
         try:
             answers = await run_in_threadpool(
@@ -1637,6 +2329,7 @@ def create_app(
                 "revision": revision.get("revision"),
                 "schema_hash": revision.get("schema_hash"),
                 "answers": answers,
+                "source": "groq",
             }
         }
 
@@ -1690,20 +2383,98 @@ def create_app(
         revision = await _required_row(
             client, "application_form_revisions", user, revision_id
         )
-        if not revision.get("approved_at") and revision.get("status") != "approved":
+        try:
+            revision_number = int(revision.get("revision") or 0)
+        except (TypeError, ValueError):
+            revision_number = 0
+        approval_is_exact = (
+            revision.get("status") == "approved"
+            and revision.get("approved_at") is not None
+            and revision_number >= 1
+            and revision.get("approved_revision") == revision_number
+            and revision.get("approved_schema_hash") == revision.get("schema_hash")
+        )
+        if not approval_is_exact:
             raise ApiError(409, "form_revision_not_approved", "Approve this exact form revision first.")
         provider = str(revision.get("provider") or "").lower()
+        if provider == "company_form":
+            form_target = public_company_form_target(revision.get("form_url"))
+            if form_target is None:
+                raise ApiError(
+                    409,
+                    "company_form_target_invalid",
+                    "The approved company form no longer has a valid public HTTPS target.",
+                )
+            application_id = revision.get("application_id")
+            if not application_id:
+                raise ApiError(
+                    409,
+                    "form_revision_invalid",
+                    "The form revision is not linked to an application.",
+                )
+            application_row = await _required_row(
+                client, "applications", user, application_id
+            )
+            application_job_id = application_row.get("job_id")
+            if (
+                not application_job_id
+                or str(revision.get("job_id") or "") != str(application_job_id)
+            ):
+                raise ApiError(
+                    409,
+                    "form_revision_invalid",
+                    "The form revision is not linked to this saved job.",
+                )
+            bound_job = await _required_row(
+                client, "jobs", user, application_job_id
+            )
+            company_binding = await load_company_form_binding(user, bound_job)
+            if (
+                company_binding is None
+                or company_binding[0]["host"] != form_target["host"]
+            ):
+                raise ApiError(
+                    409,
+                    "company_form_target_changed",
+                    "The saved company form host changed. Scan and review it again.",
+                )
+        submit_preflight: dict[str, Any] | None = None
+        if stage == "submit":
+            submit_preflight = _required_answer_preflight(revision)
+            if not submit_preflight["complete"]:
+                labels = submit_preflight["missing_labels"]
+                visible = ", ".join(str(label) for label in labels[:5])[:180]
+                remaining = int(submit_preflight["missing_count"]) - len(labels[:5])
+                suffix = f" and {remaining} more" if remaining > 0 else ""
+                raise ApiError(
+                    409,
+                    "form_required_answers_missing",
+                    f"Complete these required approved answers before submitting: {visible}{suffix}.",
+                )
         await require_managed_connection(provider, user, operation=stage)
         application_id = revision.get("application_id")
         if not application_id:
             raise ApiError(409, "form_revision_invalid", "The form revision is not linked to an application.")
         await _required_row(client, "applications", user, application_id)
+        queue_payload: dict[str, Any] = {"form_revision_id": str(revision_id)}
+        if provider == "company_form":
+            queue_payload.update(
+                {
+                    "company_form_host": form_target["host"],
+                    "company_form_target_url": form_target["target_url"],
+                }
+            )
+        if stage == "submit":
+            # This is derived only from the already approved immutable snapshot.
+            # The worker also resolves that revision through a tenant-bound RPC;
+            # no answer values are copied into the queue payload.
+            queue_payload["required_answer_preflight"] = submit_preflight
         queued = await enqueue_job(
             user=user,
             kind=f"application_{stage}",
             provider=provider,
             application_id=application_id,
-            payload={"form_revision_id": str(revision_id)},
+            payload=queue_payload,
             idempotency_key=body.idempotency_key,
         )
         return _data(queued)
@@ -2495,6 +3266,7 @@ def create_app(
         )
         if (
             capability is None
+            or provider_id not in MANAGED_BROWSER_LIFECYCLE_PROVIDERS
             or not browser_provider_allowed(
                 provider_id, runtime_settings.allowed_browser_providers
             )

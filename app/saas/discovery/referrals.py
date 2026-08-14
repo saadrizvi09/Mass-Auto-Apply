@@ -23,8 +23,14 @@ _SUBJECT_RE = re.compile(
 )
 _CC_RE = re.compile(r"(?im)^\s*cc\s*[-:]\s*(.+?)\s*$")
 _PROMOTIONAL_LINE = re.compile(
-    r"(?:whatsapp\.com/channel|t\.me/|topmate\.io|subscribe\s+(?:to|for)|join\s+our\s+channel)",
+    r"(?:whatsapp\.com/channel|t\.me/|topmate\.io|subscribe\s+(?:to|for)|"
+    r"join\s+(?:our\s+)?(?:channel|group)|free\s+hiring\s+updates|premium\s+referral)",
     re.IGNORECASE,
+)
+_PROMOTIONAL_TAIL_START = re.compile(
+    r"(?im)^\s*(?:for\s+free\s+hiring\s+updates|if\s+you\s+are\s+a\s+serious\s+job\s+seeker|"
+    r"[\W_]*only\s+for\s+serious\s+job\s+seekers|join\s+our\s+premium\s+referral|"
+    r"we\s+have\s+started\s+our\s+paid\s+group)\b.*$"
 )
 
 
@@ -36,6 +42,29 @@ def _blocks(text: str) -> list[str]:
     return [text.strip()] if text.strip() else []
 
 
+def referral_digest_summary(text: object, jobs: list[NormalizedJob]) -> dict[str, int]:
+    """Return stable intake counts without exposing or storing the pasted digest."""
+
+    source = text if isinstance(text, str) else ""
+    promotional_urls = {
+        url
+        for url in extract_urls(source, limit=1_000)
+        if _PROMOTIONAL_LINE.search(url)
+    }
+    google_forms = sum(
+        job.get("metadata", {}).get("apply_kind") == "form" for job in jobs
+    )
+    email_apply = sum(
+        job.get("metadata", {}).get("apply_kind") == "email" for job in jobs
+    )
+    return {
+        "parsed": len(jobs),
+        "google_forms": google_forms,
+        "email_apply": email_apply,
+        "ignored_promotional": len(promotional_urls),
+    }
+
+
 def _non_promotional_urls(block: str) -> list[str]:
     return [
         url
@@ -44,23 +73,31 @@ def _non_promotional_urls(block: str) -> list[str]:
     ]
 
 
-def _job_from_block(block: str, ordinal: int) -> NormalizedJob | None:
-    urls = _non_promotional_urls(block)
-    emails = extract_emails(block)
+def _actionable_part(block: str) -> str:
+    """Drop a paid-group/footer section appended after an actionable job."""
+
+    marker = _PROMOTIONAL_TAIL_START.search(block)
+    return block[: marker.start()].rstrip() if marker else block
+
+
+def _job_from_block(block: str) -> NormalizedJob | None:
+    actionable = _actionable_part(block)
+    urls = _non_promotional_urls(actionable)
+    emails = extract_emails(actionable)
     if not urls and not emails:
         return None
 
     provider_url = next((url for url in urls if detect_provider(url)), None)
     apply_url = provider_url or (urls[0] if urls else None)
     provider = detect_provider(apply_url) if apply_url else None
-    company, title = infer_company_title(block, apply_url)
-    company = labeled_field(block, ("company", "company name", "organisation", "organization")) or company
-    title = labeled_field(block, ("role", "job title", "position", "opening")) or title
-    location = labeled_field(block, ("location", "city", "work location")) or None
-    batch = labeled_field(block, ("batch", "graduation year", "year of passing"))
-    stipend = labeled_field(block, ("stipend", "salary", "ctc", "compensation"))
-    subject_match = _SUBJECT_RE.search(block)
-    cc_match = _CC_RE.search(block)
+    company, title = infer_company_title(actionable, apply_url)
+    company = labeled_field(actionable, ("company", "company name", "organisation", "organization")) or company
+    title = labeled_field(actionable, ("role", "job title", "position", "opening")) or title
+    location = labeled_field(actionable, ("location", "city", "work location")) or None
+    batch = labeled_field(actionable, ("batch", "graduation year", "year of passing"))
+    stipend = labeled_field(actionable, ("stipend", "salary", "ctc", "compensation"))
+    subject_match = _SUBJECT_RE.search(actionable)
+    cc_match = _CC_RE.search(actionable)
     cc_emails = extract_emails(cc_match.group(1)) if cc_match else []
     contact = next((email for email in emails if email not in cc_emails), emails[0] if emails else None)
     apply_kind = "form" if provider == "google_forms" else "url" if apply_url else "email"
@@ -68,10 +105,12 @@ def _job_from_block(block: str, ordinal: int) -> NormalizedJob | None:
         apply_kind = "ats"
 
     description = "\n".join(
-        line for line in clean_text(block, limit=25_000).splitlines()
+        line for line in clean_text(actionable, limit=25_000).splitlines()
         if not _PROMOTIONAL_LINE.search(line)
     ).strip()
-    external_id = stable_external_id("referral_digest", apply_url, contact, ordinal, description)
+    external_id = stable_external_id(
+        "referral_digest", apply_url, contact, title.casefold(), company.casefold()
+    )
     return make_job(
         source="referral_digest",
         external_id=external_id,
@@ -103,8 +142,8 @@ def parse_referral_digest(text: object, *, limit: int = 100) -> list[NormalizedJ
     limit = max(1, min(int(limit), 250))
     jobs: list[NormalizedJob] = []
     seen_targets: set[tuple[str | None, str | None, str, str]] = set()
-    for ordinal, block in enumerate(_blocks(text), start=1):
-        job = _job_from_block(block, ordinal)
+    for block in _blocks(text):
+        job = _job_from_block(block)
         if not job:
             continue
         target = (
@@ -122,4 +161,4 @@ def parse_referral_digest(text: object, *, limit: int = 100) -> list[NormalizedJ
     return jobs
 
 
-__all__ = ["parse_referral_digest"]
+__all__ = ["parse_referral_digest", "referral_digest_summary"]

@@ -7,6 +7,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -21,6 +22,7 @@ FieldKind = Literal[
     "textarea",
     "select",
     "combobox",
+    "listbox",
     "radio",
     "checkbox",
     "file",
@@ -29,7 +31,7 @@ ExecutionPhase = Literal["scan", "prefill", "submit"]
 
 _CONTROL_SELECTOR = (
     'input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]),'
-    'textarea,select,[role="combobox"],[role="radio"],[role="checkbox"]'
+    'textarea,select,[role="combobox"],[role="listbox"],[role="radio"],[role="checkbox"]'
 )
 _NORMALIZE = re.compile(r"[^a-z0-9]+")
 _CHECKPOINT_TEXT = re.compile(
@@ -53,11 +55,24 @@ _RESUME_FIELD = re.compile(
     r"(?:\bresume\b|\br[ée]sum[ée]\b|\bcv\b|curriculum vitae)",
     re.IGNORECASE,
 )
+_FILE_UPLOAD_PROMPT = re.compile(
+    r"(?:\b(?:upload|attach|choose|select|add)\b.{0,40}\b(?:file|document|resume|r[ée]sum[ée]|cv)\b|"
+    r"\b(?:file|document|resume|r[ée]sum[ée]|cv)\b.{0,40}\b(?:upload|attach)\b)",
+    re.IGNORECASE,
+)
+_PDF_ACCEPT_TOKENS = frozenset(
+    {".pdf", "application/pdf", "application/x-pdf", "application/*", "*/*"}
+)
+_GOOGLE_PICKER_FRAME_HOSTS = frozenset({"docs.google.com", "drive.google.com"})
+_GOOGLE_PICKER_FRAME_PATH = re.compile(r"/(?:picker|upload)(?:/|$)", re.IGNORECASE)
+_GOOGLE_PICKER_TRIGGER = re.compile(
+    r"^(?:add|upload|choose|select)\s+(?:a\s+)?file$", re.IGNORECASE
+)
 
 # This script returns form structure only.  It never returns entered values.
 _SCAN_SCRIPT = r"""
 (root) => {
-  const selector = 'input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]),textarea,select,[role="combobox"],[role="radio"],[role="checkbox"]';
+  const selector = 'input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]),textarea,select,[role="combobox"],[role="listbox"],[role="radio"],[role="checkbox"]';
   const scope = root || document;
   const controls = Array.from(scope.querySelectorAll(selector));
   const clean = value => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 500);
@@ -83,7 +98,7 @@ _SCAN_SCRIPT = r"""
   const labelled = element => {
     const role = clean(element.getAttribute('role')).toLowerCase();
     const rawType = clean(element.getAttribute('type')).toLowerCase();
-    if (['radio', 'checkbox'].includes(role || rawType)) {
+    if (['radio', 'checkbox', 'combobox', 'listbox', 'file'].includes(role || rawType)) {
       const grouped = groupLabel(element);
       if (grouped) return grouped;
     }
@@ -106,7 +121,7 @@ _SCAN_SCRIPT = r"""
     if (element.labels && element.labels.length) {
       return clean(element.labels[0].innerText || element.labels[0].textContent);
     }
-    return clean(element.getAttribute('value'));
+    return clean(element.getAttribute('value') || element.innerText || element.textContent);
   };
   return controls.slice(0, 150).map((element, index) => {
     const tag = element.tagName.toLowerCase();
@@ -114,17 +129,22 @@ _SCAN_SCRIPT = r"""
     const role = clean(element.getAttribute('role')).toLowerCase();
     let kind = tag === 'textarea' ? 'textarea' : tag === 'select' ? 'select' : rawType || 'text';
     if (role === 'combobox' && tag !== 'select') kind = 'combobox';
+    if (role === 'listbox' && tag !== 'select') kind = 'listbox';
     if (role === 'radio') kind = 'radio';
     if (role === 'checkbox') kind = 'checkbox';
-    if (!['text','email','tel','url','number','date','textarea','select','combobox','radio','checkbox','file'].includes(kind)) kind = 'text';
+    if (!['text','email','tel','url','number','date','textarea','select','combobox','listbox','radio','checkbox','file'].includes(kind)) kind = 'text';
     const name = clean(element.getAttribute('name'));
     const id = clean(element.getAttribute('id'));
     const label = labelled(element) || `Question ${index + 1}`;
     const group = groupFor(element);
+    const groupedLabel = groupLabel(element);
     const groupKey = clean(group && (group.getAttribute('aria-labelledby') || group.getAttribute('name') || group.getAttribute('id')));
-    const key = ['radio', 'checkbox'].includes(kind) ? (groupKey || name || label) : (name || id || `field_${index + 1}`);
+    const key = ['radio', 'checkbox', 'combobox', 'listbox'].includes(kind)
+      ? (groupKey || name || id || groupedLabel || label)
+      : (name || id || `field_${index + 1}`);
     let options = [];
     if (tag === 'select') options = Array.from(element.options || []).map(o => clean(o.label || o.textContent || o.value)).filter(Boolean).slice(0, 100);
+    if (kind === 'listbox') options = Array.from(element.querySelectorAll('[role="option"]')).map(optionLabel).filter(Boolean).slice(0, 100);
     if (kind === 'radio' || kind === 'checkbox') options = [optionLabel(element)].filter(Boolean);
     let answered = false;
     if (kind === 'radio') {
@@ -133,6 +153,9 @@ _SCAN_SCRIPT = r"""
         : Boolean(element.checked || element.getAttribute('aria-checked') === 'true');
     } else if (kind === 'checkbox') {
       answered = Boolean(element.checked || element.getAttribute('aria-checked') === 'true');
+    } else if (kind === 'listbox') {
+      const selected = element.querySelector('[role="option"][aria-selected="true"]');
+      answered = Boolean(selected && clean(selected.getAttribute('data-value') || selected.innerText || selected.textContent));
     } else if (kind !== 'file') {
       answered = Boolean(clean(element.value || element.textContent));
     }
@@ -179,6 +202,31 @@ def canonical_form_target(provider: str, value: str) -> str:
     if not base:
         return ""
     parsed = urlsplit(value)
+    if provider == "company_form" and parsed.query:
+        # A user-supplied company site can place the exact application identity in
+        # arbitrary query fields after its one same-host Apply transition. Preserve
+        # the original encoded ordering so signed URLs continue to reopen, but put
+        # a strict ceiling on what can be retained as reviewed form identity.
+        if len(parsed.query) > 2_048:
+            return ""
+        try:
+            pairs = parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+                strict_parsing=False,
+                max_num_fields=25,
+            )
+        except ValueError:
+            return ""
+        if (
+            len(pairs) > 25
+            or any(not key or len(key) > 128 or len(item) > 1_024 for key, item in pairs)
+        ):
+            return ""
+        clean = urlsplit(base)
+        return urlunsplit(
+            (clean.scheme, clean.netloc, clean.path, parsed.query, "")
+        )
     query_keys: dict[str, frozenset[str]] = {
         # Greenhouse embed links identify the posting through these fields.  Common
         # tracking fields such as gh_src/utm_* are deliberately discarded.
@@ -214,6 +262,8 @@ class ProviderPolicy:
     host_suffixes: tuple[str, ...] = ()
     path_prefixes: tuple[str, ...] = ("/",)
     host_path_prefixes: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    path_patterns: tuple[str, ...] = ()
+    allow_explicit_port: bool = True
 
     def allows(self, value: str) -> bool:
         if not isinstance(value, str) or not value or len(value) > 4096:
@@ -230,13 +280,19 @@ class ProviderPolicy:
         )
         path = parsed.path or "/"
         allowed_paths = self.host_path_prefixes.get(host, self.path_prefixes)
+        path_allowed = any(path.startswith(prefix) for prefix in allowed_paths)
+        if self.path_patterns:
+            path_allowed = path_allowed and any(
+                re.search(pattern, path, re.IGNORECASE)
+                for pattern in self.path_patterns
+            )
         return bool(
             parsed.scheme == "https"
             and host_allowed
             and parsed.username is None
             and parsed.password is None
-            and port in {None, 443}
-            and any(path.startswith(prefix) for prefix in allowed_paths)
+            and (port is None or (self.allow_explicit_port and port == 443))
+            and path_allowed
         )
 
 
@@ -252,9 +308,34 @@ class FormField:
     options: tuple[str, ...] = ()
     option_label: str = ""
     accept: str = ""
+    provider_picker: bool = False
+    picker_index: int | None = field(default=None, repr=False)
+
+    @property
+    def is_resume_upload(self) -> bool:
+        """Whether this is one explicit native résumé/CV file control."""
+
+        return self.kind == "file" and bool(
+            _RESUME_FIELD.search(f"{self.label} {self.key}")
+        )
+
+    @property
+    def accepts_pdf(self) -> bool:
+        """Fail closed when an explicit accept list excludes PDF documents."""
+
+        if self.kind != "file":
+            return False
+        tokens = {
+            item.strip().casefold()
+            for item in self.accept.split(",")
+            if item.strip()
+        }
+        # An omitted accept attribute means the native control accepts arbitrary
+        # files; Playwright still attaches exactly one validated local PDF.
+        return not tokens or bool(tokens & _PDF_ACCEPT_TOKENS)
 
     def public(self) -> dict[str, Any]:
-        return {
+        result = {
             "key": self.key,
             "label": self.label,
             "kind": self.kind,
@@ -267,8 +348,15 @@ class FormField:
             # and approve an exact replacement before the worker may submit it.
             "prefilled": self.answered,
             "options": list(self.options),
-            "accepts_resume": self.kind == "file",
+            "accepts_resume": self.is_resume_upload and self.accepts_pdf,
         }
+        if self.kind == "file":
+            # The accept contract participates in the reviewed schema hash. It is
+            # safe structural metadata, not an entered value or private file path.
+            result["accepted_file_types"] = self.accept
+            if self.provider_picker:
+                result["upload_mode"] = "google_picker"
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,7 +427,7 @@ def _parse_field(raw: Any) -> FormField | None:
     kind = raw.get("kind")
     if kind not in {
         "text", "email", "tel", "url", "number", "date", "textarea",
-        "select", "combobox", "radio", "checkbox", "file",
+        "select", "combobox", "listbox", "radio", "checkbox", "file",
     }:
         return None
     index = raw.get("dom_index")
@@ -426,14 +514,218 @@ def _public_fields(fields: Sequence[FormField]) -> list[dict[str, Any]]:
     return result
 
 
-async def scan_form(scope: Any) -> FormSchema:
+def _picker_label_from_text(value: str) -> str:
+    """Extract one stable question label without persisting picker/UI copy."""
+
+    lines = [" ".join(line.split())[:500] for line in value.splitlines()]
+    candidates = [
+        line
+        for line in lines
+        if line
+        and _RESUME_FIELD.search(line)
+        and not _GOOGLE_PICKER_TRIGGER.fullmatch(line)
+    ]
+    return candidates[0] if len(candidates) == 1 else ""
+
+
+def _has_file_picker_prompt(value: str) -> bool:
+    if _FILE_UPLOAD_PROMPT.search(value):
+        return True
+    return bool(
+        _RESUME_FIELD.search(value)
+        and any(
+            _GOOGLE_PICKER_TRIGGER.fullmatch(" ".join(line.split()))
+            for line in value.splitlines()
+            if line.strip()
+        )
+    )
+
+
+async def _scan_google_provider_pickers(
+    scope: Any,
+    *,
+    start_index: int,
+) -> tuple[FormField, ...]:
+    """Model Google Forms' picker-only file questions as reviewable fields.
+
+    Google renders the actual ``input[type=file]`` inside a Google-owned picker
+    iframe only after the respondent presses ``Add file``.  The scan therefore
+    records a synthetic field only when one visible question container says both
+    résumé/CV and file upload.  No trigger is clicked during scanning.
+    """
+
+    try:
+        containers = scope.locator('[role="listitem"]')
+        count = min(await containers.count(), max(0, 150 - start_index))
+    except Exception:
+        return ()
+
+    result: list[FormField] = []
+    for picker_index in range(count):
+        container = containers.nth(picker_index)
+        try:
+            if not await container.is_visible():
+                continue
+            text = (await container.inner_text(timeout=1_000))[:2_000]
+            if not _has_file_picker_prompt(text):
+                continue
+            if await container.locator('input[type="file"]').count() > 0:
+                # Native controls are already represented by ``_SCAN_SCRIPT``.
+                continue
+            label = _picker_label_from_text(text)
+            if not label:
+                # Keep ambiguous/non-résumé provider pickers in the structural
+                # guard below; never invent a résumé destination from nearby text.
+                continue
+            normalized = normalize_key(label)
+            result.append(
+                FormField(
+                    dom_index=start_index + len(result),
+                    key=f"google_picker_{normalized}"[:300],
+                    label=label,
+                    kind="file",
+                    # A required marker is rendered as a literal asterisk in the
+                    # Google question copy. Attachment verification is mandatory
+                    # even when the question itself is optional.
+                    required="*" in text,
+                    disabled=False,
+                    answered=False,
+                    # Google Forms accepts PDFs unless its visible question copy
+                    # explicitly states a different file restriction. The worker
+                    # validates the real picker input again before attaching.
+                    accept="",
+                    provider_picker=True,
+                    picker_index=picker_index,
+                )
+            )
+        except Exception:
+            # The later structural guard will fail closed if an upload-looking
+            # widget cannot be inspected consistently.
+            continue
+    return tuple(result)
+
+
+async def scan_form(scope: Any, *, provider: str = "") -> FormSchema:
     """Capture controls inside one provider-approved application form root."""
 
     raw_fields = await scope.evaluate(_SCAN_SCRIPT)
     if not isinstance(raw_fields, list):
         raw_fields = []
     fields = tuple(field for raw in raw_fields if (field := _parse_field(raw)) is not None)
+    if provider == "google_forms" and len(fields) < 150:
+        fields += await _scan_google_provider_pickers(scope, start_index=len(fields))
     return _schema(fields)
+
+
+async def resume_upload_guard_issue(
+    scope: Any,
+    schema: FormSchema,
+) -> tuple[str, str] | None:
+    """Validate the bounded native résumé-upload contract before approval/fill.
+
+    AutoApply can safely attach the selected private PDF only to one native file
+    input whose captured label/key explicitly says résumé or CV. Provider-owned
+    pickers (including Google Drive pickers), a required unrelated file, multiple
+    possible résumé inputs, and accept lists that exclude PDF stay manual. This
+    inspection reads structure and visible labels only; it never reads file values.
+    """
+
+    file_fields = tuple(field for field in schema.fields if field.kind == "file")
+    resume_fields = tuple(field for field in file_fields if field.is_resume_upload)
+    picker_fields = tuple(field for field in file_fields if field.provider_picker)
+
+    if len(resume_fields) > 1:
+        return (
+            "resume_upload_ambiguous",
+            "More than one résumé or CV upload field was found. Attach the file in Live View so the destination is explicit.",
+        )
+    if resume_fields and not resume_fields[0].accepts_pdf:
+        return (
+            "resume_upload_unsupported",
+            "The résumé upload control does not accept PDF files. Attach a supported file manually in Live View.",
+        )
+    if any(field.required and field not in resume_fields for field in file_fields):
+        return (
+            "required_file_upload_unsupported",
+            "This form requires a non-résumé file. Add it manually in Live View before submission.",
+        )
+
+    supported_picker_index: int | None = None
+    if picker_fields:
+        if len(picker_fields) != 1 or len(resume_fields) != 1:
+            return (
+                "resume_upload_ambiguous",
+                "The provider file picker could not be bound to exactly one résumé or CV question.",
+            )
+        picker = picker_fields[0]
+        if picker.picker_index is None:
+            return (
+                "provider_file_picker_unsupported",
+                "The résumé picker identity could not be verified safely. Complete the attachment in Live View.",
+            )
+        supported_picker_index = picker.picker_index
+        try:
+            container = scope.locator('[role="listitem"]').nth(supported_picker_index)
+            if not await container.is_visible():
+                raise ValueError("picker question is not visible")
+            text = (await container.inner_text(timeout=1_000))[:2_000]
+            label = _picker_label_from_text(text)
+            if normalize_key(label) != normalize_key(picker.label):
+                raise ValueError("picker question label changed")
+            triggers = container.locator('[role="button"],button')
+            exact_triggers = 0
+            for trigger_index in range(min(await triggers.count(), 20)):
+                trigger = triggers.nth(trigger_index)
+                if not await trigger.is_visible() or not await trigger.is_enabled():
+                    continue
+                trigger_text = " ".join(
+                    (await trigger.inner_text(timeout=1_000)).split()
+                )
+                if _GOOGLE_PICKER_TRIGGER.fullmatch(trigger_text):
+                    exact_triggers += 1
+            if exact_triggers != 1:
+                raise ValueError("picker trigger is ambiguous")
+        except Exception:
+            return (
+                "provider_file_picker_unsupported",
+                "The Google résumé picker could not be identified unambiguously. Complete the attachment in Live View.",
+            )
+
+    # Some sites render a provider-owned file picker without exposing a native
+    # input in the reviewed form. Never click that picker or attempt a nearby
+    # input: it may require a separate login, Drive permission, or ambiguous
+    # upload destination. A real native input in the same question is supported.
+    try:
+        containers = scope.locator(
+            '[role="listitem"],fieldset,[data-file-upload],.file-upload'
+        )
+        for index in range(min(await containers.count(), 150)):
+            container = containers.nth(index)
+            try:
+                if not await container.is_visible():
+                    continue
+                text = (await container.inner_text(timeout=1_000))[:2_000]
+                if not _has_file_picker_prompt(text):
+                    continue
+                native = container.locator('input[type="file"]')
+                if await native.count() == 0:
+                    if supported_picker_index == index:
+                        continue
+                    return (
+                        "provider_file_picker_unsupported",
+                        "This form uses a provider-owned file picker instead of a native upload control. Complete its login or picker in Live View.",
+                    )
+            except Exception:
+                return (
+                    "file_upload_inspection_failed",
+                    "The form's upload control could not be verified safely. Complete the attachment in Live View.",
+                )
+    except Exception:
+        return (
+            "file_upload_inspection_failed",
+            "The form's upload controls could not be inspected safely. Complete the attachment in Live View.",
+        )
+    return None
 
 
 async def checkpoint_present(
@@ -511,6 +803,146 @@ def _boolean_answer(value: Any) -> bool | None:
     return None
 
 
+async def _option_has_exact_value(option: Any, wanted: str) -> bool:
+    """Match one visible ARIA option without fuzzy or substring guesses."""
+
+    candidates: list[Any] = []
+    for attribute in ("data-value", "aria-label", "value"):
+        try:
+            candidates.append(await option.get_attribute(attribute))
+        except Exception:
+            continue
+    try:
+        candidates.append(await option.inner_text())
+    except Exception:
+        pass
+    return any(
+        isinstance(candidate, str) and normalize_key(candidate) == wanted
+        for candidate in candidates
+    )
+
+
+async def _visible_exact_options(scope: Any, wanted: str) -> list[Any]:
+    try:
+        options = scope.locator('[role="option"]')
+        count = min(await options.count(), 100)
+    except Exception:
+        return []
+
+    matches: list[Any] = []
+    for index in range(count):
+        option = options.nth(index)
+        try:
+            if await option.is_visible() and await _option_has_exact_value(option, wanted):
+                matches.append(option)
+        except Exception:
+            continue
+    return matches
+
+
+async def _choice_selected_exactly(control: Any, option: Any, wanted: str) -> bool:
+    """Verify the clicked choice through observable selected state/value."""
+
+    try:
+        if (
+            await option.get_attribute("aria-selected") == "true"
+            and await _option_has_exact_value(option, wanted)
+        ):
+            return True
+    except Exception:
+        pass
+
+    # Google Forms keeps the selected option below the listbox after its popup
+    # closes. Other ARIA widgets expose the chosen value on the control itself.
+    try:
+        selected = control.locator('[role="option"][aria-selected="true"]')
+        for index in range(min(await selected.count(), 20)):
+            if await _option_has_exact_value(selected.nth(index), wanted):
+                return True
+    except Exception:
+        pass
+
+    candidates: list[Any] = []
+    for attribute in ("data-value", "aria-valuetext", "value"):
+        try:
+            candidates.append(await control.get_attribute(attribute))
+        except Exception:
+            continue
+    try:
+        candidates.append(await control.input_value())
+    except Exception:
+        pass
+    try:
+        candidates.append(await control.inner_text())
+    except Exception:
+        pass
+    return any(
+        isinstance(candidate, str) and normalize_key(candidate) == wanted
+        for candidate in candidates
+    )
+
+
+async def _fill_aria_choice(
+    page: Any,
+    control: Any,
+    answer: str,
+    *,
+    editable: bool,
+) -> bool:
+    wanted = normalize_key(answer)
+    if not wanted:
+        return False
+    if await _choice_selected_exactly(control, control, wanted):
+        return True
+
+    if editable:
+        try:
+            await control.fill(answer)
+        except Exception:
+            # Some ARIA comboboxes are button-like widgets rather than inputs.
+            try:
+                await control.click()
+            except Exception:
+                return False
+    else:
+        try:
+            await control.click()
+        except Exception:
+            return False
+    try:
+        await page.wait_for_timeout(250)
+    except Exception:
+        pass
+
+    # Prefer options owned by the control. Portalled menus are searched on the
+    # page only when the control itself exposes no exact candidate.
+    matches = await _visible_exact_options(control, wanted)
+    if not matches:
+        matches = await _visible_exact_options(page, wanted)
+    if len(matches) != 1:
+        if editable:
+            try:
+                await control.fill("")
+            except Exception:
+                pass
+        return False
+
+    option = matches[0]
+    try:
+        await option.click()
+    except Exception:
+        return False
+    for attempt in range(3):
+        if await _choice_selected_exactly(control, option, wanted):
+            return True
+        if attempt < 2:
+            try:
+                await page.wait_for_timeout(100)
+            except Exception:
+                pass
+    return False
+
+
 async def _fill_one(page: Any, control: Any, field: FormField, answer: Any) -> bool:
     is_many = isinstance(answer, tuple)
     text = (
@@ -527,26 +959,11 @@ async def _fill_one(page: Any, control: Any, field: FormField, answer: Any) -> b
     if field.kind == "combobox":
         if is_many:
             return False
-        await control.fill(text)
-        try:
-            await page.wait_for_timeout(250)
-        except Exception:
-            pass
-        options = page.locator('[role="option"]')
-        matches: list[Any] = []
-        for index in range(min(await options.count(), 100)):
-            option = options.nth(index)
-            try:
-                option_text = (await option.inner_text()).strip()
-                if await option.is_visible() and option_text.casefold() == text.casefold():
-                    matches.append(option)
-            except Exception:
-                continue
-        if len(matches) == 1:
-            await matches[0].click()
-            return True
-        await control.fill("")
-        return False
+        return await _fill_aria_choice(page, control, text, editable=True)
+    if field.kind == "listbox":
+        if is_many:
+            return False
+        return await _fill_aria_choice(page, control, text, editable=False)
     if field.kind == "select":
         requested = many or (text,)
         matches = [
@@ -600,6 +1017,208 @@ async def _fill_one(page: Any, control: Any, field: FormField, answer: Any) -> b
     return False
 
 
+async def _attach_resume_pdf(control: Any, resume_path: str) -> bool:
+    """Attach one PDF and verify the native input's observable FileList."""
+
+    try:
+        expected_size = Path(resume_path).stat().st_size
+    except (OSError, ValueError):
+        expected_size = None
+    await control.set_input_files(resume_path)
+    try:
+        evidence = await control.evaluate(
+            """
+            element => {
+              const files = element && element.files ? Array.from(element.files) : [];
+              if (files.length !== 1) return { count: files.length };
+              const file = files[0];
+              return {
+                count: 1,
+                name: String(file.name || '').slice(0, 255),
+                type: String(file.type || '').slice(0, 100),
+                size: Number(file.size || 0),
+              };
+            }
+            """
+        )
+    except Exception:
+        return False
+    if not isinstance(evidence, Mapping) or evidence.get("count") != 1:
+        return False
+    name = evidence.get("name")
+    mime_type = evidence.get("type")
+    size = evidence.get("size")
+    return bool(
+        isinstance(name, str)
+        and name.casefold().endswith(".pdf")
+        and mime_type in {"application/pdf", "application/x-pdf"}
+        and isinstance(size, (int, float))
+        and not isinstance(size, bool)
+        and size > 0
+        and (expected_size is None or size == expected_size)
+    )
+
+
+async def _exact_google_picker_trigger(container: Any) -> Any | None:
+    try:
+        triggers = container.locator('[role="button"],button')
+        matches: list[Any] = []
+        for index in range(min(await triggers.count(), 20)):
+            trigger = triggers.nth(index)
+            if not await trigger.is_visible() or not await trigger.is_enabled():
+                continue
+            text = " ".join((await trigger.inner_text(timeout=1_000)).split())
+            if _GOOGLE_PICKER_TRIGGER.fullmatch(text):
+                matches.append(trigger)
+        return matches[0] if len(matches) == 1 else None
+    except Exception:
+        return None
+
+
+def _google_picker_frame_url_allowed(value: str, *, page_url: str) -> bool:
+    try:
+        parsed = urlsplit(urljoin(page_url, value))
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        parsed.scheme == "https"
+        and (parsed.hostname or "").rstrip(".").lower() in _GOOGLE_PICKER_FRAME_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+        and _GOOGLE_PICKER_FRAME_PATH.search(parsed.path or "/")
+    )
+
+
+async def _picker_filename_visible(scope: Any, filename: str) -> bool:
+    try:
+        body = scope.locator("body")
+        text = await body.inner_text(timeout=1_000)
+    except Exception:
+        try:
+            text = await scope.inner_text(timeout=1_000)
+        except Exception:
+            return False
+    return filename.casefold() in text[:100_000].casefold()
+
+
+async def _google_picker_closed_with_filename(
+    page: Any,
+    container: Any,
+    filename: str,
+) -> bool:
+    for _ in range(40):
+        try:
+            frame_nodes = page.locator(
+                'iframe.picker-frame,iframe[src*="/picker" i]'
+            )
+            visible_frames = 0
+            for index in range(min(await frame_nodes.count(), 10)):
+                if await frame_nodes.nth(index).is_visible():
+                    visible_frames += 1
+            if visible_frames == 0 and await _picker_filename_visible(container, filename):
+                return True
+        except Exception:
+            pass
+        try:
+            await page.wait_for_timeout(500)
+        except Exception:
+            pass
+    return False
+
+
+async def _attach_google_resume_picker(
+    page: Any,
+    root: Any,
+    field: FormField,
+    resume_path: str,
+) -> bool:
+    """Attach one PDF through Google's picker and verify provider-visible state.
+
+    This deliberately supports only the picker shape observed for a signed-in
+    Google Forms file-upload question. It never enters credentials and never
+    clicks the form's final Submit control. Any DOM/host/action ambiguity returns
+    ``False`` so the managed run pauses before submission.
+    """
+
+    if field.picker_index is None:
+        return False
+    try:
+        container = root.locator('[role="listitem"]').nth(field.picker_index)
+        if not await container.is_visible():
+            return False
+        text = (await container.inner_text(timeout=1_000))[:2_000]
+        if normalize_key(_picker_label_from_text(text)) != normalize_key(field.label):
+            return False
+        trigger = await _exact_google_picker_trigger(container)
+        if trigger is None:
+            return False
+        await trigger.click()
+        await page.wait_for_timeout(500)
+
+        frame_nodes = page.locator(
+            'iframe.picker-frame,iframe[src*="/picker" i]'
+        )
+        frames: list[Any] = []
+        for index in range(min(await frame_nodes.count(), 10)):
+            frame_node = frame_nodes.nth(index)
+            if not await frame_node.is_visible():
+                continue
+            source = await frame_node.get_attribute("src")
+            if not isinstance(source, str) or not _google_picker_frame_url_allowed(
+                source, page_url=getattr(page, "url", "")
+            ):
+                return False
+            frames.append(frame_node)
+        if len(frames) != 1:
+            return False
+
+        picker = frames[0].content_frame
+        file_inputs = picker.locator('input[type="file"]')
+        if await file_inputs.count() != 1:
+            return False
+        file_input = file_inputs.nth(0)
+        actual_accept = (await file_input.get_attribute("accept") or "").strip()
+        if actual_accept:
+            tokens = {
+                item.strip().casefold()
+                for item in actual_accept.split(",")
+                if item.strip()
+            }
+            if not tokens & _PDF_ACCEPT_TOKENS:
+                return False
+        if not await _attach_resume_pdf(file_input, resume_path):
+            return False
+
+        filename = Path(resume_path).name
+        # Some picker versions upload immediately. Prefer observing the picker
+        # close and the exact filename appear in the original question.
+        if await _google_picker_closed_with_filename(page, container, filename):
+            return True
+
+        if not await _picker_filename_visible(picker, filename):
+            return False
+        # Other picker versions require one explicit Upload/Select action after
+        # the exact local file is observable. Restrict this to one exact action
+        # inside the already host-validated picker iframe.
+        action_nodes = picker.locator('[role="button"],button')
+        actions: list[Any] = []
+        for index in range(min(await action_nodes.count(), 30)):
+            action = action_nodes.nth(index)
+            if not await action.is_visible() or not await action.is_enabled():
+                continue
+            action_text = normalize_key(await action.inner_text(timeout=1_000))
+            if action_text in {"upload", "select"}:
+                actions.append(action)
+        if len(actions) != 1:
+            return False
+        await actions[0].click()
+        return await _google_picker_closed_with_filename(page, container, filename)
+    except Exception:
+        return False
+
+
 async def fill_approved(
     page: Any,
     schema: FormSchema,
@@ -613,24 +1232,33 @@ async def fill_approved(
     approved = _approved_lookup(answers)
     controls = (root or page).locator(_CONTROL_SELECTOR)
     filled_keys: set[str] = set()
+    attempted_keys: set[str] = set()
     filled_count = 0
     for field in schema.fields:
         if field.disabled:
             continue
         try:
-            control = controls.nth(field.dom_index)
             if field.kind == "file":
-                resume_field = bool(
-                    _RESUME_FIELD.search(f"{field.label} {field.key}")
-                )
-                if resume_path and resume_field:
-                    await control.set_input_files(resume_path)
-                    filled_keys.add(normalize_key(field.key))
-                    filled_count += 1
+                if resume_path and field.is_resume_upload and field.accepts_pdf:
+                    attempted_keys.add(normalize_key(field.key))
+                    attached = (
+                        await _attach_google_resume_picker(
+                            page, root or page, field, resume_path
+                        )
+                        if field.provider_picker
+                        else await _attach_resume_pdf(
+                            controls.nth(field.dom_index), resume_path
+                        )
+                    )
+                    if attached:
+                        filled_keys.add(normalize_key(field.key))
+                        filled_count += 1
                 continue
+            control = controls.nth(field.dom_index)
             answer = _answer_for(field, approved)
             if answer is None:
                 continue
+            attempted_keys.add(normalize_key(field.key))
             if await _fill_one(page, control, field, answer):
                 filled_keys.add(normalize_key(field.key))
                 filled_count += 1
@@ -644,7 +1272,7 @@ async def fill_approved(
     for field in schema.fields:
         required_key = normalize_key(field.key)
         if (
-            (field.required or field.answered)
+            (field.required or field.answered or required_key in attempted_keys)
             and required_key not in filled_keys
             and required_key not in seen_required
         ):
@@ -724,6 +1352,26 @@ class ProviderAdapter:
             return False
         if self.provider == "google_forms":
             return True
+        if self.provider == "yc":
+            # YC's signed-in job page opens exactly one application dialog whose
+            # legacy, observed contract is a message textarea plus one Send/Submit
+            # control. Do not treat unrelated page forms or recommendation cards
+            # as the application root.
+            try:
+                textareas = root.locator("textarea")
+                visible_textareas = 0
+                for index in range(min(await textareas.count(), 20)):
+                    if await textareas.nth(index).is_visible():
+                        visible_textareas += 1
+                finals = root.locator(",".join(self.submit_selectors))
+                visible_finals = 0
+                for index in range(min(await finals.count(), 10)):
+                    candidate = finals.nth(index)
+                    if await candidate.is_visible() and await candidate.is_enabled():
+                        visible_finals += 1
+                return visible_textareas >= 1 and visible_finals == 1
+            except Exception:
+                return False
         try:
             text = (await root.inner_text(timeout=2_000))[:100_000]
         except Exception:
@@ -1062,6 +1710,7 @@ __all__ = [
     "checkpoint_present",
     "fill_approved",
     "normalize_key",
+    "resume_upload_guard_issue",
     "safe_form_url",
     "scan_form",
 ]

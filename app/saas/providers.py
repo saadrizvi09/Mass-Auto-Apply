@@ -45,7 +45,20 @@ _REGISTRY: tuple[dict[str, str], ...] = (
         "id": "google_forms",
         "label": "Google Forms",
         "mode": "managed_browser",
-        "reason": "Scan and prefill application forms in an isolated browser after review.",
+        "reason": (
+            "Public forms can be scanned and reviewed without a login. Connect an "
+            "optional isolated Google browser session only when a form requires a "
+            "signed-in file upload."
+        ),
+    },
+    {
+        "id": "company_form",
+        "label": "Company-hosted form",
+        "mode": "managed_browser",
+        "reason": (
+            "Save one public HTTPS application URL, scan it, and approve the exact "
+            "captured revision before submission. No login is stored."
+        ),
     },
     {
         "id": "greenhouse",
@@ -109,10 +122,22 @@ _REGISTRY: tuple[dict[str, str], ...] = (
 # Instahyre deliberately remain outside this set until their authenticated,
 # multi-step state machines have passed controlled provider canaries.
 HOSTED_FORM_AUTOMATION_PROVIDERS = frozenset(
-    {"google_forms", "greenhouse", "lever", "ashby", "wellfound"}
+    {"company_form", "google_forms", "greenhouse", "lever", "ashby", "wellfound"}
 )
+# Kept as a compatibility export for workers deployed independently from the
+# control plane.  No current hosted-form provider is forced into manual-submit
+# mode: an explicit, immutable revision approval is the submission gate.
+MANUAL_SUBMIT_ONLY_PROVIDERS: frozenset[str] = frozenset()
 SAVED_BROWSER_CONTEXT_PROVIDERS = frozenset(
     {"yc", "wellfound", "cutshort", "instahyre"}
+)
+# Public Google Forms normally run in a fresh ephemeral session. A form that
+# contains Google's authenticated file-upload question can opt into a saved,
+# tenant-isolated browser context without making that connection a global
+# requirement for ordinary public forms.
+OPTIONAL_SAVED_BROWSER_CONTEXT_PROVIDERS = frozenset({"google_forms"})
+CONNECTABLE_BROWSER_CONTEXT_PROVIDERS = (
+    SAVED_BROWSER_CONTEXT_PROVIDERS | OPTIONAL_SAVED_BROWSER_CONTEXT_PROVIDERS
 )
 
 
@@ -223,6 +248,19 @@ def provider_catalog(
                     "paused until this provider's multi-step state machine passes a "
                     "controlled canary."
                 )
+            elif provider_id == "company_form":
+                reason = (
+                    "Save an explicit public HTTPS form URL and scan it first. "
+                    "Prefill and submit unlock only for that exact reviewed revision; "
+                    "no login is stored."
+                )
+            elif provider_id == "google_forms":
+                reason = (
+                    "Public forms can be scanned and reviewed without a connection. "
+                    "Connect an optional isolated Google browser session only when "
+                    "a form requires a signed-in file upload; every captured revision "
+                    "still requires explicit review."
+                )
             else:
                 reason = (
                     "Managed browser support is enabled; every captured form revision "
@@ -233,7 +271,10 @@ def provider_catalog(
                 "label": label,
                 "mode": "managed_browser",
                 "available": ready,
-                "can_connect": ready and provider_id in SAVED_BROWSER_CONTEXT_PROVIDERS,
+                "can_connect": ready and provider_id in CONNECTABLE_BROWSER_CONTEXT_PROVIDERS,
+                # The API/database still require an explicitly saved host, a scan,
+                # and the exact approved revision.  The catalog describes the
+                # resulting provider capability, not the state of one application.
                 "can_auto_apply": automation_ready,
                 "can_scan": automation_ready,
                 "can_prefill": automation_ready,
@@ -287,6 +328,9 @@ def get_provider(
 
 __all__ = [
     "HOSTED_FORM_AUTOMATION_PROVIDERS",
+    "MANUAL_SUBMIT_ONLY_PROVIDERS",
+    "CONNECTABLE_BROWSER_CONTEXT_PROVIDERS",
+    "OPTIONAL_SAVED_BROWSER_CONTEXT_PROVIDERS",
     "ProviderCapability",
     "ProviderMode",
     "SAVED_BROWSER_CONTEXT_PROVIDERS",

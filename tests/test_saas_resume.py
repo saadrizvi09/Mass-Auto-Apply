@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import RectangleObject
 
 from app.saas import resume as resume_module
 from app.saas.resume import ResumeParseError, extract_pdf_text, profile_suggestions
@@ -102,3 +105,29 @@ def test_pdf_annotation_profile_links_are_included_without_fetching(
     text = extract_pdf_text(b"%PDF-fake", max_bytes=100)
     assert "https://linkedin.com/in/ada" in text
     assert profile_suggestions(text)["linkedin_url"] == "https://linkedin.com/in/ada"
+
+
+def test_real_pdf_uri_annotations_are_resolved() -> None:
+    """Exercise pypdf's real indirect annotation objects, as used by icon links."""
+
+    output = BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.add_uri(
+        0,
+        "https://www.linkedin.com/in/ada-lovelace",
+        RectangleObject((10, 10, 30, 30)),
+    )
+    writer.add_uri(
+        0,
+        "https://github.com/ada-lovelace",
+        RectangleObject((40, 10, 60, 30)),
+    )
+    writer.write(output)
+
+    page = PdfReader(BytesIO(output.getvalue())).pages[0]
+
+    assert resume_module._annotation_urls(page, remaining=10) == [
+        "https://www.linkedin.com/in/ada-lovelace",
+        "https://github.com/ada-lovelace",
+    ]

@@ -2,11 +2,20 @@ import { createClient } from "/vendor/supabase.js";
 
 const API_PREFIX = "/api/v1";
 const GROQ_STORAGE_PREFIX = "autoapply.groq_api_key.v2";
+const HUNTER_STORAGE_PREFIX = "autoapply.hunter_api_key.v1";
+const DISCOVERY_RUN_STORAGE_PREFIX = "autoapply.discovery_run.v1";
 const GMAIL_REVOCATION_WARNING_PREFIX = "autoapply.gmail_revocation_warning.v1";
 const UI_STORAGE_KEY = "autoapply.ui_preferences.v1";
 const DEFAULT_RESUME_LIMIT = 6_291_456;
 const TURNSTILE_SCRIPT_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
 const TURNSTILE_FLEXIBLE_MIN_WIDTH = 300;
+const DISCOVERY_POLL_INTERVAL_MS = 2_000;
+const DISCOVERY_MONITOR_TIMEOUT_MS = 300_000;
+const DISCOVERY_TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled", "needs_attention"]);
+const FORM_WORKFLOW_POLL_INTERVAL_MS = 2_000;
+const FORM_WORKFLOW_MONITOR_TIMEOUT_MS = 300_000;
+const BOOT_STEP_ORDER = ["service", "session", "workspace"];
+const WORKSPACE_OPEN_TIMEOUT_MS = 30_000;
 
 const viewCopy = {
   overview: {
@@ -20,9 +29,19 @@ const viewCopy = {
     description: "The factual source used to ground your drafts and application answers.",
   },
   discovery: {
-    kicker: "Public sourcing",
-    title: "Job Radar",
-    description: "Fetch public jobs from Telegram channels, LinkedIn guest listings, RSS feeds, and ATS boards.",
+    kicker: "Step 2 · Find opportunities",
+    title: "Find jobs",
+    description: "Use your résumé to search LinkedIn, Telegram, and RSS together.",
+  },
+  form_pilot: {
+    kicker: "Step 3 · Prepare forms",
+    title: "Form Pilot",
+    description: "Parse referral alerts, route application methods, and prepare Google Forms for review.",
+  },
+  outreach: {
+    kicker: "Step 4 · Reach the right people",
+    title: "Mass Cold Email",
+    description: "Add your Hunter key, find recruiter emails, draft with Groq, and send only messages you approve through Gmail.",
   },
   jobs: {
     kicker: "Opportunity workspace",
@@ -30,9 +49,9 @@ const viewCopy = {
     description: "Capture job descriptions, contacts, and application links.",
   },
   applications: {
-    kicker: "Review before action",
-    title: "Applications",
-    description: "Edit, approve, and send one deliberate application at a time.",
+    kicker: "Step 4 · Review and send",
+    title: "Mass Cold Email",
+    description: "Review and approve the exact cold-email messages before sending through Gmail.",
   },
   connections: {
     kicker: "External services",
@@ -63,6 +82,7 @@ const state = {
   jobsHasMore: false,
   fitSummary: {},
   applications: [],
+  formApplications: [],
   connections: [],
   googleOauthClient: {},
   googleOauthMode: null,
@@ -70,8 +90,22 @@ const state = {
   publicProviders: [],
   automationJobs: [],
   discoverySources: [],
+  googleForms: [],
+  googleFormsTotal: 0,
+  resumeDiscoveryPlan: null,
+  discoveryRun: null,
+  discoveryMonitorPromise: null,
+  workflowDockDismissedRunId: null,
+  hunterValidation: null,
+  outreachSelectedJobIds: new Set(),
+  outreachContacts: {},
   formRevisions: {},
   selectedFormRevisionId: null,
+  selectedFormApplicationId: null,
+  formSuggestionAttempts: new Set(),
+  formSuggestionCache: new Map(),
+  formSubmissionJobs: new Map(),
+  formWorkflowMonitors: new Map(),
   pendingJobImportFile: null,
   resumeSuggestions: null,
   pendingResumeFile: null,
@@ -82,6 +116,8 @@ const state = {
   identityUserId: null,
   identityGeneration: 0,
   workspaceLoadId: 0,
+  workspaceOpeningPromise: null,
+  workspaceOpeningUserId: null,
   automationTimer: null,
   captchaToken: null,
   captchaWidgetId: null,
@@ -115,11 +151,21 @@ const all = (selector, root = document) => Array.from(root.querySelectorAll(sele
 
 function setText(target, value) {
   const node = typeof target === "string" ? byId(target) : target;
-  if (node) node.textContent = value == null ? "" : String(value);
+  const next = value == null ? "" : String(value);
+  if (node && node.textContent !== next) node.textContent = next;
+}
+
+function setAriaBusy(node, busy) {
+  if (!node) return;
+  const next = busy ? "true" : "false";
+  if (node.getAttribute("aria-busy") !== next) node.setAttribute("aria-busy", next);
 }
 
 function clearNode(node) {
-  if (node) node.replaceChildren();
+  if (node) {
+    node.replaceChildren();
+    node.removeAttribute("aria-busy");
+  }
 }
 
 function createElement(tag, options = {}, children = []) {
@@ -151,12 +197,76 @@ function emptyState(title, message, symbol = "◇") {
 }
 
 function showLoading(container, count = 3) {
+  if (!container) return;
   clearNode(container);
-  const list = createElement("div", { className: "loading-list", attrs: { "aria-label": "Loading" } });
+  container.setAttribute("aria-busy", "true");
+  const list = createElement("div", {
+    className: "loading-list",
+    attrs: { role: "status", "aria-live": "polite", "aria-label": "Loading saved workspace items" },
+  });
   for (let index = 0; index < count; index += 1) {
     list.append(createElement("div", { className: "skeleton", attrs: { "aria-hidden": "true" } }));
   }
   container.append(list);
+}
+
+function setBootCheckpoint(step, title, detail, activeStatus) {
+  const boot = byId("boot-screen");
+  if (!boot) return;
+  const currentIndex = Math.max(0, BOOT_STEP_ORDER.indexOf(step));
+  boot.hidden = false;
+  boot.classList.remove("has-error");
+  byId("boot-recovery").hidden = true;
+  setAriaBusy(boot, true);
+  setText("boot-title", title);
+  setText("boot-detail", detail);
+  all("[data-boot-step]", boot).forEach((item) => {
+    const itemIndex = BOOT_STEP_ORDER.indexOf(item.dataset.bootStep);
+    const complete = itemIndex < currentIndex;
+    const active = itemIndex === currentIndex;
+    item.classList.toggle("is-complete", complete);
+    item.classList.toggle("is-active", active);
+    if (active) item.setAttribute("aria-current", "step");
+    else item.removeAttribute("aria-current");
+    const status = item.querySelector("small");
+    if (status && complete) status.textContent = "Checked and ready";
+    else if (status && active) status.textContent = activeStatus;
+  });
+}
+
+function finishBoot() {
+  const boot = byId("boot-screen");
+  if (!boot) return;
+  setAriaBusy(boot, false);
+  boot.hidden = true;
+}
+
+function showBootFailure(error) {
+  const boot = byId("boot-screen");
+  if (!boot) return;
+  boot.hidden = false;
+  boot.classList.add("has-error");
+  setAriaBusy(boot, false);
+  setText("boot-title", "Your workspace stopped before opening");
+  setText("boot-detail", errorMessage(error, "The saved workspace data could not be loaded."));
+  byId("boot-recovery").hidden = false;
+}
+
+async function waitForWorkspaceLoad(identity) {
+  let timeout;
+  try {
+    await Promise.race([
+      loadWorkspace(identity),
+      new Promise((resolve, reject) => {
+        timeout = window.setTimeout(
+          () => reject(new AppError("The workspace took too long to open. Check the service, then retry.", "workspace_load_timeout")),
+          WORKSPACE_OPEN_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) window.clearTimeout(timeout);
+  }
 }
 
 function announce(message) {
@@ -184,6 +294,76 @@ function toast(message, type = "info", title = null, timeout = 5_000) {
   if (timeout > 0) window.setTimeout(() => item.remove(), timeout);
 }
 
+let actionDialogResolve = null;
+let actionDialogTrigger = null;
+
+function settleActionDialog(confirmed) {
+  const resolve = actionDialogResolve;
+  const trigger = actionDialogTrigger;
+  actionDialogResolve = null;
+  actionDialogTrigger = null;
+  document.body.classList.remove("modal-open");
+  if (resolve) resolve(Boolean(confirmed));
+  if (trigger?.isConnected && !trigger.disabled) {
+    requestAnimationFrame(() => trigger.focus({ preventScroll: true }));
+  }
+}
+
+function bindActionDialog() {
+  const dialog = byId("action-dialog");
+  if (!dialog) return;
+  dialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    dialog.close("cancel");
+  });
+  dialog.addEventListener("close", () => settleActionDialog(dialog.returnValue === "confirm"));
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog) dialog.close("cancel");
+  });
+}
+
+function confirmAction({
+  eyebrow = "Before you continue",
+  title = "Review this action",
+  message = "Check the details before continuing.",
+  confirmLabel = "Continue",
+  cancelLabel = "Keep current state",
+  tone = "default",
+  ticketLabel = "Review",
+  symbol = "→",
+} = {}) {
+  const dialog = byId("action-dialog");
+  if (!dialog || typeof dialog.showModal !== "function") {
+    toast("This browser cannot open the review dialog. The action was cancelled.", "error");
+    return Promise.resolve(false);
+  }
+  if (dialog.open || actionDialogResolve) return Promise.resolve(false);
+
+  setText("action-dialog-eyebrow", eyebrow);
+  setText("action-dialog-title", title);
+  setText("action-dialog-message", message);
+  setText("action-dialog-confirm", confirmLabel);
+  setText("action-dialog-cancel", cancelLabel);
+  setText("action-dialog-ticket-label", ticketLabel);
+  setText("action-dialog-symbol", symbol);
+  dialog.dataset.tone = ["danger", "caution"].includes(tone) ? tone : "default";
+  const confirmButton = byId("action-dialog-confirm");
+  confirmButton.className = `button ${tone === "danger" ? "button-danger" : tone === "caution" ? "button-accent" : "button-primary"}`;
+  dialog.returnValue = "cancel";
+  actionDialogTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+  return new Promise((resolve) => {
+    actionDialogResolve = resolve;
+    document.body.classList.add("modal-open");
+    try {
+      dialog.showModal();
+      requestAnimationFrame(() => byId("action-dialog-cancel")?.focus());
+    } catch {
+      settleActionDialog(false);
+    }
+  });
+}
+
 function errorMessage(error, fallback = "Something went wrong. Please try again.") {
   if (isIdentityChanged(error)) return null;
   if (error instanceof AppError && error.message) return error.message;
@@ -203,19 +383,36 @@ function clearPrivateState() {
   state.jobsHasMore = false;
   state.fitSummary = {};
   state.applications = [];
+  state.formApplications = [];
   state.connections = [];
   state.googleOauthClient = {};
   state.googleOauthMode = null;
   state.googleOauthEditing = false;
   state.automationJobs = [];
   state.discoverySources = [];
+  state.googleForms = [];
+  state.googleFormsTotal = 0;
+  state.resumeDiscoveryPlan = null;
+  state.discoveryRun = null;
+  state.discoveryMonitorPromise = null;
+  state.workflowDockDismissedRunId = null;
+  state.hunterValidation = null;
+  state.outreachSelectedJobIds = new Set();
+  state.outreachContacts = {};
   state.formRevisions = {};
   state.selectedFormRevisionId = null;
+  state.selectedFormApplicationId = null;
+  state.formSuggestionAttempts = new Set();
+  state.formSuggestionCache = new Map();
+  state.formSubmissionJobs = new Map();
+  state.formWorkflowMonitors = new Map();
   state.pendingJobImportFile = null;
   state.resumeSuggestions = null;
   state.pendingResumeFile = null;
   state.selectedApplicationId = null;
   state.applicationEditorDirty = false;
+  const dialog = byId("action-dialog");
+  if (dialog?.open) dialog.close("cancel");
 }
 
 function setSession(session) {
@@ -266,17 +463,35 @@ async function withBusy(button, busyLabel, action) {
   if (!button) return action();
   if (button.disabled) return undefined;
   const originalNodes = Array.from(button.childNodes);
+  const hadAriaLabel = button.hasAttribute("aria-label");
+  const originalAriaLabel = button.getAttribute("aria-label");
+  const originalDisabled = button.disabled;
   button.dataset.busy = "true";
   button.disabled = true;
-  button.replaceChildren(document.createTextNode(busyLabel));
+  button.setAttribute("aria-busy", "true");
+  setBusyLabel(button, busyLabel);
   try {
     return await action();
   } finally {
     delete button.dataset.busy;
+    button.removeAttribute("aria-busy");
     button.replaceChildren(...originalNodes);
+    if (hadAriaLabel) button.setAttribute("aria-label", originalAriaLabel || "");
+    else button.removeAttribute("aria-label");
     if (isCaptchaProtectedAuthButton(button)) updateCaptchaControls();
-    else button.disabled = false;
+    else button.disabled = originalDisabled;
   }
+}
+
+function setBusyLabel(button, busyLabel) {
+  if (!button) return;
+  const label = String(busyLabel || "Working…") === "…" ? "Refreshing…" : String(busyLabel || "Working…");
+  const compact = button.classList.contains("icon-button");
+  button.replaceChildren(
+    createElement("span", { className: "button-pending-spinner", attrs: { "aria-hidden": "true" } }),
+    createElement("span", { className: compact ? "sr-only" : "button-pending-label", text: label }),
+  );
+  if (compact) button.setAttribute("aria-label", label.replace(/…/g, ""));
 }
 
 function isCaptchaProtectedAuthButton(button) {
@@ -465,6 +680,81 @@ function deleteGroqKey(userId = state.identityUserId) {
   }
 }
 
+function hunterStorageKey(userId = state.identityUserId) {
+  return typeof userId === "string" && userId ? `${HUNTER_STORAGE_PREFIX}.${userId}` : null;
+}
+
+function getHunterKey(userId = state.identityUserId) {
+  try {
+    const storageKey = hunterStorageKey(userId);
+    return storageKey ? localStorage.getItem(storageKey) || "" : "";
+  } catch {
+    return "";
+  }
+}
+
+function saveHunterKey(value, userId = state.identityUserId) {
+  const storageKey = hunterStorageKey(userId);
+  if (!storageKey) throw new AppError("Sign in before saving a Hunter key.", "not_authenticated");
+  try {
+    localStorage.setItem(storageKey, value);
+  } catch {
+    throw new AppError("This browser blocked local storage. Allow site storage to save the Hunter key.", "storage_unavailable");
+  }
+}
+
+function deleteHunterKey(userId = state.identityUserId) {
+  try {
+    const storageKey = hunterStorageKey(userId);
+    if (storageKey) localStorage.removeItem(storageKey);
+  } catch {
+    throw new AppError("This browser blocked access to local storage.", "storage_unavailable");
+  }
+}
+
+function discoveryRunStorageKey(userId = state.identityUserId) {
+  return typeof userId === "string" && userId ? `${DISCOVERY_RUN_STORAGE_PREFIX}.${userId}` : null;
+}
+
+function saveDiscoveryRun(run, userId = state.identityUserId) {
+  const storageKey = discoveryRunStorageKey(userId);
+  if (!storageKey) return;
+  try {
+    sessionStorage.setItem(storageKey, JSON.stringify({
+      job_ids: run.jobIds,
+      started_at: run.startedAt,
+    }));
+  } catch {
+    // The live page can still monitor the run if session storage is unavailable.
+  }
+}
+
+function loadDiscoveryRun(userId = state.identityUserId) {
+  const storageKey = discoveryRunStorageKey(userId);
+  if (!storageKey) return null;
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(storageKey) || "null");
+    const jobIds = Array.isArray(parsed?.job_ids)
+      ? parsed.job_ids.filter((value) => typeof value === "string" && /^[0-9a-f-]{36}$/i.test(value)).slice(0, 2)
+      : [];
+    const startedAt = Number(parsed?.started_at);
+    if (!jobIds.length || !Number.isFinite(startedAt) || startedAt <= 0) return null;
+    return { jobIds, startedAt, jobs: [], monitoring: false };
+  } catch {
+    return null;
+  }
+}
+
+function clearDiscoveryRun(userId = state.identityUserId) {
+  const storageKey = discoveryRunStorageKey(userId);
+  if (!storageKey) return;
+  try {
+    sessionStorage.removeItem(storageKey);
+  } catch {
+    // The in-memory run is still cleared.
+  }
+}
+
 function maskSecret(value) {
   if (!value) return "";
   const prefix = value.startsWith("gsk_") ? "gsk_" : "key_";
@@ -473,14 +763,26 @@ function maskSecret(value) {
 }
 
 async function publicRequest(path) {
-  const response = await fetch(`${API_PREFIX}${path}`, {
-    method: "GET",
-    headers: { Accept: "application/json" },
-    cache: "no-store",
-  });
-  const payload = await readResponse(response);
-  if (!response.ok) throw apiErrorFrom(response, payload);
-  return payload;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(`${API_PREFIX}${path}`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    const payload = await readResponse(response);
+    if (!response.ok) throw apiErrorFrom(response, payload);
+    return payload;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new AppError("The workspace service took too long to respond. Try again.", "request_timeout");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 async function readResponse(response) {
@@ -538,6 +840,11 @@ async function apiRequest(path, options = {}) {
     const key = getGroqKey(identity.userId);
     if (!key) throw new AppError("Save a Groq API key in this browser first.", "groq_key_missing");
     headers.set("X-Groq-Api-Key", key);
+  }
+  if (options.hunter) {
+    const key = getHunterKey(identity.userId);
+    if (!key) throw new AppError("Save a Hunter API key in this browser first.", "hunter_key_missing");
+    headers.set("X-Hunter-Api-Key", key);
   }
 
   const init = {
@@ -626,7 +933,7 @@ function showAccountDeletionScreen(message = "Your workspace is locked while del
   clearPrivateState();
   stopAutomationPolling();
   byId("skip-link").setAttribute("href", "#account-deletion-main");
-  byId("boot-screen").hidden = true;
+  finishBoot();
   byId("public-site").hidden = true;
   byId("workspace").hidden = true;
   byId("account-deletion-screen").hidden = false;
@@ -643,7 +950,7 @@ function showAccountDeletionScreen(message = "Your workspace is locked while del
 function showPublicSite() {
   state.accountDeletionInProgress = false;
   byId("skip-link").setAttribute("href", "#public-main");
-  byId("boot-screen").hidden = true;
+  finishBoot();
   byId("account-deletion-screen").hidden = true;
   byId("workspace").hidden = true;
   byId("public-site").hidden = false;
@@ -658,6 +965,26 @@ async function showWorkspace(session) {
     return;
   }
   if (state.identityUserId !== session.user.id || state.session?.access_token !== session.access_token) return;
+  if (state.workspaceOpeningPromise && state.workspaceOpeningUserId === session.user.id) {
+    return state.workspaceOpeningPromise;
+  }
+  const opening = openWorkspace(session);
+  state.workspaceOpeningPromise = opening;
+  state.workspaceOpeningUserId = session.user.id;
+  try {
+    return await opening;
+  } catch (error) {
+    if (state.identityUserId === session.user.id) showBootFailure(error);
+    throw error;
+  } finally {
+    if (state.workspaceOpeningPromise === opening) {
+      state.workspaceOpeningPromise = null;
+      state.workspaceOpeningUserId = null;
+    }
+  }
+}
+
+async function openWorkspace(session) {
   if (state.accountDeletionInProgress) {
     showAccountDeletionScreen();
     return;
@@ -665,12 +992,17 @@ async function showWorkspace(session) {
   setSession(session);
   state.accountDeletionInProgress = false;
   const identity = identitySnapshot();
+  setBootCheckpoint(
+    "workspace",
+    "Opening your application desk",
+    "Loading your profile, résumé, jobs, connections, and active work.",
+    "Collecting your saved data",
+  );
   byId("skip-link").setAttribute("href", "#main-content");
-  byId("boot-screen").hidden = true;
   byId("account-deletion-screen").hidden = true;
   byId("public-site").hidden = true;
-  byId("workspace").hidden = false;
-  document.body.classList.add("workspace-open");
+  byId("workspace").hidden = true;
+  document.body.classList.remove("workspace-open");
   setAccountDeletionPath(false);
 
   const email = session.user.email || "Signed-in account";
@@ -683,10 +1015,12 @@ async function showWorkspace(session) {
   setText("account-avatar", initialFor(display));
   renderGmailRevocationWarning();
 
-  const requested = new URL(window.location.href).searchParams.get("view");
-  switchView(requested === "assets" ? "profile" : requested, false);
-  await loadWorkspace(identity);
+  switchView(viewFromUrl(), false);
+  await waitForWorkspaceLoad(identity);
   if (!isCurrentIdentity(identity) || state.accountDeletionInProgress) return;
+  byId("workspace").hidden = false;
+  document.body.classList.add("workspace-open");
+  finishBoot();
   showOAuthResult();
 }
 
@@ -951,9 +1285,11 @@ async function loadWorkspace(identity = identitySnapshot()) {
     loadResumes(true, identity),
     loadJobs(true, identity),
     loadApplications(true, identity),
+    loadFormApplications(true, identity),
     loadConnections(true, identity),
     loadAutomationJobs(true, identity),
     loadDiscoverySources(true, identity),
+    loadGoogleForms(true, identity),
   ]);
   if (loadId !== state.workspaceLoadId || !isCurrentIdentity(identity)) return;
   if (state.profile?.account_status === "deleting") {
@@ -965,6 +1301,9 @@ async function loadWorkspace(identity = identitySnapshot()) {
   updateUserIdentity();
   renderOverview();
   renderGroqState();
+  renderResumeDiscoveryPlan();
+  renderOutreach();
+  resumeDiscoveryMonitoring(identity);
 }
 
 function updateUserIdentity() {
@@ -980,18 +1319,32 @@ function updateUserIdentity() {
   updateAccountDeleteButton();
 }
 
+function viewFromUrl() {
+  const url = new URL(window.location.href);
+  const view = url.searchParams.get("view") || "overview";
+  if (view === "outreach" && url.searchParams.get("tab") === "review") return "applications";
+  return view === "assets" ? "profile" : view;
+}
+
 function switchView(view, push = true) {
   if (view === "assets") view = "profile";
   if (!Object.hasOwn(viewCopy, view)) view = "overview";
+  const massEmailView = view === "outreach" || view === "applications";
   state.currentView = view;
   all("[data-view-panel]").forEach((panel) => {
     panel.hidden = panel.dataset.viewPanel !== view;
   });
   all("[data-view]").forEach((button) => {
-    const active = button.dataset.view === view;
+    const active = button.dataset.view === (massEmailView ? "outreach" : view);
     button.classList.toggle("is-active", active);
     if (active) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
+  });
+  all("[data-mass-email-view]").forEach((button) => {
+    const active = button.dataset.massEmailView === view;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
   });
   const copy = viewCopy[view];
   setText("view-kicker", copy.kicker);
@@ -1000,7 +1353,9 @@ function switchView(view, push = true) {
   closeMobileMenu();
   if (push) {
     const url = new URL(window.location.href);
-    url.searchParams.set("view", view);
+    url.searchParams.set("view", massEmailView ? "outreach" : view);
+    if (view === "applications") url.searchParams.set("tab", "review");
+    else url.searchParams.delete("tab");
     url.searchParams.delete("oauth");
     url.searchParams.delete("connection");
     url.searchParams.delete("oauth_error");
@@ -1008,7 +1363,17 @@ function switchView(view, push = true) {
   }
   if (view === "automation") startAutomationPolling();
   else stopAutomationPolling();
-  byId("main-content")?.scrollTo({ top: 0, behavior: "smooth" });
+  if (view === "discovery") {
+    renderResumeDiscoveryPlan();
+  }
+  if (view === "form_pilot") renderGoogleFormQueue();
+  if (view === "outreach") renderOutreach();
+  if (view === "applications") renderApplications();
+  const mainContent = byId("main-content");
+  if (mainContent) {
+    mainContent.scrollTop = 0;
+    requestAnimationFrame(() => { mainContent.scrollTop = 0; });
+  }
 }
 
 function openMobileMenu() {
@@ -1112,6 +1477,7 @@ function populateProfileForm() {
     "profile-linkedin": profile.linkedin_url,
     "profile-github": profile.github_url,
     "profile-portfolio": profile.portfolio_url,
+    "profile-resume-url": profile.resume_url,
   };
   for (const [id, value] of Object.entries(values)) {
     const input = byId(id);
@@ -1147,6 +1513,7 @@ function profilePayloadFromForm() {
     linkedin_url: nullable("profile-linkedin"),
     github_url: nullable("profile-github"),
     portfolio_url: nullable("profile-portfolio"),
+    resume_url: nullable("profile-resume-url"),
     education: educationFromLines(lines, state.profile.education),
     skills: csvValues(byId("profile-skills").value),
     preferences: {
@@ -1172,6 +1539,7 @@ function renderProfileCompleteness() {
     ["Passout year", byId("profile-graduation-year").value],
     ["LinkedIn profile", byId("profile-linkedin").value],
     ["GitHub profile", byId("profile-github").value],
+    ["Public résumé link", byId("profile-resume-url").value],
   ];
   const complete = fields.filter(([, value]) => String(value || "").trim()).length;
   const percentage = Math.round((complete / fields.length) * 100);
@@ -1192,7 +1560,7 @@ async function saveProfile(event) {
       const payload = await apiRequest("/profile", { method: "PATCH", body: profilePayloadFromForm() });
       state.profile = unwrapData(payload) || {};
       populateProfileForm();
-      await loadJobs(true);
+      await Promise.all([loadJobs(true), loadGoogleForms(true)]);
       updateUserIdentity();
       renderOverview();
       toast("Your applicant profile was saved.", "success");
@@ -1268,6 +1636,11 @@ async function finishDeletedAccount(identity, form = null) {
   } catch {
     localKeyRemoved = false;
   }
+  try {
+    deleteHunterKey(identity.userId);
+  } catch {
+    localKeyRemoved = false;
+  }
   setGmailRevocationWarning(false, identity.userId);
 
   try {
@@ -1284,9 +1657,9 @@ async function finishDeletedAccount(identity, form = null) {
   setAuthMode("signin");
 
   if (localKeyRemoved) {
-    toast("Your account, workspace, and browser-stored Groq key were permanently deleted.", "success", "Account deleted", 0);
+    toast("Your account, workspace, and browser-stored Groq and Hunter keys were permanently deleted.", "success", "Account deleted", 0);
   } else {
-    toast("Your account was deleted, but this browser blocked removal of the local Groq key. Clear site data or rotate the key in Groq Console.", "error", "Account deleted with a local cleanup warning", 0);
+    toast("Your account was deleted, but this browser blocked removal of a local API key. Clear site data and rotate the key with its provider.", "error", "Account deleted with a local cleanup warning", 0);
   }
 }
 
@@ -1336,7 +1709,16 @@ async function deleteAccount(event) {
 
   const identity = identitySnapshot();
   const email = currentUser()?.email || "this account";
-  if (!window.confirm(`Permanently delete ${email} and all of its AutoApply workspace data? This cannot be undone.`)) return;
+  if (!await confirmAction({
+    eyebrow: "Final account check",
+    title: "Permanently delete this account?",
+    message: `${email} and all AutoApply workspace data will be deleted. This cannot be undone.`,
+    confirmLabel: "Delete account permanently",
+    cancelLabel: "Keep my account",
+    tone: "danger",
+    ticketLabel: "Permanent action",
+    symbol: "×",
+  })) return;
 
   await withBusy(button, "Deleting account…", async () => {
     try {
@@ -1367,6 +1749,8 @@ async function loadResumes(quiet = false, identity = identitySnapshot()) {
   renderResumes();
   renderOverview();
   renderJobIntelligence();
+  renderResumeDiscoveryPlan();
+  renderOutreach();
   return state.resumes;
 }
 
@@ -1685,7 +2069,16 @@ async function fillProfileFromResume(button) {
 }
 
 async function removeResume(resume, button) {
-  if (!window.confirm(`Delete ${resume.original_name || "this résumé"}? This also removes its private stored object.`)) return;
+  if (!await confirmAction({
+    eyebrow: "Résumé library",
+    title: "Delete this résumé?",
+    message: `${resume.original_name || "This résumé"} and its private stored PDF will be removed.`,
+    confirmLabel: "Delete résumé",
+    cancelLabel: "Keep résumé",
+    tone: "danger",
+    ticketLabel: "Private file",
+    symbol: "CV",
+  })) return;
   await withBusy(button, "Deleting…", async () => {
     try {
       await apiRequest(`/resumes/${encodeURIComponent(resume.id)}`, { method: "DELETE" });
@@ -1709,6 +2102,8 @@ function renderGroqState() {
   byId("delete-groq").disabled = !key;
   renderOverview();
   renderJobIntelligence();
+  renderResumeDiscoveryPlan();
+  renderOutreach();
 }
 
 function saveGroq(event) {
@@ -1841,44 +2236,472 @@ function renderDiscoveryJobs() {
   }
 }
 
-async function submitLinkedInDiscovery(event) {
-  event.preventDefault();
-  const button = event.submitter;
-  await withBusy(button, "Queueing…", async () => {
-    try {
-      const payload = await apiRequest("/discovery/linkedin", {
-        method: "POST",
-        body: {
-          keywords: byId("discovery-keywords").value.trim(),
-          location: byId("discovery-location").value.trim() || null,
-          remote_only: byId("discovery-remote-only").checked,
-          limit: 20,
-          idempotency_key: discoveryRunKey("linkedin"),
-        },
-      });
-      const queued = unwrapData(payload) || {};
-      showDiscoveryResult("LinkedIn public job scan queued. A running background worker is required; follow the run in Activity.", "success");
-      await loadAutomationJobs(true);
-      if (queued.id) toast("LinkedIn public job scan queued.", "success");
-    } catch (error) {
-      showDiscoveryResult(errorMessage(error, "The public search could not be queued."), "error");
+function activeParsedResume() {
+  return state.resumes.find((resume) => resume.is_active !== false && resume.parse_status === "parsed") || null;
+}
+
+function inferredRoleDirections() {
+  const preferences = state.profile?.preferences && typeof state.profile.preferences === "object"
+    ? state.profile.preferences
+    : {};
+  const candidates = [
+    preferences.target_roles,
+    state.resumeDiscoveryPlan?.roles,
+    state.fitSummary?.recommended_roles,
+    state.resumeSuggestions?.target_roles,
+  ];
+  for (const value of candidates) {
+    if (Array.isArray(value)) {
+      const roles = value.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim()).slice(0, 5);
+      if (roles.length) return roles;
+    }
+  }
+  return [];
+}
+
+function discoveryJobStatus(job) {
+  return String(job?.status || "queued").toLowerCase();
+}
+
+function discoveryJobIsTerminal(job) {
+  return DISCOVERY_TERMINAL_STATUSES.has(discoveryJobStatus(job));
+}
+
+function discoveryRunIsActive(run = state.discoveryRun) {
+  if (!run || run.finished) return false;
+  if (!Array.isArray(run.jobs) || !run.jobs.length) return Array.isArray(run.jobIds) && run.jobIds.length > 0;
+  return run.jobs.some((job) => !discoveryJobIsTerminal(job));
+}
+
+function recoverDiscoveryRunFromAutomationJobs() {
+  const groups = new Map();
+  for (const job of state.automationJobs) {
+    if (!["discover_linkedin_guest", "discover_public_feeds"].includes(job?.kind)) continue;
+    if (discoveryJobIsTerminal(job)) continue;
+    const match = String(job.idempotency_key || "").match(/^(resume-search-.+):(linkedin|feeds)$/);
+    if (!match || typeof job.id !== "string") continue;
+    const key = match[1];
+    const group = groups.get(key) || { key, jobs: [], startedAt: 0 };
+    group.jobs.push(job);
+    const createdAt = Date.parse(job.created_at || job.updated_at || "");
+    group.startedAt = Math.max(group.startedAt, Number.isFinite(createdAt) ? createdAt : 0);
+    groups.set(key, group);
+  }
+  const latest = Array.from(groups.values()).sort((a, b) => b.startedAt - a.startedAt)[0];
+  if (!latest?.jobs.length) return null;
+  return {
+    jobIds: latest.jobs.map((job) => job.id).slice(0, 2),
+    jobs: latest.jobs.slice(0, 2),
+    startedAt: latest.startedAt || Date.now(),
+    monitoring: false,
+  };
+}
+
+function discoveryCheckpoint(job) {
+  const status = discoveryJobStatus(job);
+  const source = job?.kind === "discover_linkedin_guest" ? "LinkedIn" : "Telegram + RSS";
+  const copy = {
+    queued: ["Filed", "The worker will collect this source next"],
+    running: ["Collecting", "The worker is reading this public source"],
+    succeeded: ["Saved", "Matches from this source are in your workspace"],
+    failed: ["Stopped", "Open Activity to review the safe error"],
+    cancelled: ["Cancelled", "This source was not collected"],
+    needs_attention: ["Needs review", "Open Activity to continue safely"],
+  }[status] || [humanize(status), "Open Activity for the latest worker status"];
+  return { source, status, label: copy[0], detail: copy[1] };
+}
+
+function renderDiscoveryCheckpoints(container, jobs, compact = false) {
+  if (!container) return;
+  const signature = jobs.map((job) => `${job?.id || job?.kind || "source"}:${discoveryJobStatus(job)}`).join("|");
+  if (container.dataset.statusSignature === signature) return;
+  container.dataset.statusSignature = signature;
+  clearNode(container);
+  for (const job of jobs) {
+    const checkpoint = discoveryCheckpoint(job);
+    const item = createElement("span", {
+      className: `discovery-checkpoint status-${checkpoint.status}`,
+      attrs: { title: checkpoint.detail },
+    }, [
+      createElement("span", { className: "discovery-checkpoint-mark", attrs: { "aria-hidden": "true" } }),
+      createElement("span", {}, [
+        createElement("strong", { text: checkpoint.source }),
+        createElement("small", { text: checkpoint.label }),
+      ]),
+    ]);
+    if (!compact) item.append(createElement("span", { className: "sr-only", text: `. ${checkpoint.detail}` }));
+    container.append(item);
+  }
+}
+
+function renderWorkflowDock(run, jobs, { running, failed } = {}) {
+  const dock = byId("workflow-dock");
+  if (!dock) return;
+  if (!run) {
+    dock.hidden = true;
+    setAriaBusy(dock, false);
+    delete dock.dataset.statusSignature;
+    return;
+  }
+  const runId = (run.jobIds || []).join(":") || String(run.startedAt || "current-run");
+  if (state.workflowDockDismissedRunId === runId) {
+    dock.hidden = true;
+    setAriaBusy(dock, false);
+    return;
+  }
+  dock.hidden = false;
+  const active = !run.finished && !run.timedOut;
+  byId("workflow-dock-dismiss").hidden = active;
+  setAriaBusy(dock, active);
+  dock.classList.toggle("is-complete", Boolean(run.finished && !failed));
+  dock.classList.toggle("needs-attention", Boolean(failed || run.timedOut));
+  if (run.finished) {
+    setText("workflow-dock-title", failed ? "Search closed with a source warning" : "Search complete");
+    setText("workflow-dock-detail", failed ? "Successful matches were kept. Open Activity for the source that needs review." : "Fresh jobs and forms are ready to review.");
+  } else if (run.timedOut) {
+    setText("workflow-dock-title", "Search continues in the background");
+    setText("workflow-dock-detail", "Open Activity for the latest durable worker status.");
+  } else if (running) {
+    setText("workflow-dock-title", "Collecting public job matches");
+    setText("workflow-dock-detail", "You can keep using AutoApply while each source moves through its checkpoint.");
+  } else {
+    setText("workflow-dock-title", "Search filed with the worker");
+    setText("workflow-dock-detail", "The first collector will begin when the worker claims the run.");
+  }
+  renderDiscoveryCheckpoints(byId("workflow-dock-checkpoints"), jobs, true);
+}
+
+function renderResumeDiscoveryProgress(run = state.discoveryRun) {
+  const panel = byId("resume-discovery-progress");
+  if (!panel) return;
+  if (!run) {
+    panel.hidden = true;
+    setAriaBusy(panel, false);
+    renderWorkflowDock(null, []);
+    return;
+  }
+  panel.hidden = false;
+  const jobs = Array.isArray(run.jobs) ? run.jobs : [];
+  const total = Math.max(run.jobIds?.length || 0, jobs.length);
+  const finished = jobs.filter(discoveryJobIsTerminal).length;
+  const running = jobs.filter((job) => discoveryJobStatus(job) === "running").length;
+  const failed = jobs.filter((job) => ["failed", "cancelled", "needs_attention"].includes(discoveryJobStatus(job))).length;
+  const allQueued = jobs.length > 0 && jobs.every((job) => discoveryJobStatus(job) === "queued");
+  const elapsed = Date.now() - Number(run.startedAt || Date.now());
+  setText("resume-discovery-progress-count", total ? `${Math.min(finished, total)} of ${total} complete` : "Checking status");
+  setAriaBusy(panel, !run.finished && !run.timedOut);
+  if (run.finished) {
+    setText("resume-discovery-progress-title", failed ? "Search finished with a source warning" : "Search complete");
+  } else if (running) {
+    setText("resume-discovery-progress-title", "Searching LinkedIn, Telegram, and RSS…");
+  } else {
+    setText("resume-discovery-progress-title", "Starting the public-source search…");
+  }
+  let detail = jobs.length
+    ? jobs.map((job) => `${job.kind === "discover_linkedin_guest" ? "LinkedIn" : "Telegram + RSS"}: ${humanize(discoveryJobStatus(job))}`).join(" · ")
+    : "Connecting to the background worker…";
+  if (!run.finished && allQueued && elapsed >= 15_000) {
+    detail = "Your search is safely queued. You can keep using AutoApply and open Activity for the latest worker status.";
+  } else if (run.timedOut) {
+    detail = "The search is still running in the background. Keep this page open or use Activity for diagnostics.";
+  } else if (run.finished) {
+    detail = "Fresh jobs and the Form Pilot inbox were refreshed automatically.";
+  }
+  renderDiscoveryCheckpoints(byId("resume-discovery-checkpoints"), jobs);
+  renderWorkflowDock(run, jobs, { running, failed });
+  setText("resume-discovery-progress-detail", detail);
+}
+
+function discoveryCompletionSummary(jobs) {
+  let saved = 0;
+  let sourceWarnings = 0;
+  let hardFailures = 0;
+  for (const job of jobs) {
+    const result = job?.result && typeof job.result === "object" ? job.result : {};
+    const savedCount = Number(result.saved_count);
+    if (Number.isFinite(savedCount) && savedCount > 0) saved += savedCount;
+    if (Array.isArray(result.source_errors)) sourceWarnings += result.source_errors.length;
+    if (["failed", "cancelled", "needs_attention"].includes(discoveryJobStatus(job))) hardFailures += 1;
+  }
+  return { saved, sourceWarnings, hardFailures };
+}
+
+function waitForDiscoveryPoll() {
+  return new Promise((resolve) => window.setTimeout(resolve, DISCOVERY_POLL_INTERVAL_MS));
+}
+
+async function monitorResumeDiscoveryRun(run, identity = identitySnapshot()) {
+  if (state.discoveryMonitorPromise) return state.discoveryMonitorPromise;
+  state.discoveryRun = run;
+  run.monitoring = true;
+  saveDiscoveryRun(run, identity.userId);
+  renderResumeDiscoveryProgress(run);
+  renderResumeDiscoveryPlan();
+
+  const monitor = (async () => {
+    let consecutiveErrors = 0;
+    let firstPoll = true;
+    while (firstPoll || Date.now() - run.startedAt < DISCOVERY_MONITOR_TIMEOUT_MS) {
+      firstPoll = false;
+      assertCurrentIdentity(identity);
+      try {
+        const jobs = await Promise.all(run.jobIds.map(async (jobId) => {
+          const payload = await apiRequest(`/automation-jobs/${encodeURIComponent(jobId)}`, { identity });
+          return unwrapData(payload) || {};
+        }));
+        consecutiveErrors = 0;
+        run.jobs = jobs;
+        renderResumeDiscoveryProgress(run);
+        if (jobs.length && jobs.every(discoveryJobIsTerminal)) {
+          run.finished = true;
+          run.monitoring = false;
+          clearDiscoveryRun(identity.userId);
+          await Promise.all([
+            loadJobs(true, identity),
+            loadGoogleForms(true, identity),
+            loadAutomationJobs(true, identity),
+          ]);
+          const summary = discoveryCompletionSummary(jobs);
+          if (summary.saved > 0) {
+            const warningCopy = summary.hardFailures || summary.sourceWarnings
+              ? " One source needs attention, but its successful matches were kept."
+              : "";
+            showDiscoveryResult(`${summary.saved} matching job${summary.saved === 1 ? " was" : "s were"} saved. Results and Form Pilot refreshed automatically.${warningCopy}`, warningCopy ? "warning" : "success");
+          } else if (summary.hardFailures) {
+            showDiscoveryResult("The search finished, but a public source could not complete. Review Activity for the safe error details, then try again.", "error");
+          } else {
+            showDiscoveryResult("Search complete. No new matching jobs were found in this bounded run.", "info");
+          }
+          renderResumeDiscoveryProgress(run);
+          renderResumeDiscoveryPlan();
+          return jobs;
+        }
+      } catch (error) {
+        if (isIdentityChanged(error)) throw error;
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= 3) throw error;
+      }
+      await waitForDiscoveryPoll();
+    }
+    run.timedOut = true;
+    run.monitoring = false;
+    renderResumeDiscoveryProgress(run);
+    showDiscoveryResult("The search is taking longer than usual and is still running in the background. Results will remain safe; Activity is available for diagnostics.", "warning");
+    return run.jobs;
+  })();
+
+  state.discoveryMonitorPromise = monitor;
+  try {
+    return await monitor;
+  } finally {
+    if (state.discoveryMonitorPromise === monitor) state.discoveryMonitorPromise = null;
+    run.monitoring = false;
+    if (isCurrentIdentity(identity)) {
+      renderResumeDiscoveryProgress(run);
+      renderResumeDiscoveryPlan();
+    }
+  }
+}
+
+function resumeDiscoveryMonitoring(identity = identitySnapshot()) {
+  if (state.discoveryMonitorPromise) return;
+  const stored = loadDiscoveryRun(identity.userId);
+  const recovered = stored || recoverDiscoveryRunFromAutomationJobs();
+  if (!recovered) return;
+  state.discoveryRun = recovered;
+  saveDiscoveryRun(recovered, identity.userId);
+  monitorResumeDiscoveryRun(recovered, identity).catch((error) => {
+    if (!isIdentityChanged(error)) {
+      showDiscoveryResult(errorMessage(error, "The live search status could not be refreshed."), "error");
     }
   });
 }
 
-async function queuePublicFeedDiscovery(button) {
-  await withBusy(button, "Queueing…", async () => {
+function renderResumeDiscoveryPlan(plan = state.resumeDiscoveryPlan) {
+  const container = byId("resume-discovery-role-list");
+  const status = byId("resume-discovery-status");
+  const run = byId("resume-discovery-run");
+  if (!container || !status || !run) return;
+  clearNode(container);
+  const roles = Array.isArray(plan?.roles) ? plan.roles : inferredRoleDirections();
+  if (roles.length) {
+    roles.forEach((role) => container.append(createElement("span", { className: "chip status-neutral", text: role })));
+  } else {
+    container.append(createElement("span", { className: "muted", text: "Your target roles will appear after résumé analysis." }));
+  }
+  const hasResume = Boolean(activeParsedResume());
+  const hasGroq = Boolean(getGroqKey());
+  const activeRun = discoveryRunIsActive();
+  run.disabled = !hasResume || !hasGroq || activeRun || run.dataset.busy === "true";
+  if (!hasResume || !hasGroq) {
+    status.textContent = `${!hasResume ? "Upload and parse a résumé" : "Résumé ready"}; ${!hasGroq ? "add a Groq key in Profile" : "Groq key ready"}.`;
+    status.className = "form-message is-error";
+  } else if (activeRun) {
+    status.textContent = "Search in progress. Fresh jobs and Google Forms will appear automatically when the public collectors finish.";
+    status.className = "form-message is-success";
+  } else if (plan) {
+    const sourceCopy = "LinkedIn, Telegram, and RSS";
+    status.textContent = `Ready to search ${sourceCopy} for ${roles.join(", ")}${plan.location ? ` around ${plan.location}` : ""}.`;
+    status.className = "form-message is-success";
+  } else {
+    status.textContent = "Your résumé and Groq key are ready. One search will dispatch all three public collectors.";
+    status.className = "form-message";
+  }
+  const planNode = byId("resume-discovery-plan");
+  if (planNode) planNode.hidden = false;
+  renderResumeDiscoveryProgress();
+}
+
+async function submitResumeGuidedDiscovery(event) {
+  event.preventDefault();
+  const button = event.submitter || byId("resume-discovery-run");
+  if (!activeParsedResume() || !getGroqKey()) {
+    renderResumeDiscoveryPlan();
+    toast("Complete the résumé and Groq setup in Profile first.", "error");
+    return;
+  }
+  if (discoveryRunIsActive() || state.discoveryMonitorPromise) {
+    showDiscoveryResult("Your current search is already running. Results will refresh here automatically.", "info");
+    return;
+  }
+  const identity = identitySnapshot();
+  await withBusy(button, "Finding jobs…", async () => {
     try {
-      await apiRequest("/discovery/public-feeds", {
+      const payload = await apiRequest("/discovery/resume-guided", {
         method: "POST",
-        body: { source_ids: [], limit: 60, idempotency_key: discoveryRunKey("feeds") },
+        groq: true,
+        body: {
+          location: byId("discovery-location")?.value.trim() || null,
+          remote_only: Boolean(byId("discovery-remote-only")?.checked),
+          linkedin_limit: 20,
+          feed_limit: 60,
+          idempotency_key: discoveryRunKey("resume-search"),
+        },
       });
-      showDiscoveryResult("Telegram and RSS scan queued. A running background worker is required; follow the run in Activity.", "success");
-      await loadAutomationJobs(true);
+      const data = unwrapData(payload) || {};
+      state.resumeDiscoveryPlan = data.plan && typeof data.plan === "object" ? data.plan : null;
+      const jobs = Array.isArray(data.automation_jobs) ? data.automation_jobs.filter((job) => typeof job?.id === "string") : [];
+      if (!jobs.length) throw new AppError("The search was accepted but returned no trackable work.", "discovery_jobs_missing");
+      const run = {
+        jobIds: jobs.map((job) => job.id).slice(0, 2),
+        jobs: jobs.slice(0, 2),
+        startedAt: Date.now(),
+        monitoring: false,
+      };
+      state.discoveryRun = run;
+      showDiscoveryResult("Search started. Keep this page open—matching jobs and Google Forms will refresh here automatically.", "success");
+      renderResumeDiscoveryPlan();
+      await monitorResumeDiscoveryRun(run, identity);
     } catch (error) {
-      showDiscoveryResult(errorMessage(error, "The feed check could not be queued."), "error");
+      if (isIdentityChanged(error)) return;
+      setFormMessage("resume-discovery-status", errorMessage(error, "The résumé-guided search could not be queued."), "error");
+      showDiscoveryResult(errorMessage(error, "The résumé-guided search could not be queued."), "error");
     }
   });
+  renderResumeDiscoveryPlan();
+}
+
+async function loadGoogleForms(quiet = false, identity = identitySnapshot()) {
+  const container = byId("google-form-queue");
+  if (!quiet && container) showLoading(container, 2);
+  try {
+    const payload = await apiRequest("/discovery/google-forms?limit=100&offset=0", { identity });
+    state.googleForms = unwrapItems(payload, ["forms"]);
+    state.googleFormsTotal = Number.isInteger(payload?.total) ? payload.total : state.googleForms.length;
+    renderGoogleFormQueue();
+    return state.googleForms;
+  } catch (error) {
+    state.googleForms = [];
+    state.googleFormsTotal = 0;
+    renderGoogleFormQueue();
+    if (!quiet) throw error;
+    return [];
+  }
+}
+
+function googleFormApplication(entry) {
+  const current = state.formApplications.find(
+    (application) => application.job_id === entry?.job_id && application.channel === "ats",
+  );
+  if (current) return current;
+  return entry?.application && typeof entry.application === "object" && entry.application.channel === "ats"
+    ? entry.application
+    : null;
+}
+
+async function continueGoogleFormReview(entry) {
+  const application = googleFormApplication(entry);
+  if (!application?.id) return;
+  if (!state.formApplications.some((item) => item.id === application.id)) state.formApplications.unshift(application);
+  await openFormApplicationReview(application.id);
+}
+
+async function saveAndScanGoogleForm(entry, button) {
+  await withBusy(button, "Saving form…", async () => {
+    try {
+      const payload = await apiRequest("/discovery/ats", {
+        method: "POST",
+        body: { urls: [entry.apply_url] },
+      });
+      const saved = unwrapItems(payload, ["jobs", "items"])[0];
+      if (!saved?.id) throw new AppError("The Google Form was saved but could not be opened for review.", "google_form_save_incomplete");
+      await Promise.all([loadJobs(true), loadGoogleForms(true)]);
+      await scanJobApplication(saved, "google_forms", null);
+    } catch (error) {
+      setFormMessage("google-form-queue-status", errorMessage(error, "The Google Form could not be saved."), "error");
+    }
+  });
+}
+
+function renderGoogleFormQueue() {
+  const container = byId("google-form-queue");
+  if (!container) return;
+  clearNode(container);
+  setText("google-form-count", `${state.googleFormsTotal} form${state.googleFormsTotal === 1 ? "" : "s"}`);
+  const badge = byId("form-count-badge");
+  if (badge) {
+    badge.hidden = state.googleFormsTotal <= 0;
+    badge.textContent = state.googleFormsTotal > 99 ? "99+" : String(state.googleFormsTotal);
+    badge.setAttribute("aria-label", `${state.googleFormsTotal} Google Form${state.googleFormsTotal === 1 ? "" : "s"} ready in Form Pilot`);
+  }
+  if (!state.googleForms.length) {
+    container.append(emptyState("No Google Forms waiting", "Parse a referral alert, add a single form, or run Find jobs. Detected forms will appear here automatically.", "GF"));
+    setFormMessage("google-form-queue-status", "Your Form Pilot inbox is clear.");
+    return;
+  }
+  for (const entry of state.googleForms) {
+    const application = googleFormApplication(entry);
+    const item = createElement("article", { className: "google-form-queue-item" });
+    const copy = createElement("div", { className: "google-form-queue-copy" }, [
+      createElement("strong", { text: `${entry.title || "Application form"}${entry.company ? ` — ${entry.company}` : ""}` }),
+      createElement("small", { text: `${humanize(entry.source || "discovery")} · ${application ? humanize(application.status || "captured") : entry.saved ? "Ready to scan" : "Found inside a lead"}` }),
+    ]);
+    const actions = createElement("div", { className: "google-form-queue-actions" });
+    if (application?.id) {
+      const review = createElement("button", { className: "button button-primary button-small", text: "Review prepared form", type: "button" });
+      review.addEventListener("click", () => continueGoogleFormReview(entry));
+      actions.append(review);
+    } else if (entry.saved && entry.job_id) {
+      const scan = createElement("button", { className: "button button-primary button-small", text: "Prepare form", type: "button" });
+      scan.addEventListener("click", () => {
+        const savedJob = state.jobs.find((job) => job.id === entry.job_id) || { ...entry, id: entry.job_id };
+        scanJobApplication(savedJob, "google_forms", scan);
+      });
+      actions.append(scan);
+    } else {
+      const save = createElement("button", { className: "button button-primary button-small", text: "Prepare form", type: "button" });
+      save.addEventListener("click", () => saveAndScanGoogleForm(entry, save));
+      actions.append(save);
+    }
+    if (safeHttpUrl(entry.apply_url)) {
+      const open = createElement("button", { className: "link-button", text: "Open form ↗", type: "button" });
+      open.addEventListener("click", () => openExternal(entry.apply_url));
+      actions.append(open);
+    }
+    item.append(copy, actions);
+    container.append(item);
+  }
+  setFormMessage("google-form-queue-status", `${state.googleFormsTotal} Google Form${state.googleFormsTotal === 1 ? " is" : "s are"} ready for preparation and required review.`);
 }
 
 function importedCount(payload) {
@@ -1890,21 +2713,84 @@ function importedCount(payload) {
   return items.length;
 }
 
+function setFormIntakeMode(mode, focus = true) {
+  const single = mode === "single";
+  all("[data-form-intake-mode]").forEach((button) => {
+    const active = button.dataset.formIntakeMode === (single ? "single" : "digest");
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  byId("referral-ingest-form").hidden = single;
+  byId("google-form-intake-form").hidden = !single;
+  setText("referral-ingest-heading", single ? "Paste Google Form link" : "Paste referral alert");
+  setText(
+    "form-pilot-intake-copy",
+    single
+      ? "Add one public Google Form directly, then start preparing its questions and résumé-grounded answers."
+      : "Paste the complete Telegram, WhatsApp, or email digest. AutoApply separates each numbered role and keeps the useful application route.",
+  );
+  const summary = byId("referral-route-summary");
+  summary.hidden = single || summary.dataset.ready !== "true";
+  if (focus) requestAnimationFrame(() => byId(single ? "google-form-url" : "referral-digest")?.focus());
+}
+
+function renderReferralRouteSummary(summary = {}) {
+  const parsed = Number.isInteger(summary.parsed) ? summary.parsed : 0;
+  const saved = Number.isInteger(summary.saved) ? summary.saved : parsed;
+  const googleForms = Number.isInteger(summary.google_forms) ? summary.google_forms : 0;
+  const emailApply = Number.isInteger(summary.email_apply) ? summary.email_apply : 0;
+  const ignored = Number.isInteger(summary.ignored_promotional) ? summary.ignored_promotional : 0;
+  const other = Math.max(0, parsed - googleForms - emailApply);
+  const panel = byId("referral-route-summary");
+  panel.dataset.ready = "true";
+  panel.hidden = false;
+  setText("referral-route-total", `${saved} saved`);
+  setText("referral-route-forms", googleForms);
+  setText("referral-route-emails", emailApply);
+  const notes = [];
+  if (ignored) notes.push(`${ignored} promotional link${ignored === 1 ? " was" : "s were"} ignored`);
+  if (other) notes.push(`${other} direct application link${other === 1 ? " was" : "s were"} saved with the jobs`);
+  notes.push("No form was submitted and no email was sent");
+  setText("referral-route-ignored", `${notes.join(" · ")}.`);
+}
+
 async function ingestReferralDigest(event) {
   event.preventDefault();
-  const button = event.submitter;
-  await withBusy(button, "Extracting…", async () => {
+  const form = event.currentTarget;
+  const button = event.submitter || form.querySelector('button[type="submit"]');
+  const text = byId("referral-digest").value.trim();
+  setFormMessage("referral-ingest-status");
+  if (text.length < 20) {
+    setFormMessage("referral-ingest-status", "Paste the full referral message, including at least one application link or email address.", "error");
+    byId("referral-digest").focus();
+    return;
+  }
+  await withBusy(button, "Parsing opportunities…", async () => {
     try {
       const payload = await apiRequest("/discovery/referrals", {
         method: "POST",
-        body: { text: byId("referral-digest").value.trim() },
+        body: { text },
       });
-      const count = importedCount(payload);
-      byId("referral-ingest-form").reset();
-      await loadJobs(true);
-      showDiscoveryResult(`${count} opportunit${count === 1 ? "y was" : "ies were"} extracted and saved to your workspace.`, "success");
+      const summary = payload?.summary && typeof payload.summary === "object"
+        ? payload.summary
+        : { parsed: importedCount(payload), saved: importedCount(payload) };
+      if (!summary.parsed) {
+        byId("referral-route-summary").hidden = true;
+        setFormMessage("referral-ingest-status", "No application route was found. Include each job's Google Form link or application email.", "error");
+        return;
+      }
+      form.reset();
+      await Promise.all([loadJobs(true), loadGoogleForms(true)]);
+      renderReferralRouteSummary(summary);
+      const forms = Number(summary.google_forms || 0);
+      const emails = Number(summary.email_apply || 0);
+      setFormMessage(
+        "referral-ingest-status",
+        `${summary.saved ?? summary.parsed} opportunities saved · ${forms} form${forms === 1 ? "" : "s"} ready here · ${emails} email application${emails === 1 ? "" : "s"} ready for Mass Cold Email.`,
+        "success",
+      );
     } catch (error) {
-      showDiscoveryResult(errorMessage(error, "The referral digest could not be extracted."), "error");
+      setFormMessage("referral-ingest-status", errorMessage(error, "The referral message could not be parsed."), "error");
     }
   });
 }
@@ -1930,7 +2816,7 @@ async function importJobFile(event) {
       byId("job-import-form").reset();
       state.pendingJobImportFile = null;
       setText("job-import-file-label", "Title and company are required; common header names are accepted.");
-      await loadJobs(true);
+      await Promise.all([loadJobs(true), loadGoogleForms(true)]);
       showDiscoveryResult(`${count} spreadsheet row${count === 1 ? "" : "s"} saved after normalization.`, "success");
     } catch (error) {
       showDiscoveryResult(errorMessage(error, "The spreadsheet could not be imported."), "error");
@@ -1947,12 +2833,52 @@ async function ingestAtsLinks(event) {
       const payload = await apiRequest("/discovery/ats", { method: "POST", body: { urls } });
       const count = importedCount(payload);
       byId("ats-link-form").reset();
-      await loadJobs(true);
+      await Promise.all([loadJobs(true), loadGoogleForms(true)]);
       showDiscoveryResult(`${count} supported public application link${count === 1 ? " was" : "s were"} saved.`, "success");
     } catch (error) {
       showDiscoveryResult(errorMessage(error, "Those ATS links could not be saved."), "error");
     }
   });
+}
+
+async function addGoogleFormToPilot(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = event.submitter || form.querySelector('button[type="submit"]');
+  const input = byId("google-form-url");
+  const rawUrl = input?.value.trim() || "";
+  const url = safeHttpUrl(rawUrl);
+  setFormMessage("google-form-intake-status");
+  if (!url || providerForJob({ apply_url: url }) !== "google_forms") {
+    setFormMessage("google-form-intake-status", "Paste a valid forms.gle or docs.google.com/forms link.", "error");
+    input?.focus();
+    return;
+  }
+
+  let savedJob = null;
+  await withBusy(button, "Adding form…", async () => {
+    try {
+      const payload = await apiRequest("/discovery/ats", {
+        method: "POST",
+        body: { urls: [url] },
+      });
+      savedJob = unwrapItems(payload, ["jobs", "items"])[0] || null;
+      if (!savedJob?.id) throw new AppError("The form was accepted but could not be opened for preparation.", "google_form_save_incomplete");
+      form.reset();
+      await Promise.all([loadJobs(true), loadGoogleForms(true)]);
+      setFormMessage("google-form-intake-status", "Form added. Starting preparation…", "success");
+    } catch (error) {
+      setFormMessage("google-form-intake-status", errorMessage(error, "The Google Form could not be added."), "error");
+    }
+  });
+
+  if (!savedJob) return;
+  const preparationStarted = await scanJobApplication(savedJob, "google_forms", button);
+  if (preparationStarted) {
+    setFormMessage("google-form-intake-status", "Form saved and preparation queued. Review opens next.", "success");
+  } else {
+    setFormMessage("google-form-intake-status", "The form is saved in Form Pilot. Complete the required connection, then choose Prepare form.", "error");
+  }
 }
 
 async function queueAtsBoardDiscovery(event) {
@@ -1997,6 +2923,7 @@ async function loadJobs(quiet = false, identity = identitySnapshot(), append = f
   byId("jobs-load-more").hidden = !state.jobsHasMore;
   renderJobs();
   renderDiscoveryJobs();
+  renderOutreach();
   renderOverview();
   renderJobIntelligence();
   return state.jobs;
@@ -2091,8 +3018,8 @@ function filteredJobs() {
 }
 
 function providerForJob(job) {
-  const supplied = String(job?.metadata?.provider || job?.metadata?.ats_provider || job?.metadata?.discovery?.provider || "").toLowerCase();
-  const supported = new Set(["google_forms", "greenhouse", "lever", "ashby", "yc", "wellfound", "cutshort", "instahyre"]);
+  const supplied = String(job?.metadata?.application_provider || job?.metadata?.provider || job?.metadata?.ats_provider || job?.metadata?.discovery?.provider || "").toLowerCase();
+  const supported = new Set(["company_form", "google_forms", "greenhouse", "lever", "ashby", "yc", "wellfound", "cutshort", "instahyre"]);
   if (supported.has(supplied)) return supplied;
   const url = safeHttpUrl(job?.apply_url);
   if (!url) return null;
@@ -2215,8 +3142,7 @@ async function draftJob(job, button) {
       const payload = await apiRequest(`/jobs/${encodeURIComponent(job.id)}/draft`, { method: "POST", groq: true });
       const application = unwrapData(payload);
       await Promise.all([loadJobs(true), loadApplications(true)]);
-      if (application?.id) selectApplication(application.id);
-      switchView("applications");
+      if (application?.id) await openApplicationReview(application.id);
       toast("A grounded draft is ready for your review.", "success");
     } catch (error) {
       toast(errorMessage(error, "The draft could not be generated."), "error");
@@ -2240,8 +3166,7 @@ async function createBlankApplication(job, button) {
       });
       const application = unwrapData(payload);
       await loadApplications(true);
-      if (application?.id) selectApplication(application.id);
-      switchView("applications");
+      if (application?.id) await openApplicationReview(application.id);
       toast("Blank draft created for review.", "success");
     } catch (error) {
       toast(errorMessage(error, "A blank application could not be created."), "error");
@@ -2249,22 +3174,463 @@ async function createBlankApplication(job, button) {
   });
 }
 
-async function scanJobApplication(job, provider, button) {
-  await withBusy(button, "Queueing scan…", async () => {
+function outreachJobScore(job) {
+  return job?.fit?.evaluated && Number.isFinite(job.fit.score) ? job.fit.score : -1;
+}
+
+function outreachJobs() {
+  return state.jobs
+    .filter((job) => job?.id && job.company && job.status !== "archived" && !job.archived_at)
+    .sort((left, right) => {
+      const scoreDifference = outreachJobScore(right) - outreachJobScore(left);
+      return scoreDifference || new Date(right.created_at || 0) - new Date(left.created_at || 0);
+    })
+    .slice(0, 20);
+}
+
+function selectedOutreachJobs() {
+  const byJobId = new Map(outreachJobs().map((job) => [job.id, job]));
+  return [...state.outreachSelectedJobIds].map((id) => byJobId.get(id)).filter(Boolean).slice(0, 10);
+}
+
+function applicationForOutreachJob(jobId) {
+  return state.applications
+    .filter((application) => application.job_id === jobId && application.channel === "email")
+    .sort((left, right) => new Date(right.updated_at || right.created_at || 0) - new Date(left.updated_at || left.created_at || 0))[0] || null;
+}
+
+function renderHunterState() {
+  const pill = byId("hunter-key-status");
+  const quota = byId("hunter-quota");
+  const validateButton = byId("hunter-validate");
+  const deleteButton = byId("hunter-delete");
+  if (!pill || !quota || !validateButton || !deleteButton) return;
+  const key = getHunterKey();
+  const validation = state.hunterValidation;
+  const valid = validation?.valid === true;
+  const rejected = validation && validation.valid === false;
+  pill.className = `status-pill ${valid ? "status-success" : rejected ? "status-danger" : key ? "status-info" : "status-neutral"}`;
+  pill.textContent = valid ? "Hunter ready" : rejected ? "Validation failed" : key ? "Saved in browser" : "Not connected";
+  validateButton.disabled = !key;
+  deleteButton.disabled = !key;
+  if (!key) {
+    quota.textContent = "Add a free Hunter key to search HR and recruiting contacts only when you request it.";
+  } else if (valid) {
+    const requests = validation.quota?.requests || {};
+    const bucket = requests.searches || requests.credits || {};
+    const remaining = Number.isFinite(bucket.remaining) ? bucket.remaining : null;
+    quota.textContent = `${validation.quota?.plan_name || "Hunter"} plan${remaining == null ? " is connected" : ` · ${remaining} search credit${remaining === 1 ? "" : "s"} remaining`}${validation.quota?.reset_date ? ` · resets ${validation.quota.reset_date}` : ""}.`;
+  } else {
+    quota.textContent = validation?.message || "Validate the saved key before using contact credits.";
+  }
+}
+
+function saveHunter(event) {
+  event.preventDefault();
+  const input = byId("hunter-api-key");
+  const key = input?.value.trim() || "";
+  if (key.length < 8) {
+    setFormMessage("hunter-key-message", "Enter a complete Hunter API key.", "error");
+    return;
+  }
+  try {
+    saveHunterKey(key);
+    input.value = "";
+    state.hunterValidation = null;
+    renderOutreach();
+    setFormMessage("hunter-key-message", "Hunter key saved only in this browser. Validate it before spending searches.", "success");
+  } catch (error) {
+    setFormMessage("hunter-key-message", errorMessage(error), "error");
+  }
+}
+
+async function validateHunter(button) {
+  await withBusy(button, "Checking quota…", async () => {
     try {
+      const payload = await apiRequest("/hunter/validate", { method: "POST", hunter: true });
+      state.hunterValidation = payload && typeof payload === "object" ? payload : null;
+      renderOutreach();
+      setFormMessage(
+        "hunter-key-message",
+        payload?.valid ? "Hunter is ready. Contact searches run only for selected companies." : payload?.message || "Hunter rejected this key.",
+        payload?.valid ? "success" : "error",
+      );
+    } catch (error) {
+      state.hunterValidation = null;
+      renderOutreach();
+      setFormMessage("hunter-key-message", errorMessage(error, "Hunter could not validate this key."), "error");
+    }
+  });
+}
+
+function toggleOutreachJob(jobId, checked) {
+  if (checked && !state.outreachSelectedJobIds.has(jobId) && state.outreachSelectedJobIds.size >= 10) {
+    toast("Choose at most 10 jobs for one cold-email batch.", "error");
+    renderOutreachJobs();
+    return;
+  }
+  if (checked) state.outreachSelectedJobIds.add(jobId);
+  else state.outreachSelectedJobIds.delete(jobId);
+  renderOutreach();
+}
+
+function renderOutreachPrerequisites() {
+  const container = byId("outreach-prerequisites");
+  if (!container) return;
+  clearNode(container);
+  const checks = [
+    [Boolean(activeParsedResume()), "Résumé parsed", "Profile"],
+    [Boolean(getGroqKey()), "Groq key", "Profile"],
+    [Boolean(getHunterKey()), "Hunter key", "This page"],
+    [isGmailConnected(), "Gmail connected", "Connections"],
+  ];
+  for (const [ready, label, location] of checks) {
+    container.append(createElement("span", {
+      className: `outreach-prerequisite ${ready ? "is-ready" : ""}`,
+      text: `${ready ? "✓" : "○"} ${label}${ready ? "" : ` · ${location}`}`,
+    }));
+  }
+}
+
+function renderOutreachJobs() {
+  const container = byId("outreach-job-list");
+  if (!container) return;
+  clearNode(container);
+  const candidates = outreachJobs();
+  const validIds = new Set(candidates.map((job) => job.id));
+  for (const id of [...state.outreachSelectedJobIds]) {
+    if (!validIds.has(id)) state.outreachSelectedJobIds.delete(id);
+  }
+  setText("outreach-selection-count", `${state.outreachSelectedJobIds.size} / 10 selected`);
+  if (!candidates.length) {
+    container.append(emptyState("No relevant jobs to contact yet", "Run Find jobs first, or add a job with a company and description.", "1"));
+    return;
+  }
+  for (const job of candidates) {
+    const row = createElement("label", { className: `outreach-choice-item${state.outreachSelectedJobIds.has(job.id) ? " is-selected" : ""}` });
+    const checkbox = createElement("input", { type: "checkbox", attrs: { "aria-label": `Select ${job.title || "role"} at ${job.company}` } });
+    checkbox.checked = state.outreachSelectedJobIds.has(job.id);
+    checkbox.addEventListener("change", () => toggleOutreachJob(job.id, checkbox.checked));
+    const score = outreachJobScore(job);
+    const application = applicationForOutreachJob(job.id);
+    row.append(
+      checkbox,
+      createElement("span", { className: "outreach-job-copy" }, [
+        createElement("strong", { text: job.title || "Untitled role" }),
+        createElement("small", { text: `${job.company}${job.location ? ` · ${job.location}` : ""}` }),
+      ]),
+      createElement("span", { className: "outreach-job-state", text: `${score >= 0 ? `${score}% fit` : "Not scored"}${application ? ` · ${humanize(application.status)}` : ""}` }),
+    );
+    container.append(row);
+  }
+}
+
+function selectedContactForJob(job) {
+  const result = state.outreachContacts[job.id];
+  if (result?.selected) return result.selected;
+  if (job.contact_email) return job.contact_email;
+  return null;
+}
+
+function renderOutreachContacts() {
+  const container = byId("outreach-contact-results");
+  if (!container) return;
+  clearNode(container);
+  const jobs = selectedOutreachJobs();
+  if (!jobs.length) {
+    container.append(emptyState("Select jobs first", "Choose the strongest résumé matches before spending any Hunter search credits.", "2"));
+    return;
+  }
+  for (const job of jobs) {
+    const result = state.outreachContacts[job.id] || {};
+    const contacts = Array.isArray(result.contacts) ? result.contacts : [];
+    const row = createElement("article", { className: "outreach-result-item" });
+    const copy = createElement("div", {}, [
+      createElement("strong", { text: job.company }),
+      createElement("small", { text: result.error || (contacts.length ? `${contacts.length} recruiting contact${contacts.length === 1 ? "" : "s"} found${result.domain ? ` at ${result.domain}` : ""}.` : job.contact_email ? "Using the saved job contact." : "Search not run yet.") }),
+    ]);
+    if (contacts.length) {
+      const select = createElement("select", { attrs: { "aria-label": `Recruiter contact for ${job.company}` } });
+      select.append(createElement("option", { text: "Choose a contact", attrs: { value: "" } }));
+      for (const contact of contacts) {
+        const option = createElement("option", {
+          text: `${contact.name || "Recruiting contact"} · ${contact.email}${contact.position ? ` · ${contact.position}` : ""} · ${contact.confidence ?? 0}% confidence`,
+          attrs: { value: contact.email },
+        });
+        option.selected = result.selected === contact.email;
+        select.append(option);
+      }
+      select.addEventListener("change", () => {
+        state.outreachContacts[job.id] = { ...result, selected: select.value || null };
+        renderOutreach();
+      });
+      row.append(copy, select);
+    } else {
+      row.append(copy, makeStatus(result.error ? "failed" : job.contact_email ? "ready" : "pending", result.error ? "Needs attention" : job.contact_email ? job.contact_email : "Awaiting search"));
+    }
+    container.append(row);
+  }
+}
+
+async function findOutreachContacts(button) {
+  const jobs = selectedOutreachJobs();
+  if (!jobs.length) {
+    setFormMessage("outreach-contact-status", "Select at least one relevant job first.", "error");
+    return;
+  }
+  if (!getHunterKey()) {
+    setFormMessage("outreach-contact-status", "Add your Hunter key in the setup card above, then start the search again.", "error");
+    byId("hunter-api-key")?.focus();
+    return;
+  }
+  await withBusy(button, "Checking Hunter key…", async () => {
+    if (state.hunterValidation?.valid !== true) {
+      try {
+        const validation = await apiRequest("/hunter/validate", { method: "POST", hunter: true });
+        state.hunterValidation = validation && typeof validation === "object" ? validation : null;
+        renderHunterState();
+        renderOutreachPrerequisites();
+        if (state.hunterValidation?.valid !== true) {
+          setFormMessage(
+            "outreach-contact-status",
+            state.hunterValidation?.message || "Hunter rejected this key. Replace it in the setup card above.",
+            "error",
+          );
+          return;
+        }
+      } catch (error) {
+        state.hunterValidation = null;
+        renderHunterState();
+        setFormMessage("outreach-contact-status", errorMessage(error, "Hunter could not validate this key."), "error");
+        return;
+      }
+    }
+
+    let found = 0;
+    let failed = 0;
+    for (let index = 0; index < jobs.length; index += 1) {
+      const job = jobs[index];
+      setBusyLabel(button, `Searching ${index + 1} / ${jobs.length}…`);
+      try {
+        const payload = await apiRequest(`/jobs/${encodeURIComponent(job.id)}/contacts/hunter?limit=5`, { method: "POST", hunter: true });
+        const data = unwrapData(payload) || {};
+        const contacts = Array.isArray(data.contacts) ? data.contacts : [];
+        state.outreachContacts[job.id] = {
+          contacts,
+          domain: data.domain || null,
+          selected: contacts.some((contact) => contact.email === job.contact_email)
+            ? job.contact_email
+            : null,
+          error: contacts.length ? null : "Hunter found no HR contacts for this company.",
+        };
+        found += contacts.length ? 1 : 0;
+      } catch (error) {
+        failed += 1;
+        state.outreachContacts[job.id] = {
+          contacts: [],
+          selected: job.contact_email || null,
+          error: errorMessage(error, "Hunter contact search failed."),
+        };
+        if (error?.code === "hunter_quota_exhausted") break;
+      }
+      renderOutreachContacts();
+    }
+    setFormMessage("outreach-contact-status", `${found} compan${found === 1 ? "y has" : "ies have"} a selected recruiting contact${failed ? `; ${failed} search${failed === 1 ? " needs" : "es need"} attention` : ""}.`, failed ? "error" : "success");
+    renderOutreach();
+  });
+}
+
+function renderOutreachDrafts() {
+  const container = byId("outreach-draft-list");
+  if (!container) return;
+  clearNode(container);
+  const jobs = selectedOutreachJobs();
+  const rows = jobs.map((job) => ({ job, application: applicationForOutreachJob(job.id) }));
+  if (!rows.some(({ application }) => application)) {
+    container.append(emptyState("No drafts in this batch", "Choose contacts, then let Groq create one factual draft per selected job.", "3"));
+  } else {
+    for (const { job, application } of rows) {
+      if (!application) continue;
+      const row = createElement("article", { className: "outreach-result-item" });
+      const review = createElement("button", { className: "button button-ghost button-small", text: application.status === "approved" ? "Review approved" : "Review draft", type: "button" });
+      review.addEventListener("click", () => openApplicationReview(application.id));
+      row.append(
+        createElement("div", {}, [createElement("strong", { text: `${job.title} — ${job.company}` }), createElement("small", { text: application.recipient || "Recipient missing" })]),
+        makeStatus(application.status),
+        review,
+      );
+      container.append(row);
+    }
+  }
+  const approved = rows.filter(({ application }) => application?.status === "approved").length;
+  setFormMessage("outreach-draft-status", `${approved} of ${jobs.length} selected message${jobs.length === 1 ? " is" : "s are"} approved for sending.`);
+}
+
+async function createOutreachDrafts(button) {
+  const jobs = selectedOutreachJobs();
+  const ready = jobs.filter((job) => selectedContactForJob(job));
+  if (!getGroqKey()) {
+    setFormMessage("outreach-draft-status", "Save a Groq key in Profile first.", "error");
+    return;
+  }
+  if (!ready.length || ready.length !== jobs.length) {
+    setFormMessage("outreach-draft-status", "Choose one contact for every selected job before drafting.", "error");
+    return;
+  }
+  await withBusy(button, `Drafting 0 / ${ready.length}…`, async () => {
+    let completed = 0;
+    const failures = [];
+    for (let index = 0; index < ready.length; index += 1) {
+      const job = ready[index];
+      setBusyLabel(button, `Drafting ${index + 1} / ${ready.length}…`);
+      try {
+        await apiRequest(`/jobs/${encodeURIComponent(job.id)}`, {
+          method: "PATCH",
+          body: { contact_email: selectedContactForJob(job) },
+        });
+        await apiRequest(`/jobs/${encodeURIComponent(job.id)}/draft`, { method: "POST", groq: true });
+        completed += 1;
+      } catch (error) {
+        failures.push(`${job.company}: ${errorMessage(error, "draft failed")}`);
+        if (error?.code === "groq_request_rate_limited" || error?.code === "groq_rate_limited") break;
+      }
+    }
+    await Promise.all([loadJobs(true), loadApplications(true)]);
+    renderOutreach();
+    setFormMessage(
+      "outreach-draft-status",
+      `${completed} draft${completed === 1 ? " is" : "s are"} ready for individual review${failures.length ? `. ${failures.slice(0, 2).join(" · ")}` : "."}`,
+      failures.length ? "error" : "success",
+    );
+  });
+}
+
+async function sendApprovedOutreach(button) {
+  const approved = selectedOutreachJobs()
+    .map((job) => ({ job, application: applicationForOutreachJob(job.id) }))
+    .filter(({ application }) => application?.status === "approved" && application.recipient)
+    .slice(0, 10);
+  if (!approved.length) {
+    setFormMessage("outreach-send-status", "Review and approve at least one selected draft first.", "error");
+    return;
+  }
+  if (!isGmailConnected()) {
+    setFormMessage("outreach-send-status", "Connect Gmail before sending approved messages.", "error");
+    switchView("connections");
+    return;
+  }
+  const companies = approved.map(({ job }) => job.company).join(", ");
+  if (!await confirmAction({
+    eyebrow: "Final Gmail handoff",
+    title: `Send ${approved.length} approved cold email${approved.length === 1 ? "" : "s"}?`,
+    message: `Gmail will send the individually reviewed messages with your active résumé attached.\nRecipients: ${companies}.`,
+    confirmLabel: `Send ${approved.length} email${approved.length === 1 ? "" : "s"}`,
+    cancelLabel: "Review again",
+    tone: "caution",
+    ticketLabel: "Approved batch",
+    symbol: String(approved.length),
+  })) return;
+  await withBusy(button, `Sending 0 / ${approved.length}…`, async () => {
+    let sent = 0;
+    const failures = [];
+    for (let index = 0; index < approved.length; index += 1) {
+      const { job, application } = approved[index];
+      setBusyLabel(button, `Sending ${index + 1} / ${approved.length}…`);
+      try {
+        await apiRequest(`/applications/${encodeURIComponent(application.id)}/send`, {
+          method: "POST",
+          body: {
+            idempotency_key: `outreach-send-${application.id}-${crypto.randomUUID()}`,
+            attach_resume: true,
+          },
+        });
+        sent += 1;
+      } catch (error) {
+        failures.push(`${job.company}: ${errorMessage(error, "send failed")}`);
+        if (["daily_send_cap_reached", "provider_daily_send_cap_reached", "gmail_reauthorization_required"].includes(error?.code)) break;
+      }
+    }
+    await loadApplications(true);
+    setFormMessage(
+      "outreach-send-status",
+      `${sent} approved message${sent === 1 ? " was" : "s were"} accepted by Gmail${failures.length ? `. ${failures.slice(0, 2).join(" · ")}` : "."}`,
+      failures.length ? "error" : "success",
+    );
+    renderOutreach();
+  });
+}
+
+function renderOutreach() {
+  if (!byId("outreach-job-list")) return;
+  renderOutreachPrerequisites();
+  renderHunterState();
+  renderOutreachJobs();
+  renderOutreachContacts();
+  renderOutreachDrafts();
+  const selected = selectedOutreachJobs();
+  const withContacts = selected.filter((job) => selectedContactForJob(job));
+  const approved = selected.filter((job) => applicationForOutreachJob(job.id)?.status === "approved");
+  const findButton = byId("outreach-find-contacts");
+  const draftButton = byId("outreach-create-drafts");
+  const sendButton = byId("outreach-send-approved");
+  const hunterKey = getHunterKey();
+  setText(
+    "outreach-credit-estimate",
+    selected.length
+      ? `${selected.length} selected compan${selected.length === 1 ? "y" : "ies"} · up to ${selected.length} Hunter search credit${selected.length === 1 ? "" : "s"}`
+      : "Select jobs to see the Hunter credit estimate.",
+  );
+  if (findButton) {
+    findButton.disabled = !selected.length || !hunterKey;
+    findButton.title = !selected.length
+      ? "Select at least one company first."
+      : !hunterKey
+        ? "Add your Hunter API key in the setup card above."
+        : state.hunterValidation?.valid === true
+          ? `Search ${selected.length} selected compan${selected.length === 1 ? "y" : "ies"}.`
+          : "Your saved Hunter key will be validated automatically before this search.";
+  }
+  if (selected.length && hunterKey && state.hunterValidation == null) {
+    setFormMessage("outreach-contact-status", "Ready. Hunter will validate the saved key automatically, then search every selected company.");
+  } else if (selected.length && state.hunterValidation?.valid === false) {
+    setFormMessage("outreach-contact-status", state.hunterValidation.message || "Hunter rejected this key. Replace or validate it above.", "error");
+  } else if (selected.length && !hunterKey) {
+    setFormMessage("outreach-contact-status", "Add your Hunter key in the setup card above to unlock contact search.", "error");
+  }
+  if (draftButton) draftButton.disabled = !selected.length || withContacts.length !== selected.length || !getGroqKey();
+  if (sendButton) sendButton.disabled = !approved.length || !isGmailConnected();
+}
+
+async function scanJobApplication(job, provider, button) {
+  return withBusy(button, "Preparing form…", async () => {
+    try {
+      const identity = identitySnapshot();
       const payload = await apiRequest(`/jobs/${encodeURIComponent(job.id)}/application/scan`, {
         method: "POST",
         body: { idempotency_key: discoveryRunKey("scan"), form_revision_id: null },
+        identity,
       });
       const data = unwrapData(payload) || {};
       const applicationId = data.application?.id || data.application_id || null;
-      await Promise.all([loadApplications(true), loadAutomationJobs(true)]);
+      const automationJobId = data.automation_job?.id || null;
+      if (data.application?.id && data.application.channel === "ats") {
+        state.formApplications = [
+          data.application,
+          ...state.formApplications.filter((item) => item.id !== data.application.id),
+        ];
+      }
+      await Promise.all([
+        loadFormApplications(true, identity),
+        loadAutomationJobs(true, identity),
+        loadGoogleForms(true, identity),
+      ]);
       const application = applicationId
-        ? state.applications.find((item) => item.id === applicationId)
-        : state.applications.find((item) => item.job_id === job.id && item.channel === "ats");
-      if (application) selectApplication(application.id);
-      switchView("applications");
-      toast(`${humanize(provider)} form scan queued. Activity will show when its reviewable revision is ready.`, "success");
+        ? state.formApplications.find((item) => item.id === applicationId)
+        : state.formApplications.find((item) => item.job_id === job.id && item.channel === "ats");
+      if (!application?.id) throw new AppError("The form scan started, but its review desk could not be opened.", "form_application_missing");
+      await openFormApplicationReview(application.id, { monitorJobId: automationJobId, identity });
+      toast(`${humanize(provider)} scan started. Form Pilot will show the questions and grounded suggestions automatically.`, "success");
+      return true;
     } catch (error) {
       if (error?.code === "provider_connection_required" || error?.code === "browser_context_missing") {
         toast(`Connect ${humanize(provider)} in the provider center before scanning this form.`, "error");
@@ -2272,6 +3638,7 @@ async function scanJobApplication(job, provider, button) {
       } else {
         toast(errorMessage(error, "The application scan could not be queued."), "error");
       }
+      return false;
     }
   });
 }
@@ -2279,8 +3646,8 @@ async function scanJobApplication(job, provider, button) {
 async function loadApplications(quiet = false, identity = identitySnapshot()) {
   const container = byId("application-list");
   if (!quiet) showLoading(container);
-  const payload = await apiRequest("/applications?limit=50", { identity });
-  state.applications = unwrapItems(payload, ["applications"]);
+  const payload = await apiRequest("/applications?channel=email&limit=50", { identity });
+  state.applications = unwrapItems(payload, ["applications"]).filter((application) => application.channel === "email");
   if (state.selectedApplicationId && !state.applications.some((item) => item.id === state.selectedApplicationId)) {
     state.selectedApplicationId = null;
     state.applicationEditorDirty = false;
@@ -2289,8 +3656,30 @@ async function loadApplications(quiet = false, identity = identitySnapshot()) {
     state.selectedApplicationId = state.applications[0].id;
   }
   renderApplications();
+  renderOutreach();
   renderOverview();
   return state.applications;
+}
+
+async function loadFormApplications(quiet = false, identity = identitySnapshot()) {
+  const payload = await apiRequest("/applications?channel=ats&limit=50", { identity });
+  state.formApplications = unwrapItems(payload, ["applications"]).filter((application) => application.channel === "ats");
+  if (
+    state.selectedFormApplicationId
+    && !state.formApplications.some((item) => item.id === state.selectedFormApplicationId)
+  ) {
+    state.selectedFormApplicationId = null;
+    state.selectedFormRevisionId = null;
+  }
+  renderGoogleFormQueue();
+  if (state.selectedFormApplicationId) {
+    const selected = state.formApplications.find((item) => item.id === state.selectedFormApplicationId);
+    if (selected) populateFormApplicationReview(selected);
+  } else if (!quiet) {
+    clearFormApplicationReview();
+  }
+  renderOverview();
+  return state.formApplications;
 }
 
 function jobForApplication(application) {
@@ -2299,7 +3688,9 @@ function jobForApplication(application) {
 
 function filteredApplications() {
   const status = byId("application-status-filter").value;
-  return state.applications.filter((application) => !status || application.status === status);
+  return state.applications.filter(
+    (application) => application.channel === "email" && (!status || application.status === status),
+  );
 }
 
 function renderApplications() {
@@ -2310,6 +3701,10 @@ function renderApplications() {
   const badge = byId("draft-count-badge");
   badge.hidden = draftCount === 0;
   badge.textContent = String(draftCount);
+  all("[data-draft-tab-count]").forEach((tabBadge) => {
+    tabBadge.hidden = draftCount === 0;
+    tabBadge.textContent = String(draftCount);
+  });
   if (!applications.length) {
     container.append(emptyState(state.applications.length ? "No applications match this filter" : "No applications yet", state.applications.length ? "Choose another status." : "Create a draft from a saved job to begin.", "✎"));
     if (!state.applicationEditorDirty) clearApplicationEditor(false);
@@ -2355,9 +3750,22 @@ function renderApplications() {
   }
 }
 
-function selectApplication(id) {
+async function selectApplication(id) {
+  if (state.applicationEditorDirty && state.selectedApplicationId === id) {
+    if (state.currentView === "applications") byId("application-editor").scrollIntoView({ behavior: "smooth", block: "start" });
+    return true;
+  }
   if (state.applicationEditorDirty && state.selectedApplicationId && state.selectedApplicationId !== id) {
-    if (!window.confirm("Discard the unsaved edits in the current application?")) return;
+    if (!await confirmAction({
+      eyebrow: "Unsaved draft",
+      title: "Discard your unsaved changes?",
+      message: "The edits in the current application have not been saved. Switching drafts will remove them.",
+      confirmLabel: "Discard changes",
+      cancelLabel: "Keep editing",
+      tone: "caution",
+      ticketLabel: "Draft change",
+      symbol: "↺",
+    })) return false;
   }
   state.applicationEditorDirty = false;
   state.selectedApplicationId = id;
@@ -2367,11 +3775,89 @@ function selectApplication(id) {
     populateApplicationEditor(application);
     if (state.currentView === "applications") byId("application-editor").scrollIntoView({ behavior: "smooth", block: "start" });
   }
+  return true;
+}
+
+async function openApplicationReview(id) {
+  if (!id) return false;
+  const application = state.applications.find((item) => item.id === id && item.channel === "email");
+  if (!application) return false;
+  const selected = await selectApplication(id);
+  if (!selected) return false;
+  switchView("applications");
+  requestAnimationFrame(() => byId("application-editor")?.focus?.());
+  return true;
+}
+
+function formApplicationById(id) {
+  return state.formApplications.find((item) => item.id === id && item.channel === "ats") || null;
+}
+
+function activeFormScanJob(applicationId) {
+  return state.automationJobs.find(
+    (job) => job.application_id === applicationId
+      && job.kind === "application_scan"
+      && ["queued", "running"].includes(job.status),
+  ) || null;
+}
+
+async function openFormApplicationReview(
+  id,
+  { monitorJobId = null, identity = identitySnapshot(), scroll = true } = {},
+) {
+  if (!id) return false;
+  const application = formApplicationById(id);
+  if (!application) return false;
+  state.selectedFormApplicationId = id;
+  populateFormApplicationReview(application);
+  switchView("form_pilot");
+  const trackedJobId = monitorJobId || activeFormScanJob(id)?.id || null;
+  try {
+    await loadApplicationFormRevisions(id, false, !trackedJobId, identity);
+  } catch (error) {
+    if (isIdentityChanged(error)) return false;
+    setFormMessage("form-revision-message", errorMessage(error, "The captured form revision could not be loaded."), "error");
+  }
+  if (trackedJobId) {
+    monitorFormScan(trackedJobId, id, identity).catch((error) => {
+      if (!isIdentityChanged(error)) {
+        setFormMessage("form-revision-message", errorMessage(error, "The live form scan status could not be refreshed."), "error");
+      }
+    });
+  }
+  if (scroll) requestAnimationFrame(() => byId("form-pilot-review")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  return true;
+}
+
+function populateFormApplicationReview(application) {
+  const job = jobForApplication(application);
+  byId("form-application-id").value = application.id || "";
+  setText(
+    "form-application-job-context",
+    job
+      ? `${job.title || "Role"} at ${job.company || "company"}`
+      : "Captured application form without a linked saved job",
+  );
+  const pill = byId("form-application-status-pill");
+  pill.className = `status-pill ${statusClass(application.status)}`;
+  pill.textContent = humanize(application.status || "draft_pending");
+}
+
+function clearFormApplicationReview(clearSelection = true) {
+  if (clearSelection) state.selectedFormApplicationId = null;
+  state.selectedFormRevisionId = null;
+  hideFormWorkflowProgress();
+  byId("form-application-id").value = "";
+  setText("form-application-job-context", "Choose Prepare form or Review prepared form above to begin.");
+  const pill = byId("form-application-status-pill");
+  pill.className = "status-pill status-neutral";
+  pill.textContent = "Choose a prepared form";
+  renderFormRevision(null);
+  setFormMessage("form-revision-message");
 }
 
 function populateApplicationEditor(application) {
   const job = jobForApplication(application);
-  const isFormApplication = application.channel === "ats";
   state.applicationEditorDirty = false;
   byId("application-id").value = application.id || "";
   byId("application-recipient").value = application.recipient || "";
@@ -2379,8 +3865,7 @@ function populateApplicationEditor(application) {
   byId("application-body").value = application.body || "";
   byId("application-attach-resume").checked = true;
   byId("application-fields").disabled = false;
-  byId("application-fields").hidden = isFormApplication;
-  byId("application-form-review").hidden = !isFormApplication;
+  byId("application-fields").hidden = false;
   setText("application-job-context", job ? `${job.title || "Role"} at ${job.company || "company"}` : "Application without a linked job");
   const pill = byId("application-status-pill");
   pill.className = `status-pill ${statusClass(application.status)}`;
@@ -2388,14 +3873,6 @@ function populateApplicationEditor(application) {
   updateApplicationCharacterCount();
   updateApplicationActionState(application);
   setFormMessage("application-editor-message");
-  if (isFormApplication) {
-    loadApplicationFormRevisions(application.id).catch((error) => {
-      setFormMessage("form-revision-message", errorMessage(error, "The captured form revision could not be loaded."), "error");
-    });
-  } else {
-    state.selectedFormRevisionId = null;
-    clearNode(byId("form-revision-answers"));
-  }
 }
 
 function updateApplicationActionState(application = null) {
@@ -2429,17 +3906,23 @@ function markApplicationDirty() {
   setFormMessage("application-editor-message", "Save these edits, then approve the current version before sending.");
 }
 
-function clearApplicationEditor(clearSelection = true) {
-  if (clearSelection && state.applicationEditorDirty && !window.confirm("Discard these unsaved application edits?")) return;
+async function clearApplicationEditor(clearSelection = true) {
+  if (clearSelection && state.applicationEditorDirty && !await confirmAction({
+    eyebrow: "Unsaved draft",
+    title: "Close without saving?",
+    message: "The current application edits will be discarded.",
+    confirmLabel: "Discard changes",
+    cancelLabel: "Keep editing",
+    tone: "caution",
+    ticketLabel: "Draft change",
+    symbol: "↺",
+  })) return;
   if (clearSelection) state.selectedApplicationId = null;
   state.applicationEditorDirty = false;
   byId("application-editor").reset();
   byId("application-id").value = "";
   byId("application-fields").disabled = true;
   byId("application-fields").hidden = false;
-  byId("application-form-review").hidden = true;
-  state.selectedFormRevisionId = null;
-  clearNode(byId("form-revision-answers"));
   setText("application-job-context", "Select a draft from the list to review it here.");
   const pill = byId("application-status-pill");
   pill.className = "status-pill status-neutral";
@@ -2463,14 +3946,171 @@ function latestFormRevision(applicationId) {
   return [...revisions].sort((a, b) => Number(b.revision || 0) - Number(a.revision || 0))[0] || null;
 }
 
-async function loadApplicationFormRevisions(applicationId, quiet = false) {
+function waitForFormWorkflowPoll() {
+  return new Promise((resolve) => window.setTimeout(resolve, FORM_WORKFLOW_POLL_INTERVAL_MS));
+}
+
+function formWorkflowJobIsTerminal(job) {
+  return DISCOVERY_TERMINAL_STATUSES.has(String(job?.status || "").toLowerCase());
+}
+
+function showFormWorkflowProgress({
+  title = "Preparing your form",
+  detail = "Form Pilot is waiting for the isolated worker.",
+  value = "Starting",
+  percent = 8,
+  tone = "active",
+} = {}) {
+  const panel = byId("form-workflow-progress");
+  if (!panel) return;
+  panel.hidden = false;
+  panel.classList.toggle("is-complete", tone === "complete");
+  panel.classList.toggle("is-error", tone === "error");
+  panel.classList.toggle("is-attention", tone === "attention");
+  setAriaBusy(panel, tone === "active");
+  setText("form-workflow-progress-title", title);
+  setText("form-workflow-progress-detail", detail);
+  setText("form-workflow-progress-value", value);
+  const bar = byId("form-workflow-progress-bar");
+  if (bar) bar.style.width = `${Math.max(4, Math.min(100, Number(percent) || 0))}%`;
+}
+
+function hideFormWorkflowProgress() {
+  const panel = byId("form-workflow-progress");
+  if (!panel) return;
+  panel.hidden = true;
+  panel.classList.remove("is-complete", "is-error", "is-attention");
+  setAriaBusy(panel, false);
+}
+
+function formJobDetail(job, fallback = "The isolated worker is preparing the form.") {
+  const result = job?.result && typeof job.result === "object" ? job.result : {};
+  const detail = result.message || progressSummary(job) || job?.error_message || fallback;
+  return String(detail).slice(0, 500);
+}
+
+function rememberAutomationJob(job) {
+  if (!job?.id) return;
+  const index = state.automationJobs.findIndex((item) => item.id === job.id);
+  if (index >= 0) state.automationJobs[index] = job;
+  else state.automationJobs.unshift(job);
+  if (job.kind === "application_submit") {
+    const revisionId = job.payload?.form_revision_id || job.result?.form_revision_id;
+    if (revisionId) state.formSubmissionJobs.set(revisionId, job);
+  }
+}
+
+async function monitorFormWorkflowJob(jobId, identity = identitySnapshot(), onUpdate = null) {
+  if (!jobId) throw new AppError("The form worker did not return a trackable job.", "form_job_missing");
+  if (state.formWorkflowMonitors.has(jobId)) return state.formWorkflowMonitors.get(jobId);
+  const startedAt = Date.now();
+  const monitor = (async () => {
+    let consecutiveErrors = 0;
+    let latest = null;
+    let firstPoll = true;
+    while (firstPoll || Date.now() - startedAt < FORM_WORKFLOW_MONITOR_TIMEOUT_MS) {
+      firstPoll = false;
+      assertCurrentIdentity(identity);
+      try {
+        const payload = await apiRequest(`/automation-jobs/${encodeURIComponent(jobId)}`, { identity });
+        latest = unwrapData(payload) || {};
+        consecutiveErrors = 0;
+        rememberAutomationJob(latest);
+        if (typeof onUpdate === "function") onUpdate(latest);
+        if (formWorkflowJobIsTerminal(latest)) return { job: latest, timedOut: false };
+      } catch (error) {
+        if (isIdentityChanged(error)) throw error;
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= 3) throw error;
+      }
+      await waitForFormWorkflowPoll();
+    }
+    return { job: latest, timedOut: true };
+  })();
+  state.formWorkflowMonitors.set(jobId, monitor);
+  try {
+    return await monitor;
+  } finally {
+    if (state.formWorkflowMonitors.get(jobId) === monitor) state.formWorkflowMonitors.delete(jobId);
+  }
+}
+
+async function monitorFormScan(jobId, applicationId, identity = identitySnapshot()) {
+  showFormWorkflowProgress({
+    title: "Capturing the visible form",
+    detail: "The worker is opening this Google Form and recording its current questions.",
+    value: "Queued",
+    percent: 12,
+  });
+  const outcome = await monitorFormWorkflowJob(jobId, identity, (job) => {
+    const running = job.status === "running";
+    showFormWorkflowProgress({
+      title: running ? "Capturing the visible form" : "Waiting for the form worker",
+      detail: formJobDetail(job),
+      value: humanize(job.status || "queued"),
+      percent: running ? 58 : 18,
+    });
+  });
+  assertCurrentIdentity(identity);
+  if (outcome.timedOut) {
+    showFormWorkflowProgress({
+      title: "Preparation is continuing in Activity",
+      detail: "This is taking longer than five minutes. The durable job is still safe; Form Pilot will not submit or automatically retry anything.",
+      value: "Still running",
+      percent: 72,
+      tone: "error",
+    });
+    setFormMessage("form-revision-message", "Preparation is still running. Check Activity for the latest worker status; no form was submitted.", "error");
+    return null;
+  }
+  await Promise.all([
+    loadFormApplications(true, identity),
+    loadGoogleForms(true, identity),
+    loadAutomationJobs(true, identity),
+  ]);
+  await loadApplicationFormRevisions(applicationId, true, true, identity);
+  const revision = latestFormRevision(applicationId);
+  if (revision) {
+    showFormWorkflowProgress({
+      title: "Questions captured",
+      detail: getGroqKey()
+        ? "Form Pilot is now preparing résumé-grounded suggestions for your review."
+        : "Review the captured fields below and complete any missing answers manually.",
+      value: "Ready",
+      percent: 100,
+      tone: "complete",
+    });
+    window.setTimeout(() => {
+      if (state.selectedFormApplicationId === applicationId && !state.formWorkflowMonitors.size) hideFormWorkflowProgress();
+    }, 1_800);
+    return revision;
+  }
+  const job = outcome.job || {};
+  showFormWorkflowProgress({
+    title: "The form needs attention",
+    detail: `${formJobDetail(job, "The worker could not capture a reviewable form revision.")} Nothing was submitted.`,
+    value: humanize(job.status || "stopped"),
+    percent: 100,
+    tone: "error",
+  });
+  setFormMessage("form-revision-message", `${formJobDetail(job, "The form could not be prepared.")} Nothing was submitted.`, "error");
+  return null;
+}
+
+async function loadApplicationFormRevisions(
+  applicationId,
+  quiet = false,
+  autoSuggest = true,
+  identity = identitySnapshot(),
+) {
   const answerList = byId("form-revision-answers");
   if (!quiet) showLoading(answerList, 2);
-  const payload = await apiRequest(`/applications/${encodeURIComponent(applicationId)}/form-revisions`);
+  const payload = await apiRequest(`/applications/${encodeURIComponent(applicationId)}/form-revisions`, { identity });
   state.formRevisions[applicationId] = unwrapItems(payload, ["revisions"]);
   const latest = latestFormRevision(applicationId);
   state.selectedFormRevisionId = latest?.id || null;
   renderFormRevision(latest);
+  if (latest && autoSuggest) await maybeSuggestFormAnswers(applicationId, latest);
   return state.formRevisions[applicationId];
 }
 
@@ -2479,9 +4119,10 @@ function formQuestionControl(question, value, answerKey) {
   const attrs = { "data-answer-key": answerKey };
   let control;
   const options = Array.isArray(question.options) ? question.options : Array.isArray(question.choices) ? question.choices : [];
-  if (["select", "radio", "dropdown", "multiselect"].includes(rawType) && options.length) {
-    control = createElement("select", { attrs: { ...attrs, ...(rawType === "multiselect" ? { multiple: "" } : {}) } });
-    if (rawType !== "multiselect") control.append(createElement("option", { text: "Choose an answer", attrs: { value: "" } }));
+  const multiple = ["multiselect", "checkbox"].includes(rawType) && options.length > 0;
+  if (["select", "combobox", "listbox", "radio", "dropdown", "multiselect", "checkbox"].includes(rawType) && options.length) {
+    control = createElement("select", { attrs: { ...attrs, ...(multiple ? { multiple: "" } : {}) } });
+    if (!multiple) control.append(createElement("option", { text: "Choose an answer", attrs: { value: "" } }));
     const selectedValues = new Set(Array.isArray(value) ? value.map(String) : [String(value ?? "")]);
     for (const option of options) {
       const optionValue = typeof option === "object" ? String(option.value ?? option.id ?? option.label ?? "") : String(option);
@@ -2497,8 +4138,17 @@ function formQuestionControl(question, value, answerKey) {
     control = createElement("input", { type: "checkbox", attrs });
     control.checked = value === true || value === "true";
   } else if (["file", "resume", "upload"].includes(rawType)) {
-    control = createElement("input", { attrs: { ...attrs, value: "Active résumé is supplied securely by the worker", readonly: "" } });
-    control.dataset.systemAnswer = "resume";
+    const acceptsResume = question.accepts_resume === true || ["resume", "upload"].includes(rawType);
+    control = createElement("input", {
+      attrs: {
+        ...attrs,
+        value: acceptsResume
+          ? "Active résumé is supplied securely by the worker"
+          : "This provider file field requires Live View",
+        readonly: "",
+      },
+    });
+    control.dataset.systemAnswer = acceptsResume ? "resume" : "provider-file";
   } else {
     const inputType = ["email", "tel", "url", "number", "date"].includes(rawType) ? rawType : "text";
     control = createElement("input", { type: inputType, attrs: { ...attrs, maxlength: inputType === "text" ? "1000" : undefined } });
@@ -2507,31 +4157,278 @@ function formQuestionControl(question, value, answerKey) {
   return control;
 }
 
+function formQuestionKey(question, index) {
+  return String(question?.key || question?.id || question?.name || `field_${index + 1}`);
+}
+
+function formQuestionLabel(question, index) {
+  const raw = String(question?.label || question?.title || question?.text || `Field ${index + 1}`);
+  return raw.replace(/\s*\*+\s*$/, "").trim() || raw;
+}
+
+function formSubmissionJobForRevision(revision, applicationId = state.selectedFormApplicationId) {
+  if (!revision?.id) return null;
+  const tracked = state.formSubmissionJobs.get(revision.id);
+  if (tracked?.id || tracked?.status) return tracked;
+  return state.automationJobs.find((job) => {
+    if (job.kind !== "application_submit" || job.application_id !== applicationId) return false;
+    const queuedRevisionId = job.payload?.form_revision_id || job.result?.form_revision_id || null;
+    return !queuedRevisionId || queuedRevisionId === revision.id;
+  }) || null;
+}
+
+function setFormSubmitRoute(stage = "review", tone = "active") {
+  const order = ["review", "queue", "submit", "verify"];
+  const target = Math.max(0, order.indexOf(stage));
+  all("[data-form-submit-stage]", byId("form-submit-preflight")).forEach((node, index) => {
+    node.classList.toggle("is-complete", tone === "verified" || index < target);
+    node.classList.toggle("is-current", tone !== "verified" && index === target);
+    node.classList.toggle("needs-attention", tone === "attention" && index === target);
+    if (tone !== "verified" && index === target) node.setAttribute("aria-current", "step");
+    else node.removeAttribute("aria-current");
+  });
+}
+
+function updateFormSubmitTicket({
+  heading = "Review readiness",
+  detail = "Check every required answer before submission.",
+  status = "Waiting",
+  statusTone = "status-neutral",
+  issues = [],
+  stage = "review",
+  tone = "active",
+} = {}) {
+  const panel = byId("form-submit-preflight");
+  if (!panel) return;
+  panel.hidden = false;
+  panel.classList.toggle("is-ready", tone === "ready");
+  panel.classList.toggle("is-running", tone === "active" && stage !== "review");
+  panel.classList.toggle("is-verified", tone === "verified");
+  panel.classList.toggle("needs-attention", tone === "attention");
+  setText("form-submit-preflight-heading", heading);
+  setText("form-submit-preflight-detail", detail);
+  const pill = byId("form-submit-preflight-status");
+  pill.className = `status-pill ${statusTone}`;
+  pill.textContent = status;
+  const list = byId("form-submit-missing-list");
+  clearNode(list);
+  for (const issue of issues) list.append(createElement("li", { text: issue }));
+  list.hidden = issues.length === 0;
+  setFormSubmitRoute(stage, tone);
+}
+
+function activeFormResume(revision) {
+  if (revision?.resume_id) return { id: revision.resume_id };
+  return state.resumes.find((resume) => resume.is_active !== false) || state.resumes[0] || null;
+}
+
+function formRevisionPreflight(revision, { markFields = false } = {}) {
+  const controls = new Map(
+    all("[data-answer-key]", byId("form-revision-answers")).map((control) => [control.dataset.answerKey, control]),
+  );
+  const missing = [];
+  const missingKeys = new Set();
+  const warnings = [];
+  const resume = activeFormResume(revision);
+  revisionQuestions(revision).forEach((question, index) => {
+    const key = formQuestionKey(question, index);
+    const label = formQuestionLabel(question, index);
+    const rawType = String(question.type || question.input_type || "text").toLowerCase();
+    const needsExactAnswer = question.required === true;
+    const control = controls.get(key);
+    const isResume = control?.dataset.systemAnswer === "resume"
+      || (rawType === "file" && question.accepts_resume === true)
+      || ["resume", "upload"].includes(rawType);
+    const providerFile = control?.dataset.systemAnswer === "provider-file";
+    const answered = isResume ? Boolean(resume?.id) : formControlHasAnswer(control);
+    if (providerFile && needsExactAnswer) {
+      missing.push(`${label}: attach this file in Live View`);
+      missingKeys.add(key);
+    } else if (needsExactAnswer && !answered) {
+      missing.push(isResume ? `${label}: upload and activate a résumé first` : label);
+      missingKeys.add(key);
+    }
+    if (question.disabled && needsExactAnswer) {
+      warnings.push(`${label} is provider-controlled and may require Live View.`);
+    }
+  });
+  if (markFields) {
+    all(".form-answer-row", byId("form-revision-answers")).forEach((row) => {
+      const invalid = missingKeys.has(row.dataset.answerKey);
+      row.classList.toggle("has-preflight-error", invalid);
+      const control = row.querySelector("[data-answer-key]");
+      if (control) {
+        if (invalid) control.setAttribute("aria-invalid", "true");
+        else control.removeAttribute("aria-invalid");
+      }
+    });
+  }
+  return { ready: missing.length === 0, missing, warnings };
+}
+
+function formSubmissionIsVerified(job) {
+  return Boolean(
+    job?.status === "succeeded"
+      && job.result?.code === "application_submitted"
+      && job.result?.submission_state === "confirmed",
+  );
+}
+
+function renderFormSubmissionJob(revision, job) {
+  if (!revision || !job) return false;
+  const button = byId("submit-form-revision");
+  const liveLink = byId("form-live-review-link");
+  const status = String(job.status || "queued").toLowerCase();
+  const result = job.result && typeof job.result === "object" ? job.result : {};
+  const detail = formJobDetail(job, "The background form submission is being processed.");
+  const fallbackUrl = safeBrowserbaseLiveViewUrl(result.live_view_url);
+  const missing = Array.isArray(result.missing_required)
+    ? result.missing_required.slice(0, 12).map((label) => `Missing on provider form: ${String(label)}`)
+    : [];
+  liveLink.hidden = true;
+  liveLink.removeAttribute("href");
+  button.disabled = true;
+
+  if (status === "queued") {
+    button.textContent = "Submission queued";
+    updateFormSubmitTicket({
+      heading: "Submission queued",
+      detail: "Your exact approved revision is sealed. A worker will claim this one-time submission; no duplicate retry is created.",
+      status: "Queued",
+      statusTone: "status-info",
+      stage: "queue",
+    });
+    showFormWorkflowProgress({ title: "Submission queued", detail, value: "Queued", percent: 34 });
+    return true;
+  }
+  if (status === "running") {
+    button.textContent = "Submitting…";
+    updateFormSubmitTicket({
+      heading: "Submitting in the secure browser",
+      detail: detail || "The worker is filling the sealed answers and waiting for a clear provider confirmation.",
+      status: "Running",
+      statusTone: "status-info",
+      stage: "submit",
+    });
+    showFormWorkflowProgress({ title: "Submitting in the secure browser", detail, value: "Running", percent: 72 });
+    return true;
+  }
+  if (formSubmissionIsVerified(job)) {
+    button.textContent = "Submitted · verified";
+    updateFormSubmitTicket({
+      heading: "Provider confirmation verified",
+      detail: "The provider displayed a new confirmation and AutoApply recorded this application. No further action is needed.",
+      status: "Verified success",
+      statusTone: "status-success",
+      stage: "verify",
+      tone: "verified",
+    });
+    showFormWorkflowProgress({ title: "Application submitted", detail, value: "Verified success", percent: 100, tone: "complete" });
+    setFormMessage("form-revision-message", "Submitted once and verified from the provider confirmation.", "success");
+    const applicationPill = byId("form-application-status-pill");
+    applicationPill.className = "status-pill status-success";
+    applicationPill.textContent = "Submitted · verified";
+    return true;
+  }
+
+  const uncertain = result.submission_state === "uncertain";
+  const attentionDetail = uncertain
+    ? `${detail} The provider may have received the application; do not submit it again until you verify the outcome.`
+    : detail;
+  button.textContent = uncertain ? "Outcome needs verification" : "Submission needs attention";
+  updateFormSubmitTicket({
+    heading: uncertain ? "Verify the provider outcome" : "A person needs to finish this submission",
+    detail: attentionDetail,
+    status: "Needs attention",
+    statusTone: "status-warning",
+    issues: missing,
+    stage: result.code === "required_answers_missing" ? "submit" : "verify",
+    tone: "attention",
+  });
+  showFormWorkflowProgress({ title: "Submission needs attention", detail: attentionDetail, value: "Needs attention", percent: 100, tone: "attention" });
+  setFormMessage("form-revision-message", attentionDetail, "error");
+  const applicationPill = byId("form-application-status-pill");
+  applicationPill.className = "status-pill status-warning";
+  applicationPill.textContent = "Needs attention";
+  if (fallbackUrl) {
+    liveLink.href = fallbackUrl;
+    liveLink.hidden = false;
+  }
+  return true;
+}
+
+function refreshFormSubmitPreflight({ markFields = false } = {}) {
+  const applicationId = byId("form-application-id").value;
+  const revision = latestFormRevision(applicationId);
+  if (!revision?.id) return null;
+  const submissionJob = formSubmissionJobForRevision(revision, applicationId);
+  if (submissionJob) {
+    renderFormSubmissionJob(revision, submissionJob);
+    return null;
+  }
+  const report = formRevisionPreflight(revision, { markFields });
+  const capability = capabilityForProvider(revision.provider);
+  const canSubmit = capability?.can_auto_apply === true;
+  const button = byId("submit-form-revision");
+  button.textContent = "Approve & submit in background";
+  button.disabled = !report.ready || !canSubmit;
+  button.title = canSubmit
+    ? "Seal these exact answers and queue one background submission"
+    : capability?.reason || "Background submission is not enabled for this provider.";
+  updateFormSubmitTicket({
+    heading: report.ready ? "Ready for your final action" : "Complete the required answers",
+    detail: report.ready
+      ? `All required answers are present.${report.warnings.length ? " A provider-controlled field may still require Live View." : ""} This exact revision will be sealed before one background submission is queued.`
+      : `${report.missing.length} required answer${report.missing.length === 1 ? " is" : "s are"} still missing. Complete ${report.missing.length === 1 ? "it" : "them"} before the one-time action is enabled.`,
+    status: report.ready ? (canSubmit ? "Ready" : "Unavailable") : `${report.missing.length} missing`,
+    statusTone: report.ready && canSubmit ? "status-success" : "status-warning",
+    issues: [...report.missing, ...report.warnings],
+    stage: "review",
+    tone: report.ready && canSubmit ? "ready" : "attention",
+  });
+  return { report, capability, canSubmit };
+}
+
 function renderFormRevision(revision) {
   const container = byId("form-revision-answers");
   clearNode(container);
   const status = byId("form-revision-status");
+  const liveLink = byId("form-live-review-link");
+  const preflight = byId("form-submit-preflight");
+  liveLink.hidden = true;
+  liveLink.removeAttribute("href");
   if (!revision) {
+    preflight.hidden = true;
     status.className = "status-pill status-neutral";
     status.textContent = "Awaiting scan";
-    setText("form-revision-context", "The worker has not returned a captured form yet. Follow the scan in Activity, then reopen this application.");
-    container.append(emptyState("No captured form revision", "A scan records the exact visible questions before anything is filled.", "⌕"));
-    for (const id of ["suggest-form-answers", "approve-form-revision", "prefill-form-revision", "submit-form-revision"]) byId(id).disabled = true;
+    setText("form-revision-context", "The worker has not returned the visible questions yet. This desk refreshes automatically while the scan runs.");
+    container.append(emptyState("Capturing the form", "Form Pilot will place the exact visible questions here when the worker finishes scanning.", "⌕"));
+    byId("submit-form-revision").disabled = true;
     return;
   }
   const approved = Boolean(revision.approved_at) || revision.status === "approved";
   status.className = `status-pill ${approved ? "status-success" : "status-warning"}`;
   status.textContent = approved ? `Revision ${revision.revision} approved` : `Revision ${revision.revision} needs review`;
   setText("form-revision-context", `${humanize(revision.provider || "application form")} · ${revisionQuestions(revision).length} captured field${revisionQuestions(revision).length === 1 ? "" : "s"}. Approval applies only to schema ${String(revision.schema_hash || "").slice(0, 10) || "unknown"}.`);
-  const answers = revision.answers && typeof revision.answers === "object" ? revision.answers : {};
+  const storedAnswers = revision.answers && typeof revision.answers === "object" ? revision.answers : {};
+  const cachedAnswers = state.formSuggestionCache.get(revision.id) || {};
+  // The API derives these deterministic values from the saved Profile for an
+  // unsealed revision. Keep them last so a model can never replace an exact
+  // profile fact such as the public resume URL or graduation-year option.
+  // Sealed revisions deliberately receive an empty profile_answers object.
+  const profileAnswers = revision.profile_answers && typeof revision.profile_answers === "object"
+    ? revision.profile_answers
+    : {};
+  const answers = { ...storedAnswers, ...cachedAnswers, ...profileAnswers };
   const questions = revisionQuestions(revision);
   if (!questions.length) {
     container.append(emptyState("No fillable questions found", "Open the source form to confirm whether it is still available.", "◇"));
   }
   questions.forEach((question, index) => {
-    const answerKey = String(question.key || question.id || question.name || `field_${index + 1}`);
-    const labelText = String(question.label || question.title || question.text || `Field ${index + 1}`);
-    const wrapper = createElement("div", { className: "form-answer-row" });
+    const answerKey = formQuestionKey(question, index);
+    const labelText = formQuestionLabel(question, index);
+    const wrapper = createElement("div", { className: "form-answer-row", attrs: { "data-answer-row": answerKey } });
+    wrapper.dataset.answerKey = answerKey;
     const field = createElement("div", { className: "field" });
     const label = createElement("label", { text: labelText });
     if (question.required) label.append(createElement("span", { className: "question-required", text: " *", attrs: { "aria-label": "required" } }));
@@ -2551,25 +4448,15 @@ function renderFormRevision(revision) {
     wrapper.append(field);
     container.append(wrapper);
   });
-  byId("approve-form-revision").disabled = approved;
-  byId("suggest-form-answers").disabled = approved || !getGroqKey();
-  byId("suggest-form-answers").title = approved
-    ? "Run a new scan to change this sealed revision"
-    : !getGroqKey()
-      ? "Save a Groq key in Profile first"
-      : "Suggest only answers grounded in your profile, résumé, and this job";
-  const capability = capabilityForProvider(revision.provider);
-  const canPrefill = capability?.can_prefill === true;
-  const canSubmit = capability?.can_auto_apply === true;
-  byId("prefill-form-revision").disabled = !approved || !canPrefill;
-  byId("submit-form-revision").disabled = !approved || !canSubmit;
-  byId("prefill-form-revision").title = canPrefill
-    ? "Open the approved answers in an isolated browser for final review"
-    : capability?.reason || "Hosted prefill is not enabled for this provider.";
-  byId("submit-form-revision").title = canSubmit
-    ? "Submit only this exact approved revision"
-    : capability?.reason || "Hosted submission is not enabled for this provider.";
-  setFormMessage("form-revision-message", approved ? "This exact answer/schema revision is sealed. Run a new scan to change it; prefill and submit remain separate actions." : "Review every captured answer. Approving seals this exact answer snapshot.");
+  refreshFormSubmitPreflight();
+  setFormMessage(
+    "form-revision-message",
+    approved
+      ? "This revision is already approved and sealed. Queue its one-time background submission when ready."
+      : getGroqKey()
+        ? "Profile facts and Groq suggestions are applied automatically once per captured revision. Review every answer before approving and submitting."
+        : "Saved Profile facts are applied automatically. Add a Groq key in Profile for open-ended answers, then review the completed form.",
+  );
 }
 
 function formRevisionAnswers() {
@@ -2585,97 +4472,278 @@ function formRevisionAnswers() {
   return answers;
 }
 
-async function suggestFormAnswers(button) {
-  const applicationId = byId("application-id").value;
-  const revision = latestFormRevision(applicationId);
-  if (!revision?.id) return;
-  await withBusy(button, "Suggesting…", async () => {
+function formRevisionCanAutoSuggest(revision) {
+  return Boolean(
+    revision?.id
+      && !(revision.approved_at || revision.status === "approved")
+      && revisionQuestions(revision).length
+      && !state.formSuggestionAttempts.has(revision.id),
+  );
+}
+
+function formControlHasAnswer(control) {
+  if (!control) return false;
+  if (control.type === "checkbox") return control.checked;
+  if (control.multiple) return control.selectedOptions.length > 0;
+  return String(control.value || "").trim().length > 0;
+}
+
+function applyFormSuggestions(suggestions, { preserveCompleted = false } = {}) {
+  let applied = 0;
+  for (const control of all("[data-answer-key]", byId("form-revision-answers"))) {
+    const key = control.dataset.answerKey;
+    if (!key || !Object.hasOwn(suggestions, key) || control.dataset.systemAnswer) continue;
+    if (preserveCompleted && formControlHasAnswer(control)) continue;
+    const value = suggestions[key];
+    if (control.type === "checkbox" && typeof value === "boolean") {
+      control.checked = value;
+      applied += 1;
+    } else if (control.multiple && Array.isArray(value)) {
+      const selected = new Set(value.map(String));
+      for (const option of control.options) option.selected = selected.has(option.value);
+      applied += 1;
+    } else if (control.tagName === "SELECT") {
+      const candidate = String(value);
+      if (Array.from(control.options).some((option) => option.value === candidate)) {
+        control.value = candidate;
+        applied += 1;
+      }
+    } else if (["string", "number"].includes(typeof value)) {
+      control.value = String(value);
+      applied += 1;
+    }
+  }
+  return applied;
+}
+
+async function requestFormSuggestions(revision, { button = null, automatic = false } = {}) {
+  if (!revision?.id) return false;
+  if (automatic && state.formSuggestionAttempts.has(revision.id)) return false;
+  if (automatic) state.formSuggestionAttempts.add(revision.id);
+  const run = async () => {
+    showFormWorkflowProgress({
+      title: "Preparing grounded answers",
+      detail: getGroqKey()
+        ? "AutoApply applies exact Profile facts first, then asks Groq only for remaining answers grounded in your active résumé and this role."
+        : "AutoApply is applying exact saved Profile facts. Unknown questions stay blank for your review.",
+      value: "Drafting",
+      percent: 76,
+    });
     try {
       const payload = await apiRequest(`/application-form-revisions/${encodeURIComponent(revision.id)}/suggest`, {
         method: "POST",
-        groq: true,
+        // The endpoint always returns deterministic Profile facts. It uses Groq
+        // only when this browser has supplied a key and open questions remain.
+        ...(getGroqKey() ? { groq: true } : {}),
       });
-      const suggestions = unwrapData(payload)?.answers || {};
-      let applied = 0;
-      for (const control of all("[data-answer-key]", byId("form-revision-answers"))) {
-        const key = control.dataset.answerKey;
-        if (!key || !Object.hasOwn(suggestions, key) || control.dataset.systemAnswer) continue;
-        const value = suggestions[key];
-        if (control.type === "checkbox" && typeof value === "boolean") {
-          control.checked = value;
-          applied += 1;
-        } else if (control.multiple && Array.isArray(value)) {
-          const selected = new Set(value.map(String));
-          for (const option of control.options) option.selected = selected.has(option.value);
-          applied += 1;
-        } else if (control.tagName === "SELECT") {
-          const candidate = String(value);
-          if (Array.from(control.options).some((option) => option.value === candidate)) {
-            control.value = candidate;
-            applied += 1;
-          }
-        } else if (["string", "number"].includes(typeof value)) {
-          control.value = String(value);
-          applied += 1;
-        }
-      }
+      if (state.selectedFormRevisionId !== revision.id) return false;
+      const suggestionData = unwrapData(payload) || {};
+      const suggestions = suggestionData.answers || {};
+      const source = String(suggestionData.source || "groq");
+      const applied = applyFormSuggestions(suggestions, { preserveCompleted: automatic });
+      state.formSuggestionCache.set(revision.id, formRevisionAnswers());
+      refreshFormSubmitPreflight({ markFields: true });
+      const preparedBy = source.startsWith("profile") ? "Profile facts ready" : "Grounded suggestions ready";
+      showFormWorkflowProgress({
+        title: preparedBy,
+        detail: applied
+          ? `${applied} answer${applied === 1 ? " was" : "s were"} filled. Review every field before approval.`
+          : source.startsWith("profile")
+            ? "Your saved Profile facts are already applied. Complete any genuinely unknown fields manually."
+            : "Groq did not find another answer it could safely ground. Complete any remaining fields manually.",
+        value: "Review now",
+        percent: 100,
+        tone: "complete",
+      });
       setFormMessage(
         "form-revision-message",
         applied
-          ? `${applied} grounded suggestion${applied === 1 ? " was" : "s were"} added. Review every answer before approving.`
-          : "Groq found no answers it could ground in your supplied facts. Complete the remaining fields manually.",
+          ? `${applied} grounded suggestion${applied === 1 ? " was" : "s were"} ${automatic ? "added automatically" : "refreshed"}. Review every answer before approving.`
+          : source.startsWith("profile")
+            ? "Your exact saved Profile facts are already applied. Complete any remaining unknown fields manually."
+            : "Groq found no additional answers it could ground in your supplied facts. Complete the remaining fields manually.",
         applied ? "success" : "",
       );
+      window.setTimeout(() => {
+        if (state.selectedFormRevisionId === revision.id) hideFormWorkflowProgress();
+      }, 1_800);
+      return true;
     } catch (error) {
-      setFormMessage("form-revision-message", errorMessage(error, "Form suggestions could not be generated."), "error");
-    }
-  });
-}
-
-async function approveFormRevision(button) {
-  const applicationId = byId("application-id").value;
-  const revision = latestFormRevision(applicationId);
-  if (!revision?.id) return;
-  await withBusy(button, "Approving…", async () => {
-    try {
-      await apiRequest(`/application-form-revisions/${encodeURIComponent(revision.id)}/approve`, {
-        method: "POST",
-        body: {
-          expected_revision: Number(revision.revision),
-          schema_hash: revision.schema_hash,
-          answers: formRevisionAnswers(),
-        },
+      showFormWorkflowProgress({
+        title: "Suggestions need attention",
+        detail: `${errorMessage(error, "Form suggestions could not be generated.")} You can still complete the captured fields manually.`,
+        value: "Not generated",
+        percent: 100,
+        tone: "error",
       });
-      await loadApplicationFormRevisions(applicationId, true);
-      toast("The exact captured form revision was approved.", "success");
-    } catch (error) {
-      setFormMessage("form-revision-message", errorMessage(error, "This form revision could not be approved."), "error");
+      setFormMessage("form-revision-message", errorMessage(error, "Form suggestions could not be generated."), "error");
+      return false;
+    } finally {
+      // Preparation is automatic. The review desk intentionally has no second
+      // AI-fill action that could overwrite an answer the user has just edited.
     }
-  });
+  };
+  return button ? withBusy(button, "Preparing…", run) : run();
 }
 
-async function queueFormRevisionStage(stage, button) {
-  const applicationId = byId("application-id").value;
-  const revision = latestFormRevision(applicationId);
+async function maybeSuggestFormAnswers(applicationId, revision) {
+  if (state.selectedFormApplicationId !== applicationId || !formRevisionCanAutoSuggest(revision)) return false;
+  return requestFormSuggestions(revision, { automatic: true });
+}
+
+async function approveAndSubmitFormRevision(button) {
+  const applicationId = byId("form-application-id").value;
+  let revision = latestFormRevision(applicationId);
   if (!revision?.id) return;
-  if (!(revision.approved_at || revision.status === "approved")) {
-    setFormMessage("form-revision-message", "Approve this exact revision before queueing browser work.", "error");
+  const preflight = formRevisionPreflight(revision, { markFields: true });
+  if (!preflight.ready) {
+    updateFormSubmitTicket({
+      heading: "Complete the required answers",
+      detail: "Nothing was queued. Complete the highlighted answers, then review the one-time action again.",
+      status: `${preflight.missing.length} missing`,
+      statusTone: "status-warning",
+      issues: [...preflight.missing, ...preflight.warnings],
+      stage: "review",
+      tone: "attention",
+    });
+    setFormMessage("form-revision-message", "Complete every highlighted required answer before submitting.", "error");
+    byId("form-revision-answers").querySelector('[aria-invalid="true"]')?.focus();
     return;
   }
-  if (stage === "submit" && !window.confirm("Submit this exact approved application now? The worker will stop for CAPTCHA, MFA, or an uncertain confirmation.")) return;
-  await withBusy(button, stage === "submit" ? "Queueing submit…" : "Queueing prefill…", async () => {
+  const capability = capabilityForProvider(revision.provider);
+  if (capability?.can_auto_apply !== true) {
+    const message = capability?.reason || "Background submission is not enabled for this provider.";
+    updateFormSubmitTicket({
+      heading: "Background submission is unavailable",
+      detail: message,
+      status: "Unavailable",
+      statusTone: "status-warning",
+      stage: "review",
+      tone: "attention",
+    });
+    setFormMessage("form-revision-message", message, "error");
+    return;
+  }
+  const existingJob = formSubmissionJobForRevision(revision, applicationId);
+  if (existingJob) {
+    renderFormSubmissionJob(revision, existingJob);
+    return;
+  }
+  const identity = identitySnapshot();
+  await withBusy(button, "Approving & queueing…", async () => {
     try {
-      await apiRequest(`/application-form-revisions/${encodeURIComponent(revision.id)}/${stage}`, {
-        method: "POST",
-        body: { idempotency_key: discoveryRunKey(stage), form_revision_id: revision.id },
+      if (!(revision.approved_at || revision.status === "approved")) {
+        showFormWorkflowProgress({
+          title: "Sealing your reviewed answers",
+          detail: "Form Pilot is locking this exact schema and answer set before creating one background submission.",
+          value: "Approving",
+          percent: 16,
+        });
+        updateFormSubmitTicket({
+          heading: "Sealing this exact revision",
+          detail: "Your reviewed answers are being locked to the captured form schema.",
+          status: "Approving",
+          statusTone: "status-info",
+          stage: "review",
+        });
+        await apiRequest(`/application-form-revisions/${encodeURIComponent(revision.id)}/approve`, {
+          method: "POST",
+          body: {
+            expected_revision: Number(revision.revision),
+            schema_hash: revision.schema_hash,
+            answers: formRevisionAnswers(),
+          },
+          identity,
+        });
+        state.formSuggestionCache.delete(revision.id);
+        await loadApplicationFormRevisions(applicationId, true, false, identity);
+        assertCurrentIdentity(identity);
+        revision = latestFormRevision(applicationId);
+        if (!revision?.id || !(revision.approved_at || revision.status === "approved")) {
+          throw new AppError("The reviewed answers could not be sealed. Refresh the form and try again.", "form_revision_not_approved");
+        }
+      }
+      updateFormSubmitTicket({
+        heading: "Queueing one background submission",
+        detail: "The approved revision is sealed. Form Pilot is creating one durable worker job now.",
+        status: "Queueing",
+        statusTone: "status-info",
+        stage: "queue",
       });
-      await loadAutomationJobs(true);
-      setFormMessage("form-revision-message", `${humanize(stage)} queued. Follow the isolated browser run in Activity.`, "success");
-      toast(`${humanize(stage)} queued for the approved revision.`, "success");
+      const payload = await apiRequest(`/application-form-revisions/${encodeURIComponent(revision.id)}/submit`, {
+        method: "POST",
+        body: {
+          idempotency_key: `form-submit-${revision.id}`,
+          form_revision_id: revision.id,
+        },
+        identity,
+      });
+      const queued = unwrapData(payload) || {};
+      if (!queued.id) throw new AppError("The submission was accepted but no trackable worker job was returned.", "form_submit_job_missing");
+      state.formSubmissionJobs.set(revision.id, queued);
+      rememberAutomationJob(queued);
+      renderFormSubmissionJob(revision, queued);
+      const outcome = await monitorFormWorkflowJob(queued.id, identity, (job) => {
+        state.formSubmissionJobs.set(revision.id, job);
+        renderFormSubmissionJob(revision, job);
+      });
+      assertCurrentIdentity(identity);
+      if (outcome.timedOut) {
+        const latest = outcome.job || queued;
+        state.formSubmissionJobs.set(revision.id, latest);
+        updateFormSubmitTicket({
+          heading: "Submission is still running",
+          detail: "The durable worker job is continuing in Activity. No duplicate retry has been created; check this same submission before taking another action.",
+          status: "Still running",
+          statusTone: "status-info",
+          stage: latest.status === "running" ? "submit" : "queue",
+        });
+        showFormWorkflowProgress({
+          title: "Submission is still running",
+          detail: "The same durable job remains active in Activity. Form Pilot will not create a duplicate submission.",
+          value: "Check Activity",
+          percent: latest.status === "running" ? 76 : 38,
+        });
+        setFormMessage("form-revision-message", "This submission is still running in Activity. Do not submit the form again.");
+        return;
+      }
+      const completed = outcome.job || queued;
+      state.formSubmissionJobs.set(revision.id, completed);
+      renderFormSubmissionJob(revision, completed);
+      await Promise.all([
+        loadAutomationJobs(true, identity),
+        loadFormApplications(true, identity),
+      ]);
+      if (formSubmissionIsVerified(completed)) {
+        toast("The provider confirmation was verified and this form was submitted once.", "success", "Application submitted");
+      } else {
+        toast("The provider did not return a verified success. Review the attention details before taking another action.", "error", "Submission needs attention", 9_000);
+      }
     } catch (error) {
-      setFormMessage("form-revision-message", errorMessage(error, `The ${stage} action could not be queued.`), "error");
+      if (isIdentityChanged(error)) return;
+      const message = errorMessage(error, "This form could not be approved and queued.");
+      showFormWorkflowProgress({
+        title: "Submission was not queued",
+        detail: message,
+        value: "Needs attention",
+        percent: 100,
+        tone: "attention",
+      });
+      updateFormSubmitTicket({
+        heading: "Submission was not queued",
+        detail: message,
+        status: "Needs attention",
+        statusTone: "status-warning",
+        stage: "review",
+        tone: "attention",
+      });
+      setFormMessage("form-revision-message", message, "error");
+      toast(message, "error", "Check this form", 9_000);
     }
   });
+  const current = latestFormRevision(applicationId);
+  const tracked = current?.id ? state.formSubmissionJobs.get(current.id) : null;
+  if (current && tracked) renderFormSubmissionJob(current, tracked);
 }
 
 function updateApplicationCharacterCount() {
@@ -2770,7 +4838,16 @@ async function sendApplication(button) {
   }
   const attachResume = byId("application-attach-resume").checked;
   const attachmentCopy = attachResume ? " with your active résumé attached" : " without a résumé attachment";
-  if (!window.confirm(`Send this approved message now through your connected Gmail account${attachmentCopy}? This action may not be reversible.`)) return;
+  if (!await confirmAction({
+    eyebrow: "Approved Gmail message",
+    title: "Send this email?",
+    message: `Gmail will send the exact approved message${attachmentCopy}. Sending cannot be reversed from AutoApply.`,
+    confirmLabel: "Send email",
+    cancelLabel: "Review message",
+    tone: "caution",
+    ticketLabel: "Final send",
+    symbol: "@",
+  })) return;
   await withBusy(button, "Sending…", async () => {
     try {
       const payload = await apiRequest(`/applications/${encodeURIComponent(id)}/send`, {
@@ -2803,6 +4880,7 @@ async function loadConnections(quiet = false, identity = identitySnapshot()) {
   renderConnections();
   updateApplicationActionState();
   renderOverview();
+  renderOutreach();
   return state.connections;
 }
 
@@ -3189,7 +5267,16 @@ async function deleteGoogleOauthClient(button) {
     toast("Disconnect Gmail before deleting the OAuth app that issued its token.", "error");
     return;
   }
-  if (!window.confirm("Delete your saved Google OAuth Client ID and Client Secret? You will need to enter both again before reconnecting.")) return;
+  if (!await confirmAction({
+    eyebrow: "Gmail connection",
+    title: "Remove Google OAuth credentials?",
+    message: "The saved Client ID and Client Secret will be deleted. You will need to enter both again before reconnecting Gmail.",
+    confirmLabel: "Remove credentials",
+    cancelLabel: "Keep credentials",
+    tone: "danger",
+    ticketLabel: "Stored secret",
+    symbol: "G",
+  })) return;
   await withBusy(button, "Deleting…", async () => {
     try {
       await apiRequest("/connections/google-oauth-client", { method: "DELETE" });
@@ -3257,7 +5344,17 @@ async function completeBrowserConnection(provider, button) {
 }
 
 async function disconnectProvider(provider, button) {
-  if (!window.confirm(`Disconnect ${humanize(provider)} and delete its stored authorization/context metadata?`)) return;
+  const providerName = humanize(provider);
+  if (!await confirmAction({
+    eyebrow: "Connected service",
+    title: `Disconnect ${providerName}?`,
+    message: `AutoApply will delete the stored ${providerName} authorization and browser-context metadata.`,
+    confirmLabel: "Disconnect",
+    cancelLabel: "Keep connected",
+    tone: "danger",
+    ticketLabel: "Connection",
+    symbol: "⌁",
+  })) return;
   await withBusy(button, "Disconnecting…", async () => {
     try {
       const payload = await apiRequest(`/connections/${encodeURIComponent(provider)}`, { method: "DELETE" });
@@ -3318,8 +5415,18 @@ async function loadAutomationJobs(quiet = false, identity = identitySnapshot()) 
   if (!quiet) showLoading(container);
   const payload = await apiRequest("/automation-jobs?limit=100", { identity });
   state.automationJobs = unwrapItems(payload, ["automation_jobs", "jobs"]);
+  const fetchedSubmissions = new Map();
+  for (const job of state.automationJobs) {
+    if (job.kind !== "application_submit") continue;
+    const revisionId = job.payload?.form_revision_id || job.result?.form_revision_id;
+    if (revisionId && !fetchedSubmissions.has(revisionId)) fetchedSubmissions.set(revisionId, job);
+  }
+  for (const [revisionId, job] of fetchedSubmissions) state.formSubmissionJobs.set(revisionId, job);
   renderAutomationJobs();
   renderOverview();
+  const selectedRevision = latestFormRevision(byId("form-application-id")?.value || "");
+  const selectedSubmission = selectedRevision ? formSubmissionJobForRevision(selectedRevision) : null;
+  if (selectedRevision && selectedSubmission) renderFormSubmissionJob(selectedRevision, selectedSubmission);
   return state.automationJobs;
 }
 
@@ -3690,6 +5797,22 @@ function bindAuthEvents() {
 function bindWorkspaceEvents() {
   all("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
   all("[data-view-target]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.viewTarget)));
+  all("[data-mass-email-view]").forEach((button) => {
+    button.addEventListener("click", () => switchView(button.dataset.massEmailView));
+    button.addEventListener("keydown", (event) => {
+      const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
+      if (!keys.includes(event.key)) return;
+      event.preventDefault();
+      const targetView = event.key === "ArrowLeft" || event.key === "Home" ? "outreach" : "applications";
+      switchView(targetView);
+      requestAnimationFrame(() => {
+        const target = all(`[data-mass-email-view="${targetView}"]`).find(
+          (candidate) => !candidate.closest("[data-view-panel]")?.hidden,
+        );
+        target?.focus();
+      });
+    });
+  });
   byId("menu-toggle").addEventListener("click", () => byId("workspace-sidebar").classList.contains("is-open") ? closeMobileMenu() : openMobileMenu());
   byId("mobile-backdrop").addEventListener("click", closeMobileMenu);
   byId("sidebar-signout").addEventListener("click", signOut);
@@ -3728,8 +5851,17 @@ function bindWorkspaceEvents() {
 
   byId("groq-form").addEventListener("submit", saveGroq);
   byId("validate-groq").addEventListener("click", (event) => validateGroq(event.currentTarget));
-  byId("delete-groq").addEventListener("click", () => {
-    if (!window.confirm("Delete the Groq key from this browser?")) return;
+  byId("delete-groq").addEventListener("click", async () => {
+    if (!await confirmAction({
+      eyebrow: "Browser-held AI key",
+      title: "Remove the Groq key?",
+      message: "Résumé analysis and draft generation will remain unavailable until a key is saved again in this browser.",
+      confirmLabel: "Remove key",
+      cancelLabel: "Keep key",
+      tone: "danger",
+      ticketLabel: "Local secret",
+      symbol: "AI",
+    })) return;
     try {
       deleteGroqKey();
       renderGroqState();
@@ -3770,9 +5902,7 @@ function bindWorkspaceEvents() {
   });
   byId("jobs-open-profile").addEventListener("click", () => switchView("profile"));
 
-  byId("linkedin-discovery-form").addEventListener("submit", submitLinkedInDiscovery);
-  byId("public-feeds-run").addEventListener("click", (event) => queuePublicFeedDiscovery(event.currentTarget));
-  byId("referral-ingest-form").addEventListener("submit", ingestReferralDigest);
+  byId("resume-discovery-form").addEventListener("submit", submitResumeGuidedDiscovery);
   byId("job-import-form").addEventListener("submit", importJobFile);
   byId("job-import-file").addEventListener("change", (event) => {
     state.pendingJobImportFile = event.target.files?.[0] || null;
@@ -3780,7 +5910,51 @@ function bindWorkspaceEvents() {
   });
   byId("ats-link-form").addEventListener("submit", ingestAtsLinks);
   byId("ats-board-form").addEventListener("submit", queueAtsBoardDiscovery);
-  byId("discovery-refresh").addEventListener("click", (event) => withBusy(event.currentTarget, "Refreshing…", () => loadJobs()));
+  all("[data-form-intake-mode]").forEach((button) => {
+    button.addEventListener("click", () => setFormIntakeMode(button.dataset.formIntakeMode));
+  });
+  byId("referral-ingest-form").addEventListener("submit", ingestReferralDigest);
+  byId("google-form-intake-form").addEventListener("submit", addGoogleFormToPilot);
+  byId("discovery-refresh").addEventListener("click", (event) => withBusy(event.currentTarget, "Refreshing…", async () => {
+    await Promise.all([loadJobs(), loadGoogleForms(true)]);
+  }));
+  byId("google-form-queue-refresh").addEventListener("click", (event) => withBusy(event.currentTarget, "Refreshing…", () => loadGoogleForms()));
+  byId("form-pilot-review-jump").addEventListener("click", async () => {
+    const application = formApplicationById(state.selectedFormApplicationId) || state.formApplications[0] || null;
+    if (!application?.id) {
+      toast("Prepare a Google Form first; its captured questions will then appear in the review desk.", "info");
+      byId("google-form-queue")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    await openFormApplicationReview(application.id);
+  });
+
+  byId("hunter-setup-form").addEventListener("submit", saveHunter);
+  byId("hunter-validate").addEventListener("click", (event) => validateHunter(event.currentTarget));
+  byId("hunter-delete").addEventListener("click", async () => {
+    if (!await confirmAction({
+      eyebrow: "Browser-held contact key",
+      title: "Remove the Hunter key?",
+      message: "The key and current contact-search results will be removed from this browser. Saved jobs and drafts will stay intact.",
+      confirmLabel: "Remove key",
+      cancelLabel: "Keep key",
+      tone: "danger",
+      ticketLabel: "Local secret",
+      symbol: "H",
+    })) return;
+    try {
+      deleteHunterKey();
+      state.hunterValidation = null;
+      state.outreachContacts = {};
+      renderOutreach();
+      setFormMessage("hunter-key-message", "The Hunter key and current contact results were removed from this browser.", "success");
+    } catch (error) {
+      setFormMessage("hunter-key-message", errorMessage(error), "error");
+    }
+  });
+  byId("outreach-find-contacts").addEventListener("click", (event) => findOutreachContacts(event.currentTarget));
+  byId("outreach-create-drafts").addEventListener("click", (event) => createOutreachDrafts(event.currentTarget));
+  byId("outreach-send-approved").addEventListener("click", (event) => sendApprovedOutreach(event.currentTarget));
 
   byId("application-status-filter").addEventListener("change", renderApplications);
   byId("applications-refresh").addEventListener("click", (event) => withBusy(event.currentTarget, "…", () => loadApplications()));
@@ -3794,10 +5968,14 @@ function bindWorkspaceEvents() {
   byId("approve-application").addEventListener("click", (event) => approveApplication(event.currentTarget));
   byId("send-application").addEventListener("click", (event) => sendApplication(event.currentTarget));
   byId("clear-application").addEventListener("click", () => clearApplicationEditor(true));
-  byId("suggest-form-answers").addEventListener("click", (event) => suggestFormAnswers(event.currentTarget));
-  byId("approve-form-revision").addEventListener("click", (event) => approveFormRevision(event.currentTarget));
-  byId("prefill-form-revision").addEventListener("click", (event) => queueFormRevisionStage("prefill", event.currentTarget));
-  byId("submit-form-revision").addEventListener("click", (event) => queueFormRevisionStage("submit", event.currentTarget));
+  byId("submit-form-revision").addEventListener("click", (event) => approveAndSubmitFormRevision(event.currentTarget));
+  for (const eventName of ["input", "change"]) {
+    byId("form-revision-answers").addEventListener(eventName, () => {
+      const current = latestFormRevision(byId("form-application-id").value);
+      if (!current?.id || current.approved_at || current.status === "approved" || formSubmissionJobForRevision(current)) return;
+      refreshFormSubmitPreflight({ markFields: true });
+    });
+  }
 
   byId("connections-refresh").addEventListener("click", (event) => withBusy(event.currentTarget, "Refreshing…", () => loadConnections()));
   byId("gmail-oauth-mode-platform").addEventListener("change", (event) => {
@@ -3835,18 +6013,32 @@ async function signOut() {
 }
 
 function bindStaticEvents() {
+  bindActionDialog();
   bindWorkspaceEvents();
+  byId("boot-retry").addEventListener("click", () => window.location.reload());
+  byId("workflow-dock-dismiss").addEventListener("click", () => {
+    const run = state.discoveryRun;
+    state.workflowDockDismissedRunId = (run?.jobIds || []).join(":") || String(run?.startedAt || "current-run");
+    byId("workflow-dock").hidden = true;
+    setAriaBusy(byId("workflow-dock"), false);
+    announce("Workflow status dismissed. Its full history remains in Activity.");
+  });
   window.addEventListener("popstate", () => {
     if (!state.session) return;
-    const view = new URL(window.location.href).searchParams.get("view") || "overview";
-    switchView(view, false);
+    switchView(viewFromUrl(), false);
   });
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeMobileMenu();
+    if (event.key === "Escape" && !byId("action-dialog")?.open) closeMobileMenu();
   });
 }
 
 async function initialise() {
+  setBootCheckpoint(
+    "service",
+    "Preparing your workspace",
+    "Checking that the workspace service is ready.",
+    "Checking connection",
+  );
   bindStaticEvents();
   await Promise.all([checkHealth(), loadPublicProviders()]);
   try {
@@ -3863,6 +6055,12 @@ async function initialise() {
       },
       global: { headers: { "X-Client-Info": "autoapply-cloud-web/2.0" } },
     });
+    setBootCheckpoint(
+      "session",
+      "Restoring your sign-in",
+      "Checking this browser for an existing AutoApply session.",
+      "Reading the identity file",
+    );
     bindAuthEvents();
     // Bot protection gates only signed-out auth forms. Start it in parallel so a
     // provider outage cannot prevent restoration of an already valid session.
@@ -3899,6 +6097,11 @@ async function initialise() {
     }
     await captchaPromise;
   } catch (error) {
+    if (state.session && state.supabase) {
+      showBootFailure(error);
+      toast(errorMessage(error, "The workspace could not be loaded."), "error", "Workspace paused", 0);
+      return;
+    }
     showPublicSite();
     byId("auth-unavailable").hidden = false;
     all("#auth-card input, #auth-card button").forEach((control) => { control.disabled = true; });
