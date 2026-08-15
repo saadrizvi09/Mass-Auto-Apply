@@ -85,6 +85,36 @@ _SAFE_DATABASE_ERRORS: dict[str, tuple[int, str, str]] = {
         "browser_connection_invalid",
         "The managed-browser connection request is invalid.",
     ),
+    "provider_credential_invalid": (
+        422,
+        "provider_credential_invalid",
+        "The provider credential is invalid.",
+    ),
+    "browserbase_jobs_active": (
+        409,
+        "browserbase_jobs_active",
+        "Wait for active managed-browser jobs to finish before changing Browserbase credentials.",
+    ),
+    "browserbase_disconnect_required": (
+        409,
+        "browserbase_disconnect_required",
+        "Disconnect saved browser logins before changing Browserbase credentials.",
+    ),
+    "browserbase_connection_operation_in_progress": (
+        409,
+        "browserbase_connection_operation_in_progress",
+        "Wait for the managed-browser connection operation to finish before changing Browserbase credentials.",
+    ),
+    "browserbase_credential_binding_stale": (
+        409,
+        "browserbase_credential_binding_stale",
+        "The saved browser context belongs to a different Browserbase credential. Abandon it locally if remote cleanup is no longer possible.",
+    ),
+    "browserbase_abandon_confirmation_invalid": (
+        422,
+        "browserbase_abandon_confirmation_invalid",
+        "Confirm that unreachable remote Browserbase data should be abandoned.",
+    ),
     "resume_parse_rate_limited": (
         429,
         "resume_parse_rate_limited",
@@ -144,6 +174,11 @@ _SAFE_DATABASE_ERRORS: dict[str, tuple[int, str, str]] = {
         409,
         "account_operation_in_progress",
         "A Gmail send is still being resolved. Wait or reconcile it before deleting the account.",
+    ),
+    "account_automation_jobs_running": (
+        409,
+        "account_automation_jobs_running",
+        "Account deletion requested cancellation of active work. Retry after the running worker stops.",
     ),
     "send_reservation_not_found": (
         404,

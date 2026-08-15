@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -22,6 +24,12 @@ from app.saas_main import create_app
 
 USER_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_USER_ID = UUID("22222222-2222-4222-8222-222222222222")
+
+
+def _browserbase_fingerprint(project_id: str) -> str:
+    return hashlib.sha256(
+        b"autoapply.browserbase.project.v1\x00" + project_id.encode("utf-8")
+    ).hexdigest()
 
 
 class FakeAuth:
@@ -144,7 +152,10 @@ class FakeStoreClient:
     async def rpc(self, function: str, params: dict[str, Any] | None = None) -> Any:
         clean_params = deepcopy(params or {})
         self.rpc_calls.append((function, clean_params))
-        result = self.rpc_results.get(function, [])
+        if function == "get_browserbase_credential_state" and function not in self.rpc_results:
+            result: Any = {"epoch": 0}
+        else:
+            result = self.rpc_results.get(function, [])
         if callable(result):
             result = result(clean_params)
         return deepcopy(result)
@@ -238,14 +249,16 @@ def browser_settings(encryption_key: str) -> Settings:
 class FakeBrowserbase:
     def __init__(self) -> None:
         self.events: list[tuple[str, str]] = []
+        self.session_options: list[dict[str, Any]] = []
         self.fail_context_deletes = 0
 
     def create_context(self) -> dict[str, str]:
         self.events.append(("create_context", "context-new"))
         return {"id": "context-new"}
 
-    def create_session(self, context_id: str, **_kwargs: Any) -> dict[str, str]:
+    def create_session(self, context_id: str, **kwargs: Any) -> dict[str, str]:
         self.events.append(("create_session", context_id))
+        self.session_options.append(dict(kwargs))
         return {
             "id": "session-new",
             "context_id": context_id,
@@ -1756,6 +1769,78 @@ def test_recently_authenticated_account_can_be_deleted() -> None:
     assert store.server.deleted_auth_users == [(USER_ID, False)]
 
 
+def test_account_deletion_waits_for_running_automation_before_auth_deletion() -> None:
+    store = FakeStore(rpc_results={"begin_account_deletion": False})
+
+    response = TestClient(
+        create_app(settings=configured_settings(), auth=FakeAuth(), store=store)
+    ).request("DELETE", "/api/v1/account", json={"confirmation": "DELETE"})
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "account_automation_jobs_running"
+    assert store.rpc_calls == [
+        ("begin_account_deletion", {"confirmation_input": "DELETE"})
+    ]
+    assert store.server.deleted_auth_users == []
+
+
+def test_confirmed_account_deletion_records_unconfirmed_browserbase_cleanup() -> None:
+    connection_id = str(uuid4())
+    key = Fernet.generate_key().decode()
+    cipher = TokenCipher(key)
+    store = FakeStore(
+        {
+            "profiles": [{"user_id": str(USER_ID), "account_status": "active"}],
+            "connections": [
+                {
+                    "id": connection_id,
+                    "user_id": str(USER_ID),
+                    "provider": "greenhouse",
+                    "mode": "managed_browser",
+                    "status": "active",
+                }
+            ],
+            "connection_secrets": [
+                {
+                    "connection_id": connection_id,
+                    "user_id": str(USER_ID),
+                    "browser_context_id_ciphertext": cipher.encrypt("context-old"),
+                    "browser_session_id_ciphertext": None,
+                    "browser_lifecycle_generation": 2,
+                    "browser_credential_source": "platform",
+                    "browser_credential_generation": None,
+                    "browser_credential_epoch": 0,
+                    "browser_project_fingerprint": _browserbase_fingerprint(
+                        "browser-project"
+                    ),
+                }
+            ],
+        },
+        rpc_results={
+            "begin_account_deletion": True,
+            # An unavailable lifecycle/remote cleanup path must be explicitly
+            # recorded as abandonment during a fully confirmed account delete.
+            "begin_browser_disconnect": None,
+            "abandon_browserbase_resources": True,
+        },
+    )
+
+    response = TestClient(
+        create_app(settings=browser_settings(key), auth=FakeAuth(), store=store)
+    ).request("DELETE", "/api/v1/account", json={"confirmation": "DELETE"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "ok": True,
+        "remote_browser_cleanup_confirmed": False,
+        "browserbase_dashboard_url": "https://www.browserbase.com/overview",
+    }
+    assert any(
+        name == "abandon_browserbase_resources" for name, _params in store.rpc_calls
+    )
+    assert store.server.deleted_auth_users == [(USER_ID, False)]
+
+
 def test_client_cannot_inject_tenant_id() -> None:
     app = create_app(settings=configured_settings(), auth=FakeAuth(), store=FakeStore())
     response = TestClient(app).post(
@@ -1849,8 +1934,16 @@ def test_browser_start_persists_context_and_session_for_one_generation(
                 "context_ciphertext": None,
                 "session_ciphertext": None,
                 "reuse_context": False,
+                "credential_epoch": 0,
+                "active_credential_source": "platform",
+                "active_credential_generation": None,
+                "active_project_fingerprint": None,
+                "context_credential_source": None,
+                "context_credential_generation": None,
+                "context_credential_epoch": None,
+                "context_project_fingerprint": None,
             },
-            "save_browser_connection_context": [
+            "save_browser_connection_context_bound": [
                 {
                     "id": connection_id,
                     "user_id": str(USER_ID),
@@ -1871,20 +1964,35 @@ def test_browser_start_persists_context_and_session_for_one_generation(
     ).post("/api/v1/connections/greenhouse/browser/start")
     assert response.status_code == 200, response.text
     assert response.json()["data"]["live_view_url"].startswith("https://")
+    assert browser.session_options == [
+        {
+            "keep_alive": False,
+            "timeout_seconds": 180,
+            "user_metadata": {"provider": "greenhouse"},
+        }
+    ]
     call_names = [name for name, _params in store.rpc_calls]
     assert "reserve_browser_start" not in call_names
     assert call_names.index("begin_browser_start") < call_names.index(
-        "save_browser_connection_context"
+        "save_browser_connection_context_bound"
     ) < call_names.index("save_browser_connection_session") < call_names.index(
         "confirm_browser_start"
     )
     save_context = next(
-        params for name, params in store.rpc_calls if name == "save_browser_connection_context"
+        params
+        for name, params in store.rpc_calls
+        if name == "save_browser_connection_context_bound"
     )
     save_session = next(
         params for name, params in store.rpc_calls if name == "save_browser_connection_session"
     )
     assert save_context["expected_generation_input"] == 4
+    assert save_context["credential_source_input"] == "platform"
+    assert save_context["credential_generation_input"] is None
+    assert save_context["credential_epoch_input"] == 0
+    assert save_context["project_fingerprint_input"] == _browserbase_fingerprint(
+        "browser-project"
+    )
     assert save_session["expected_generation_input"] == 4
     assert save_session["expected_connection_id_input"] == connection_id
     assert save_session["expected_context_ciphertext_input"] == save_context[
@@ -1892,6 +2000,65 @@ def test_browser_start_persists_context_and_session_for_one_generation(
     ]
     assert "context-new" not in save_context["context_ciphertext_input"]
     assert "session-new" not in save_session["session_ciphertext_input"]
+
+
+def test_browser_start_never_adopts_or_rebinds_unbound_legacy_context(
+    monkeypatch: Any,
+) -> None:
+    key = Fernet.generate_key().decode()
+    cipher = TokenCipher(key)
+    connection_id = str(uuid4())
+    store = FakeStore(
+        {"profiles": [{"user_id": str(USER_ID), "account_status": "active"}]},
+        rpc_results={
+            "begin_browser_start": {
+                "generation": 5,
+                "connection_id": connection_id,
+                "context_ciphertext": cipher.encrypt("legacy-context"),
+                "session_ciphertext": cipher.encrypt("legacy-session"),
+                # Application validation must fail closed even if an older or
+                # stale database function incorrectly offers context reuse.
+                "reuse_context": True,
+                "credential_epoch": 0,
+                "active_credential_source": "platform",
+                "active_credential_generation": None,
+                "active_project_fingerprint": None,
+                "context_credential_source": None,
+                "context_credential_generation": None,
+                "context_credential_epoch": None,
+                "context_project_fingerprint": None,
+            },
+            "abort_browser_start": True,
+        },
+    )
+    browser = FakeBrowserbase()
+    constructor_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def browserbase_factory(*args: Any, **kwargs: Any) -> FakeBrowserbase:
+        constructor_calls.append((args, kwargs))
+        return browser
+
+    monkeypatch.setattr(saas_main, "BrowserbaseClient", browserbase_factory)
+
+    response = TestClient(
+        create_app(settings=browser_settings(key), auth=FakeAuth(), store=store)
+    ).post("/api/v1/connections/greenhouse/browser/start")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "browserbase_credential_binding_stale"
+    assert constructor_calls == []
+    assert browser.events == []
+    assert not any(
+        name == "save_browser_connection_context_bound" for name, _params in store.rpc_calls
+    )
+    assert not any(
+        name in {"save_browser_connection_session", "confirm_browser_start"}
+        for name, _params in store.rpc_calls
+    )
+    abort = next(params for name, params in store.rpc_calls if name == "abort_browser_start")
+    assert abort["expected_generation_input"] == 5
+    assert abort["expected_connection_id_input"] == connection_id
+    assert abort["drop_connection_input"] is False
 
 
 def test_stale_browser_start_cleans_every_remote_resource_it_created(
@@ -1916,8 +2083,16 @@ def test_stale_browser_start_cleans_every_remote_resource_it_created(
                 "context_ciphertext": None,
                 "session_ciphertext": None,
                 "reuse_context": False,
+                "credential_epoch": 0,
+                "active_credential_source": "platform",
+                "active_credential_generation": None,
+                "active_project_fingerprint": None,
+                "context_credential_source": None,
+                "context_credential_generation": None,
+                "context_credential_epoch": None,
+                "context_project_fingerprint": None,
             },
-            "save_browser_connection_context": [
+            "save_browser_connection_context_bound": [
                 {
                     "id": connection_id,
                     "user_id": str(USER_ID),
@@ -1957,6 +2132,11 @@ def test_browser_disconnect_retries_same_generation_and_exact_connection(
         "connection_id": connection_id,
         "context_ciphertext": cipher.encrypt("context-old"),
         "session_ciphertext": cipher.encrypt("session-old"),
+        "credential_epoch": 0,
+        "context_credential_source": "platform",
+        "context_credential_generation": None,
+        "context_credential_epoch": 0,
+        "context_project_fingerprint": _browserbase_fingerprint("browser-project"),
     }
     store = FakeStore(
         {"profiles": [{"user_id": str(USER_ID), "account_status": "active"}]},
@@ -2015,6 +2195,12 @@ def test_browser_complete_finishes_only_the_saved_generation(
                     "browser_context_id_ciphertext": cipher.encrypt("context-new"),
                     "browser_session_id_ciphertext": session_ciphertext,
                     "browser_lifecycle_generation": 15,
+                    "browser_credential_source": "platform",
+                    "browser_credential_generation": None,
+                    "browser_credential_epoch": 0,
+                    "browser_project_fingerprint": _browserbase_fingerprint(
+                        "browser-project"
+                    ),
                 }
             ],
         },
@@ -2037,6 +2223,59 @@ def test_browser_complete_finishes_only_the_saved_generation(
     assert finish["expected_connection_id_input"] == connection_id
     assert finish["expected_session_ciphertext_input"] == session_ciphertext
     assert ("release_session", "session-new") in browser.events
+
+
+def test_browser_complete_rejects_unbound_legacy_context_before_remote_access(
+    monkeypatch: Any,
+) -> None:
+    key = Fernet.generate_key().decode()
+    cipher = TokenCipher(key)
+    connection_id = str(uuid4())
+    connection = {
+        "id": connection_id,
+        "user_id": str(USER_ID),
+        "provider": "greenhouse",
+        "mode": "managed_browser",
+        "status": "pending",
+    }
+    store = FakeStore(
+        {
+            "profiles": [{"user_id": str(USER_ID), "account_status": "active"}],
+            "connections": [connection],
+            "connection_secrets": [
+                {
+                    "connection_id": connection_id,
+                    "user_id": str(USER_ID),
+                    "browser_context_id_ciphertext": cipher.encrypt("legacy-context"),
+                    "browser_session_id_ciphertext": cipher.encrypt("legacy-session"),
+                    "browser_lifecycle_generation": 16,
+                    "browser_credential_source": None,
+                    "browser_credential_generation": None,
+                    "browser_credential_epoch": None,
+                    "browser_project_fingerprint": None,
+                }
+            ],
+        }
+    )
+    browser = FakeBrowserbase()
+    constructor_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def browserbase_factory(*args: Any, **kwargs: Any) -> FakeBrowserbase:
+        constructor_calls.append((args, kwargs))
+        return browser
+
+    monkeypatch.setattr(saas_main, "BrowserbaseClient", browserbase_factory)
+
+    response = TestClient(
+        create_app(settings=browser_settings(key), auth=FakeAuth(), store=store)
+    ).post("/api/v1/connections/greenhouse/browser/complete")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "browserbase_credential_binding_stale"
+    assert constructor_calls == []
+    assert browser.events == []
+    assert not any(name == "finish_browser_start" for name, _params in store.rpc_calls)
+    assert not any(name == "abort_browser_start" for name, _params in store.rpc_calls)
 
 
 def test_linkedin_cannot_enter_browser_disconnect_lifecycle() -> None:
@@ -2487,3 +2726,434 @@ def test_google_disconnect_uses_retryable_lifecycle_before_revocation(
         params for name, params in store.rpc_calls if name == "finish_google_disconnect"
     )
     assert finish_call["expected_generation_input"] == 5
+
+
+def test_browserbase_byok_is_validated_without_a_session_and_encrypted_at_rest(
+    monkeypatch: Any,
+) -> None:
+    encryption_key = Fernet.generate_key().decode()
+    rpc_results: dict[str, Any] = {}
+    store = FakeStore(
+        {"profiles": [{"user_id": str(USER_ID), "account_status": "active"}]},
+        rpc_results=rpc_results,
+    )
+
+    def save_credential(params: dict[str, Any]) -> list[dict[str, Any]]:
+        row = {
+            "user_id": params["user_id_input"],
+            "provider": params["provider_input"],
+            "credential_ciphertext": params["credential_ciphertext_input"],
+            "verification_status": params["verification_status_input"],
+            "verification_code": params["verification_code_input"],
+            "verified_at": params["verified_at_input"],
+            "generation": 1,
+            "binding_fingerprint": params["binding_fingerprint_input"],
+            "updated_at": "2026-08-15T12:00:00Z",
+        }
+        store.client.tables.setdefault("user_provider_credentials", []).append(row)
+        return [row]
+
+    rpc_results["save_user_provider_credential"] = save_credential
+    constructed: list[tuple[str, str]] = []
+
+    class ValidatingBrowserbase:
+        def __init__(self, api_key: str, project_id: str) -> None:
+            constructed.append((api_key, project_id))
+
+        def validate_project(self) -> dict[str, Any]:
+            return {"valid": True, "status": "ready", "project_id": "tenant-project"}
+
+    monkeypatch.setattr(saas_main, "BrowserbaseClient", ValidatingBrowserbase)
+    client = TestClient(
+        create_app(settings=browser_settings(encryption_key), auth=FakeAuth(), store=store)
+    )
+    api_key = "bb_live_tenant_secret"
+
+    response = client.put(
+        "/api/v1/provider-credentials/browserbase",
+        json={"api_key": api_key, "project_id": "tenant-project"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["verification_status"] == "verified"
+    assert api_key not in response.text
+    assert "tenant-project" not in response.text
+    assert "tenant-project" not in json.dumps(response.json()["verification"])
+    assert "project_id" not in response.json()["verification"]
+    assert constructed == [(api_key, "tenant-project")]
+    saved = store.client.tables["user_provider_credentials"][0]
+    assert api_key not in saved["credential_ciphertext"]
+    envelope = json.loads(TokenCipher(encryption_key).decrypt(saved["credential_ciphertext"]))
+    assert envelope == {
+        "api_key": api_key,
+        "project_id": "tenant-project",
+        "provider": "browserbase",
+        "version": 1,
+    }
+
+
+def test_stored_groq_and_hunter_keys_are_used_when_legacy_headers_are_absent(
+    monkeypatch: Any,
+) -> None:
+    encryption_key = Fernet.generate_key().decode()
+    cipher = TokenCipher(encryption_key)
+    groq_key = "gsk_stored_groq_secret"
+    hunter_key = "hunter_stored_secret"
+    rows = []
+    for provider, api_key in (("groq", groq_key), ("hunter", hunter_key)):
+        rows.append(
+            {
+                "user_id": str(USER_ID),
+                "provider": provider,
+                "credential_ciphertext": cipher.encrypt(
+                    json.dumps(
+                        {"api_key": api_key, "provider": provider, "version": 1},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                ),
+                "verification_status": "verified",
+                "verification_code": None,
+                "verified_at": "2026-08-15T12:00:00Z",
+                "generation": 1,
+                "created_at": "2026-08-15T12:00:00Z",
+                "updated_at": "2026-08-15T12:00:00Z",
+            }
+        )
+    store = FakeStore(
+        {
+            "profiles": [{"user_id": str(USER_ID), "account_status": "active"}],
+            "user_provider_credentials": rows,
+        }
+    )
+    seen: list[tuple[str, str]] = []
+
+    def validate_groq(api_key: str, _model: str) -> dict[str, Any]:
+        seen.append(("groq", api_key))
+        return {"valid": True, "status": "ready"}
+
+    def validate_hunter(api_key: str) -> dict[str, Any]:
+        seen.append(("hunter", api_key))
+        return {"valid": True, "status": "ready"}
+
+    monkeypatch.setattr(saas_main, "validate_groq_key", validate_groq)
+    monkeypatch.setattr(saas_main, "validate_hunter_key", validate_hunter)
+    client = TestClient(
+        create_app(settings=browser_settings(encryption_key), auth=FakeAuth(), store=store)
+    )
+
+    groq_response = client.post("/api/v1/groq/validate")
+    hunter_response = client.post("/api/v1/hunter/validate")
+
+    assert groq_response.status_code == 200, groq_response.text
+    assert hunter_response.status_code == 200, hunter_response.text
+    assert seen == [("groq", groq_key), ("hunter", hunter_key)]
+    assert groq_key not in groq_response.text
+    assert hunter_key not in hunter_response.text
+
+
+def test_saved_groq_key_survives_a_fresh_app_and_client_without_a_header(
+    monkeypatch: Any,
+) -> None:
+    encryption_key = Fernet.generate_key().decode()
+    store = FakeStore(
+        {"profiles": [{"user_id": str(USER_ID), "account_status": "active"}]}
+    )
+    api_key = "gsk_persisted_between_app_instances"
+    seen: list[str] = []
+
+    def validate(api_key_input: str, _model: str) -> dict[str, Any]:
+        seen.append(api_key_input)
+        return {"valid": True, "status": "ready"}
+
+    def save_credential(params: dict[str, Any]) -> list[dict[str, Any]]:
+        row = {
+            "user_id": params["user_id_input"],
+            "provider": params["provider_input"],
+            "credential_ciphertext": params["credential_ciphertext_input"],
+            "verification_status": params["verification_status_input"],
+            "verification_code": params["verification_code_input"],
+            "verified_at": params["verified_at_input"],
+            "generation": 1,
+            "binding_fingerprint": None,
+            "created_at": "2026-08-15T12:00:00Z",
+            "updated_at": "2026-08-15T12:00:00Z",
+        }
+        store.client.tables["user_provider_credentials"] = [row]
+        return [row]
+
+    store.client.rpc_results["save_user_provider_credential"] = save_credential
+    store.server.rpc_results["save_user_provider_credential"] = save_credential
+    monkeypatch.setattr(saas_main, "validate_groq_key", validate)
+    settings = browser_settings(encryption_key)
+
+    first_client = TestClient(
+        create_app(settings=settings, auth=FakeAuth(), store=store)
+    )
+    saved = first_client.put(
+        "/api/v1/provider-credentials/groq", json={"api_key": api_key}
+    )
+    assert saved.status_code == 200, saved.text
+    assert api_key not in saved.text
+
+    # A separate app and TestClient must resolve the encrypted row from the
+    # shared store; this guards against accidental process-local persistence.
+    second_client = TestClient(
+        create_app(settings=settings, auth=FakeAuth(), store=store)
+    )
+    validated = second_client.post("/api/v1/groq/validate")
+
+    assert validated.status_code == 200, validated.text
+    assert validated.json()["valid"] is True
+    assert seen == [api_key, api_key]
+    assert api_key not in validated.text
+    ciphertext = store.client.tables["user_provider_credentials"][0][
+        "credential_ciphertext"
+    ]
+    assert api_key not in ciphertext
+
+
+@pytest.mark.parametrize(
+    ("provider", "validation_code", "expected_status"),
+    [
+        ("groq", "groq_invalid_key", 422),
+        ("hunter", "hunter_invalid_key", 422),
+        ("groq", "groq_unavailable", 503),
+        ("hunter", "hunter_unavailable", 503),
+    ],
+)
+def test_failed_key_replacement_preserves_an_existing_verified_credential(
+    monkeypatch: Any,
+    provider: str,
+    validation_code: str,
+    expected_status: int,
+) -> None:
+    encryption_key = Fernet.generate_key().decode()
+    cipher = TokenCipher(encryption_key)
+    old_key = f"{provider}_existing_verified_secret"
+    ciphertext = cipher.encrypt(
+        json.dumps(
+            {"version": 1, "provider": provider, "api_key": old_key},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    store = FakeStore(
+        {
+            "profiles": [{"user_id": str(USER_ID), "account_status": "active"}],
+            "user_provider_credentials": [
+                {
+                    "user_id": str(USER_ID),
+                    "provider": provider,
+                    "credential_ciphertext": ciphertext,
+                    "verification_status": "verified",
+                    "verification_code": None,
+                    "verified_at": "2026-08-15T12:00:00Z",
+                    "generation": 2,
+                    "binding_fingerprint": None,
+                }
+            ],
+        }
+    )
+    invalid = {
+        "valid": False,
+        "status": validation_code,
+        "message": "The replacement key could not be verified.",
+    }
+    if provider == "groq":
+        monkeypatch.setattr(saas_main, "validate_groq_key", lambda *_args: invalid)
+    else:
+        monkeypatch.setattr(saas_main, "validate_hunter_key", lambda *_args: invalid)
+
+    response = TestClient(
+        create_app(
+            settings=browser_settings(encryption_key), auth=FakeAuth(), store=store
+        )
+    ).put(
+        f"/api/v1/provider-credentials/{provider}",
+        json={"api_key": f"{provider}_invalid_replacement"},
+    )
+
+    assert response.status_code == expected_status, response.text
+    assert response.json()["error"]["code"] == validation_code
+    assert store.client.tables["user_provider_credentials"][0][
+        "credential_ciphertext"
+    ] == ciphertext
+    assert not any(
+        name == "save_user_provider_credential" for name, _params in store.rpc_calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("validation_code", "expected_status"),
+    [("browserbase_not_authorized", 422), ("browserbase_unavailable", 503)],
+)
+def test_failed_browserbase_replacement_preserves_old_key_and_project(
+    monkeypatch: Any, validation_code: str, expected_status: int
+) -> None:
+    encryption_key = Fernet.generate_key().decode()
+    cipher = TokenCipher(encryption_key)
+    old_project = "tenant-old-project"
+    old_ciphertext = cipher.encrypt(
+        json.dumps(
+            {
+                "version": 1,
+                "provider": "browserbase",
+                "api_key": "bb_live_existing_verified_secret",
+                "project_id": old_project,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    store = FakeStore(
+        {
+            "profiles": [{"user_id": str(USER_ID), "account_status": "active"}],
+            "user_provider_credentials": [
+                {
+                    "user_id": str(USER_ID),
+                    "provider": "browserbase",
+                    "credential_ciphertext": old_ciphertext,
+                    "verification_status": "verified",
+                    "verification_code": None,
+                    "verified_at": "2026-08-15T12:00:00Z",
+                    "generation": 1,
+                    "binding_fingerprint": _browserbase_fingerprint(old_project),
+                }
+            ],
+        },
+        rpc_results={"get_browserbase_credential_state": {"epoch": 1}},
+    )
+
+    class InvalidBrowserbase:
+        def __init__(self, _api_key: str, _project_id: str) -> None:
+            pass
+
+        def validate_project(self) -> dict[str, Any]:
+            return {
+                "valid": False,
+                "status": validation_code,
+                "message": "The replacement key and project do not match.",
+            }
+
+    monkeypatch.setattr(saas_main, "BrowserbaseClient", InvalidBrowserbase)
+
+    response = TestClient(
+        create_app(
+            settings=browser_settings(encryption_key), auth=FakeAuth(), store=store
+        )
+    ).put(
+        "/api/v1/provider-credentials/browserbase",
+        json={
+            "api_key": "bb_live_invalid_replacement",
+            "project_id": "tenant-new-project",
+        },
+    )
+
+    assert response.status_code == expected_status, response.text
+    assert response.json()["error"]["code"] == validation_code
+    assert store.client.tables["user_provider_credentials"][0][
+        "credential_ciphertext"
+    ] == old_ciphertext
+    assert not any(
+        name == "begin_browser_disconnect" for name, _params in store.rpc_calls
+    )
+    assert not any(
+        name == "save_user_provider_credential" for name, _params in store.rpc_calls
+    )
+
+
+def test_browserbase_local_abandon_requires_exact_confirmation_and_is_explicit() -> None:
+    store = FakeStore(rpc_results={"abandon_browserbase_resources": True})
+    client = TestClient(
+        create_app(
+            settings=browser_settings(Fernet.generate_key().decode()),
+            auth=FakeAuth(),
+            store=store,
+        )
+    )
+
+    rejected = client.post(
+        "/api/v1/provider-credentials/browserbase/abandon",
+        json={"confirmation": "DELETE"},
+    )
+    assert rejected.status_code == 422, rejected.text
+    assert not any(
+        name == "abandon_browserbase_resources" for name, _params in store.rpc_calls
+    )
+
+    abandoned = client.post(
+        "/api/v1/provider-credentials/browserbase/abandon",
+        json={"confirmation": "ABANDON REMOTE BROWSER DATA"},
+    )
+    assert abandoned.status_code == 200, abandoned.text
+    assert abandoned.json() == {
+        "ok": True,
+        "remote_cleanup_confirmed": False,
+        "browserbase_dashboard_url": "https://www.browserbase.com/overview",
+    }
+    assert store.rpc_calls[-1] == (
+        "abandon_browserbase_resources",
+        {
+            "user_id_input": str(USER_ID),
+            "confirmation_input": "ABANDON REMOTE BROWSER DATA",
+        },
+    )
+
+
+def test_provider_credential_status_returns_only_masked_hints() -> None:
+    encryption_key = Fernet.generate_key().decode()
+    cipher = TokenCipher(encryption_key)
+    api_key = "bb_live_status_secret"
+    project_id = "tenant-project-status"
+    store = FakeStore(
+        {
+            "profiles": [{"user_id": str(USER_ID), "account_status": "active"}],
+            "user_provider_credentials": [
+                {
+                    "user_id": str(USER_ID),
+                    "provider": "browserbase",
+                    "credential_ciphertext": cipher.encrypt(
+                        json.dumps(
+                            {
+                                "api_key": api_key,
+                                "project_id": project_id,
+                                "provider": "browserbase",
+                                "version": 1,
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                    ),
+                    "verification_status": "verified",
+                    "verification_code": None,
+                    "verified_at": "2026-08-15T12:00:00Z",
+                    "generation": 1,
+                    "binding_fingerprint": _browserbase_fingerprint(project_id),
+                    "created_at": "2026-08-15T12:00:00Z",
+                    "updated_at": "2026-08-15T12:00:00Z",
+                }
+            ],
+        },
+        rpc_results={"get_browserbase_credential_state": {"epoch": 1}},
+    )
+    client = TestClient(
+        create_app(settings=browser_settings(encryption_key), auth=FakeAuth(), store=store)
+    )
+
+    response = client.get("/api/v1/provider-credentials")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    browserbase = next(
+        item for item in payload["items"] if item["provider"] == "browserbase"
+    )
+    assert browserbase["configured"] is True
+    assert browserbase["key_hint"].endswith("cret")
+    assert browserbase["project_id_hint"] == "tenant-p…atus"
+    assert browserbase["key_url"] == "https://www.browserbase.com/settings"
+    assert browserbase["signup_url"] == "https://www.browserbase.com/sign-up"
+    assert browserbase["project_url"] == "https://www.browserbase.com/overview"
+    assert api_key not in response.text
+    assert project_id not in response.text
+    assert "credential_ciphertext" not in response.text

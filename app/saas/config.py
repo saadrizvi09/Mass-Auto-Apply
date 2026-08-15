@@ -176,6 +176,18 @@ class Settings:
         return bool(self.browserbase_api_key and self.browserbase_project_id)
 
     @property
+    def provider_credential_store_ready(self) -> bool:
+        """Whether tenant BYOK values can be stored encrypted server-side."""
+
+        return self.secret_store_configured and self.token_encryption_configured
+
+    @property
+    def managed_browser_available(self) -> bool:
+        """Whether platform or tenant Browserbase credentials can run jobs."""
+
+        return self.browserbase_configured or self.provider_credential_store_ready
+
+    @property
     def secret_store_configured(self) -> bool:
         return bool(self.supabase_url and self.supabase_secret_key)
 
@@ -199,8 +211,9 @@ class Settings:
                 "gmail": self.gmail_connection_available,
                 "gmail_platform_oauth": self.google_configured,
                 "gmail_user_oauth_clients": self.google_byoc_ready,
-                "managed_browser": self.browserbase_configured
+                "managed_browser": self.managed_browser_available
                 and bool(self.allowed_browser_providers),
+                "browserbase_byok": self.provider_credential_store_ready,
                 "groq_byok": True,
                 "groq_model": self.groq_model,
                 "resume_upload": True,
@@ -208,7 +221,7 @@ class Settings:
                 "max_resume_bytes": self.max_resume_bytes,
                 "credential_free_discovery": True,
                 "linkedin_guest_discovery": True,
-                "managed_application_review": self.browserbase_configured
+                "managed_application_review": self.managed_browser_available
                 and bool(
                     HOSTED_FORM_AUTOMATION_PROVIDERS.intersection(
                         self.allowed_browser_providers
@@ -229,6 +242,7 @@ class Settings:
             "gmail_platform_oauth": self.google_configured,
             "gmail_user_oauth_clients": self.google_byoc_ready,
             "managed_browser": self.browserbase_configured,
+            "browserbase_byok": self.provider_credential_store_ready,
         }
 
     def require_supabase(self) -> None:

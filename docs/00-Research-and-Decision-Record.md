@@ -1,7 +1,7 @@
 # AutoApply Cloud — Research and Decision Record
 
 **Status:** Approved for implementation
-**Date:** 2026-08-11; implementation contract updated 2026-08-13
+**Date:** 2026-08-11; implementation contract updated 2026-08-15
 **Scope:** Conversion of the local, single-user AutoApply application into a public,
 multi-user product whose web control plane deploys to Vercel.
 
@@ -21,7 +21,7 @@ flowchart LR
     USER -->|direct PDF upload| STORAGE[Supabase Storage]
     UI -->|Supabase bearer JWT| API[FastAPI on Vercel]
     API --> DB[(Supabase Postgres + RLS)]
-    API --> GROQ[Groq API<br/>user key supplied per request]
+    API --> PROVIDERS[Groq / Hunter APIs<br/>account key decrypted just in time]
     API --> GOOGLE[Google OAuth + Gmail API]
     API --> QUEUE[(Durable job table)]
     WORKER[Persistent worker] --> QUEUE
@@ -196,7 +196,8 @@ Google Forms use that third worker job in the normal public flow. Their sequence
 1. an explicit **Prepare form** action queues a durable scan and records the detected
    schema and proposed revision;
 2. after scan success, the signed-in browser automatically calls the foreground Groq
-   suggestion endpoint once for the eligible revision when a valid local key exists;
+   suggestion endpoint once for the eligible revision when a valid account credential
+   exists;
 3. the user reviews and edits the exact revision inside Form Pilot, then explicitly
    chooses **Approve & submit in background**;
 4. the API atomically seals the latest exact revision, verifies complete required
@@ -205,10 +206,11 @@ Google Forms use that third worker job in the normal public flow. Their sequence
    control once, and reports success only after freshly observed provider confirmation.
 
 The automatic suggestion request is neither approval nor submission. It is deduplicated
-per revision in browser state, carries the key only for that foreground request, and
-cannot be performed by the worker after the browser closes. The explicit combined
-approval action is the Google Forms submission boundary; a queued or running job is not
-success. Only `application_submitted` with `submission_state=confirmed` is success.
+per revision in browser state, while the API resolves and decrypts the saved Groq
+credential only inside the trusted backend for that request. The browser neither sends
+nor receives the raw saved key. The explicit combined approval action is the Google
+Forms submission boundary; a queued or running job is not success. Only
+`application_submitted` with `submission_state=confirmed` is success.
 
 The first approval may atomically replace proposed answers with the exact answers shown
 to the user and then seals them. Any later answer change—or any selected résumé, target
@@ -248,23 +250,40 @@ release and context deletion. This is observed behavior for the configured proje
 not a guarantee that Browserbase will retain that capability or pricing; deployment
 must keep the needs-attention Live View canary in its release gate.
 
-### 7. A browser-persisted Groq key and autonomous jobs are different modes
+### 7. Account-scoped provider credentials do not authorize autonomous work
 
-The requested bring-your-own Groq key will be stored in that user's browser
-`localStorage`. It is never written to Supabase or Vercel. The browser sends it in an
-authorization header only for an active foreground AI request, including résumé
-analysis, email drafting, and the automatic post-scan Form Pilot suggestion request.
-This satisfies browser persistence but means a background worker cannot generate new
-text after that browser closes; queued jobs must contain already-approved generated
-content. Form Pilot therefore observes a completed scan in the signed-in page,
-automatically requests at most one suggestion set for that eligible revision, and then
-requires the user to review the exact answers before explicitly approving their
-background submission.
+Bring-your-own Groq, Hunter, and Browserbase credentials are stored per account as
+authenticated ciphertext in a service-role-only database table. Browser roles have no
+read policy for that table. Credential APIs return only configured/verification state
+and bounded masked hints; neither plaintext nor ciphertext is returned. A trusted API
+request resolves the row from the verified tenant identity and decrypts it just in time
+for that operation. A worker similarly resolves and decrypts only the credential bound
+to the queue job it has claimed (currently the tenant Browserbase credential for managed
+browser work). Raw credentials never enter queue payloads, progress, results, analytics,
+application logs, or provider error messages.
+
+This is authenticated, reversible encryption because a provider API key must be
+recovered for an outbound provider call. Account passwords have a different lifecycle:
+Supabase Auth applies one-way password hashing, and password hashes never enter this
+credential vault. Hashing is not a substitute for API-key encryption. The operator-held
+`TOKEN_ENCRYPTION_KEY` is therefore critical deployment state and must have the exact
+same value in the API and persistent worker environments; losing or changing it without
+a deliberate rotation makes saved credentials unreadable.
+
+The first-party browser submits a raw provider secret only over authenticated HTTPS when
+the user saves or replaces it. Existing user-scoped Groq/Hunter `localStorage` values
+are a migration source only: on the next authenticated credential load, the client moves
+each legacy value into the encrypted account vault and removes the browser copy after
+the server confirms the import (or confirms that an account credential already exists).
+A failed import is reported and leaves the legacy value available for a safe retry; new
+credentials are not persisted in browser storage.
 
 Groq recommends never exposing keys in frontend code and using a backend proxy. This
-product therefore never calls Groq directly from JavaScript; the key transits the HTTPS
-FastAPI proxy and is not logged or persisted. The UI clearly discloses the local-storage
-risk and provides a one-click delete action.
+product therefore never calls Groq directly from JavaScript, and a saved raw key is never
+returned to JavaScript. Vault persistence removes the browser-close limitation on
+credential availability, but it does not grant autonomous generation or approval:
+launch Groq and Hunter actions remain explicit, review-bound operations, and durable jobs
+still carry only non-secret references and already approved content.
 
 The legacy `llama-3.3-70b-versatile` model is scheduled to stop serving free/developer
 tier traffic on 2026-08-16. The product defaults to the recommended production model
@@ -313,7 +332,7 @@ and [Turnstile CSP](https://developers.cloudflare.com/turnstile/reference/conten
 |---|---|---|
 | Supabase email/password auth | Implement | Public tenant identity and JWTs |
 | Private PDF résumé upload | Implement | Five exact private slots; atomic registration avoids races |
-| Browser-persistent BYO Groq key | Implement with disclosure | Explicit product request; proxy never persists it |
+| Encrypted account-scoped BYO Groq/Hunter keys | Implement | Service-role-only vault; raw values are never returned or queued |
 | Cloudflare Turnstile/Supabase CAPTCHA | Implement | Public password-auth abuse boundary |
 | Draft from JD + résumé/profile | Implement | Bounded Vercel request |
 | Telegram public previews/RSS | Implement, bounded | No provider credential; allowlisted network fetches only |
@@ -342,7 +361,7 @@ and [Turnstile CSP](https://developers.cloudflare.com/turnstile/reference/conten
 
 The implementation is complete when a new public user can pass the configured auth
 challenge, sign up, maintain an isolated profile, use up to five private PDF slots,
-save/remove a per-user Groq key in their browser, add a job/JD,
+save/remove per-user Groq and Hunter keys in their encrypted account vault, add a job/JD,
 ingest and review credential-free discovery results, generate and edit a tailored email draft,
 connect Gmail with web OAuth using the available platform client or an explicitly
 configured user-managed Web client, explicitly approve and send one message, scan a

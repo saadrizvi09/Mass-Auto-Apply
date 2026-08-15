@@ -3,7 +3,7 @@
 ## AutoApply Cloud 2.0
 
 **Status:** Implementation baseline
-**Date:** 2026-08-13
+**Date:** 2026-08-15
 
 ## 1. Hosted project structure
 
@@ -17,9 +17,9 @@
 │       ├── errors.py                # stable API error envelope
 │       ├── store.py                 # Supabase REST/Storage repository
 │       ├── schemas.py               # public request/response models
-│       ├── crypto.py                # provider-token encryption
-│       ├── groq.py                  # transient BYOK proxy
-│       ├── hunter.py                # stateless Hunter validation/HR contacts
+│       ├── crypto.py                # provider credential/token encryption
+│       ├── groq.py                  # account-scoped Groq adapter
+│       ├── hunter.py                # account-scoped Hunter validation/HR contacts
 │       ├── gmail.py                 # web OAuth and Gmail send adapter
 │       ├── browser.py               # managed-browser control adapter
 │       ├── providers.py             # capability catalog/allowlist
@@ -83,7 +83,8 @@ GROQ_MODEL=openai/gpt-oss-120b
 MAX_RESUME_BYTES=6291456
 DEFAULT_DAILY_SEND_CAP=10
 
-# Managed-browser application features (trusted API/worker only)
+# Optional platform fallback for managed-browser application features.
+# A validated account-scoped Browserbase credential takes priority.
 BROWSERBASE_API_KEY=...
 BROWSERBASE_PROJECT_ID=...
 ALLOWED_BROWSER_PROVIDERS=google_forms,greenhouse
@@ -96,10 +97,11 @@ WORKER_LEASE_SECONDS=120
 The Supabase secret key, encryption key, platform Google client secret, user-managed
 Google client credentials, provider tokens, and browser connection URLs must never be
 returned by `/config`, embedded in JavaScript, stored in browser storage, or logged.
-User-supplied Groq and Hunter keys are the deliberate browser-storage exception: they
-are namespaced to the authenticated user, sent only in their dedicated sensitive
-headers (including Form Pilot's automatic post-scan suggestion request), and never
-become deployment variables or server-persisted provider tokens.
+User-supplied Groq, Hunter, and Browserbase credentials are submitted once through the
+authenticated provider-credential API, encrypted as versioned JSON with
+`TOKEN_ENCRYPTION_KEY`, and persisted only in the service-role-only
+`user_provider_credentials` table. API responses expose only provider status, safe
+hints, validation codes, and timestamps—never plaintext or ciphertext.
 
 The worker begins polling at `WORKER_POLL_SECONDS`, exponentially backs off consecutive
 empty claims toward `WORKER_MAX_IDLE_POLL_SECONDS`, and resets the idle delay as soon as
@@ -107,9 +109,12 @@ it claims work. Successful HTTP transport entries are suppressed; worker lifecyc
 claimed-job, completion, and redacted warning logs remain visible.
 
 The API and worker share `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, and
-`TOKEN_ENCRYPTION_KEY`; the worker uses the latter to decrypt only the context bound to
-its claimed tenant job. Browserbase variables are required to create/reuse Live View
-contexts. An empty `ALLOWED_BROWSER_PROVIDERS` disables all browser jobs; the exact
+`TOKEN_ENCRYPTION_KEY`; trusted code uses the latter to decrypt only the credential or
+context required for the owned request or claimed tenant job. For Browserbase, the
+worker first resolves the claimed job owner's validated BYOK API-key/Project-ID pair
+and uses the operator `BROWSERBASE_API_KEY`/`BROWSERBASE_PROJECT_ID` only when no owned
+pair exists. Both sources being absent disables managed-browser work. An empty
+`ALLOWED_BROWSER_PROVIDERS` disables all browser jobs; the exact
 initial allowlist above enables Greenhouse plus one-page Google Forms scan,
 exact-approved submit, and verified-confirmation handling and excludes ZipRecruiter.
 Add Lever, Ashby, or Wellfound individually only after its controlled canary passes. YC
@@ -129,15 +134,15 @@ job boards themselves inside Browserbase Live View. The Google Forms connection 
 optional: ordinary public forms continue to use an ephemeral browser, while a scanned
 form containing a signed-in résumé/CV upload returns `provider_login_required` until
 that tenant has connected an isolated Google browser context. Gmail OAuth tokens do
-not provide browser cookies and cannot satisfy this requirement. A user's Groq key remains
-browser-only and is not a worker environment variable. The same applies to Hunter:
-there is no `HUNTER_API_KEY` environment variable, and contact lookup is a foreground,
-user-initiated API call.
+not provide browser cookies and cannot satisfy this requirement. Groq and Hunter are
+also account-scoped encrypted credentials rather than worker environment variables;
+there is no deployment-wide `GROQ_API_KEY` or `HUNTER_API_KEY`. Hunter contact lookup
+remains a foreground, user-initiated API call.
 
 ## 3. Database schema
 
 The canonical executable schema is the ordered Supabase migrations. Deployments must
-apply through `202608130003_profile_public_resume_url.sql`. In particular,
+apply through `202608150002_user_provider_credentials.sql`. In particular,
 `202608130001_google_forms_manual_submit.sql` is a temporary fail-closed state;
 `202608130002_google_forms_approved_submit.sql` is the required forward migration that
 removes that prohibition and installs the exact-approved/required-answer submit gate.
@@ -352,6 +357,33 @@ send, advance the generation, and invalidate all pending Google OAuth states. Ac
 deletion removes this row by cascade. Gmail disconnect removes the token connection but
 leaves this separate client configuration until the user deletes it.
 
+### `user_provider_credentials`
+
+Server-only encrypted BYOK credentials for `groq`, `hunter`, and `browserbase`. RLS is
+enabled with no browser policy; privileges are revoked from `public`, `anon`, and
+`authenticated`, and the service role is the only database role with access:
+
+```sql
+user_id uuid not null references auth.users(id) on delete cascade,
+provider text not null check (provider in ('groq', 'hunter', 'browserbase')),
+credential_ciphertext text not null,
+verification_status text not null, -- verified | unverified | invalid
+verification_code text,
+verified_at timestamptz,
+generation bigint not null check (generation > 0),
+created_at timestamptz not null default now(),
+updated_at timestamptz not null default now(),
+primary key (user_id, provider)
+```
+
+The ciphertext is a versioned JSON envelope encrypted with `TOKEN_ENCRYPTION_KEY`.
+Groq and Hunter contain one provider key; Browserbase contains both the API key and
+Project ID. Save/delete RPCs use an account/provider advisory lock, increment the
+generation on replacement, write a secret-free audit event, and cascade on account
+deletion. Replacing or deleting Browserbase BYOK is rejected while that account has an
+active browser job or retained managed-browser context, because those remote resources
+belong to the original Browserbase project.
+
 ### `oauth_states`
 
 Server-only, single-use rows containing a hash of the random state, bound user/provider,
@@ -538,31 +570,53 @@ All routes are under `/api/v1`. Private routes require a Supabase bearer JWT.
 | POST | `/api/v1/resumes/register` | atomically verify/register/activate uploaded owned slot |
 | GET | `/api/v1/resumes` | own metadata list |
 | POST | `/api/v1/resumes/{id}/parse` | bounded PDF text/annotation-link extraction and conservative contact suggestions |
-| POST | `/api/v1/resumes/{id}/analyze` | use the transient user Groq key to return allowlisted profile/role suggestions without mutating the profile |
+| POST | `/api/v1/resumes/{id}/analyze` | resolve the owned Groq credential and return allowlisted profile/role suggestions without mutating the profile |
 | DELETE | `/api/v1/resumes/{id}` | delete owned résumé row/object, retain application history |
+
+### Account-scoped provider credentials
+
+| Method | Path | Result |
+|---|---|---|
+| GET | `/api/v1/provider-credentials` | list safe status/hints for the caller's Groq, Hunter, and Browserbase credentials |
+| PUT | `/api/v1/provider-credentials/{provider}` | validate, encrypt, and create/replace one owned credential; `provider` is `groq`, `hunter`, or `browserbase` |
+| DELETE | `/api/v1/provider-credentials/{provider}` | delete one owned encrypted credential after lifecycle guards pass |
+
+The PUT body is `{ "api_key": "..." }` for Groq/Hunter and
+`{ "api_key": "...", "project_id": "..." }` for Browserbase. It validates before
+persistence and then discards the request plaintext. Browserbase validation calls
+`GET https://api.browserbase.com/v1/projects/{project_id}` with `X-BB-API-Key`, requires
+HTTP 200 and a matching returned project ID, and does **not** create a browser session
+or consume browser minutes. The list/PUT responses expose only safe hints,
+verification status/code, generation, and timestamps. The browser clears credential
+input controls after the request and retains no provider secret.
+
+New Browserbase users can register at
+<https://www.browserbase.com/sign-up>. Existing users obtain their API key from
+<https://www.browserbase.com/settings> and their Project ID from
+<https://www.browserbase.com/overview>.
 
 ### Groq
 
 | Method | Path | Result |
 |---|---|---|
-| POST | `/api/v1/groq/validate` | validate transient header key |
-| POST | `/api/v1/jobs/{id}/draft` | create/update an owned draft |
+| POST | `/api/v1/jobs/{id}/draft` | resolve the owned Groq credential and create/update an owned draft |
 
-`X-Groq-Api-Key` is required and marked sensitive. Neither endpoint returns it.
+Groq generation routes resolve and decrypt the authenticated user's verified credential
+just in time. No key header, query parameter, queue payload, or provider key appears in
+the response.
 
 ### Hunter
 
 | Method | Path | Result |
 |---|---|---|
-| POST | `/api/v1/hunter/validate` | validate the transient browser-held key and return an allowlisted quota summary |
 | POST | `/api/v1/jobs/{id}/contacts/hunter?limit=1..10` | search bounded HR contacts for the owned job's company |
 
-`X-Hunter-Api-Key` is required and marked sensitive. The stateless adapter uses
-Hunter's `X-API-Key` provider header, never a query parameter; applies fixed timeouts;
-does not cache/log/return the key or provider error body; and returns only bounded
-domain, email, name, position, confidence, and verification status fields. The endpoint
-loads the owned job before provider lookup and requires its company name. It exposes no
-durable Hunter job or unattended company search.
+The endpoint resolves the authenticated user's verified encrypted Hunter credential.
+The adapter uses Hunter's `X-API-Key` provider header, never a query parameter; applies
+fixed timeouts; does not cache/log/return the key or provider error body; and returns
+only bounded domain, email, name, position, confidence, and verification status fields.
+The endpoint loads the owned job before provider lookup and requires its company name.
+It exposes no durable Hunter job or unattended company search.
 
 ### Jobs/applications
 
@@ -592,7 +646,7 @@ analysis fills only blank browser form fields; the user reviews and saves the pr
 | POST | `/api/v1/discovery/ats/boards` | enqueue bounded official Greenhouse/Lever/Ashby public-board enumeration |
 | POST | `/api/v1/discovery/public-feeds` | enqueue bounded Telegram/RSS discovery |
 | POST | `/api/v1/discovery/linkedin` | enqueue bounded unofficial LinkedIn guest discovery |
-| POST | `/api/v1/discovery/resume-guided` | use transient Groq analysis of the active parsed résumé to return a bounded plan and enqueue LinkedIn guest plus filtered Telegram/RSS jobs |
+| POST | `/api/v1/discovery/resume-guided` | use the owned Groq credential with the active parsed résumé to return a bounded plan and enqueue LinkedIn guest plus filtered Telegram/RSS jobs |
 | GET | `/api/v1/discovery/google-forms` | paginate the tenant's deduplicated direct/metadata-discovered Google Forms review queue |
 | GET | `/api/v1/discovery/sources` | source/provider capabilities and current limits |
 
@@ -657,7 +711,7 @@ ingestion itself creates no draft and sends no message.
 |---|---|---|
 | POST | `/api/v1/jobs/{job_id}/application/scan` | create/reuse ATS application; enqueue field-only scan |
 | GET | `/api/v1/applications/{application_id}/form-revisions` | list own immutable revisions |
-| POST | `/api/v1/application-form-revisions/{revision_id}/suggest` | return transient, fact-grounded Groq answer suggestions; the browser calls this automatically once when an eligible revision loads and retains a retry path |
+| POST | `/api/v1/application-form-revisions/{revision_id}/suggest` | resolve the owned Groq credential and return fact-grounded answer suggestions; the browser calls this automatically once when an eligible revision loads and retains a retry path |
 | POST | `/api/v1/application-form-revisions/{revision_id}/approve` | approve exact latest revision/hash/answers |
 | POST | `/api/v1/application-form-revisions/{revision_id}/prefill` | enqueue a fill-only diagnostic/canary job for an already approved revision; never activates Submit and is not the normal Google Forms completion path |
 | POST | `/api/v1/application-form-revisions/{revision_id}/submit` | enqueue an idempotent worker submission for an exact latest approved revision whose required-answer preflight is complete; this is the normal Google Forms path after the UI's explicit combined approval action |
@@ -670,10 +724,10 @@ carries a bounded complete required-answer preflight. After sealing, any changed
 answer—and any résumé, URL, or detected-schema change—requires a new scan/revision and
 approval.
 
-The suggestion endpoint accepts the browser-held Groq key only in the request header,
-omits protected-trait/security questions, returns only captured question keys, and does
-not update the revision. When Form Pilot loads a newly scanned, unsealed revision with a
-Groq key available, it makes one deduplicated automatic request, applies the returned
+The suggestion endpoint resolves the owned verified Groq credential, omits
+protected-trait/security questions, returns only captured question keys, and does not
+update the revision. When Form Pilot loads a newly scanned, unsealed revision with a
+Groq credential available, it makes one deduplicated automatic request, applies the returned
 values as browser-visible draft answers, and leaves all fields editable. Missing keys,
 quota/model errors, or ungrounded fields do not block manual completion; the user can
 retry. The user must still review and explicitly approve the answers. The Groq key and
@@ -761,18 +815,21 @@ revision. ZipRecruiter is rejected even when supplied directly to the RPC.
 Provider details are mapped to safe codes. Raw provider responses, keys, tokens, and
 message content are never returned in errors.
 
-## 8. Gmail OAuth credential and token encryption
+## 8. Credential and token encryption
 
-`TOKEN_ENCRYPTION_KEY` is an operator-managed 32-byte URL-safe base64 key. Provider
-tokens are encrypted using authenticated encryption (Fernet in the initial Python
-implementation). Token ciphertext is stored only in `connection_secrets`; user Web
-OAuth client-ID and client-secret ciphertext is stored only in
-`user_google_oauth_clients`. Both tables are service-role-only.
+`TOKEN_ENCRYPTION_KEY` is an operator-managed 32-byte URL-safe base64 key shared by the
+API and every worker. Provider tokens and credentials are encrypted using authenticated
+encryption (Fernet in the initial Python implementation). Token/context ciphertext is
+stored only in `connection_secrets`; user Web OAuth client-ID/client-secret ciphertext
+is stored only in `user_google_oauth_clients`; Groq, Hunter, and Browserbase encrypted
+JSON envelopes are stored only in `user_provider_credentials`. All three tables are
+service-role-only.
 
 Key rotation is an operational migration: decrypt with current/previous key, encrypt
 with new key, verify, then remove previous. Losing all encryption keys makes tokens and
-user-managed client credentials unrecoverable; affected users must re-save their client
-and reconnect.
+user-managed credentials unrecoverable; affected users must re-save provider/OAuth
+credentials and reconnect. Never replace this variable independently on Vercel and the
+worker.
 
 ## 9. Gmail send algorithm
 
@@ -796,7 +853,7 @@ and reconnect.
 The browser provides convenience orchestration without creating a bulk-send API:
 
 1. Build an in-memory selection of at most 10 owned, non-archived jobs.
-2. Require a parsed active résumé, validated Groq/Hunter browser keys, and a connected
+2. Require a parsed active résumé, verified account-scoped Groq/Hunter credentials, and a connected
    Gmail account. Show projected Hunter credit use inline before the user explicitly
    starts the search; no additional confirmation dialog is required for that lookup.
 3. For each selected job, call the owned Hunter contact endpoint sequentially with
@@ -883,9 +940,15 @@ while running:
     await store.complete(job.id, worker_id, redact(result))
 ```
 
-Browser handlers use Playwright over Browserbase CDP. `get_application_job_bundle`
-returns only the tenant/application/job/revision/résumé/context bundle associated with
-the active lease. `store_application_form_scan` appends a revision;
+Browser handlers use Playwright over Browserbase CDP. Before creating a session, the
+worker resolves the claimed tenant's verified Browserbase BYOK pair; only when none is
+configured may it use the optional platform fallback pair. It never mixes an API key
+from one source with a Project ID from another. `get_application_job_bundle` returns
+only the tenant/application/job/revision/résumé/context bundle associated with the
+active lease. Every browser session has a 90-second stall cap and is closed as soon as
+work completes or fails. This reduces minutes for stalled runs, but Browserbase bills a
+minimum of one minute for every created session, so a successful sub-minute run still
+uses one browser minute. `store_application_form_scan` appends a revision;
 `update_application_job_progress` persists redacted progress; and
 `record_application_form_submission` commits applied/submitted state only after an
 exact approved revision receives provider confirmation. These RPCs are service-role
@@ -907,27 +970,28 @@ Connection-only or unsupported multi-step paths return `needs_attention` without
 attempting an application. CAPTCHA, MFA, login/security challenge, an unknown required
 field, changed schema, and uncertain confirmation do the same and may retain Live View
 only for user attention. No ambiguous submit is blindly retried. Mocked adapter tests are not evidence
-that live provider markup or terms are unchanged; operator Browserbase credentials and
-controlled test accounts/jobs are required before adding a provider to the production
+that live provider markup or terms are unchanged; account BYOK or operator-fallback
+Browserbase credentials and controlled test accounts/jobs are required before adding a provider to the production
 allowlist.
 
 ## 12. Frontend storage contract
 
-Keys:
-
-```text
-autoapply.groq_api_key.v2.<auth-user-uuid>
-autoapply.hunter_api_key.v1.<auth-user-uuid>
-autoapply.ui_preferences.v1
-```
-
-The Groq and Hunter key inputs use `type=password`, are never inserted into DOM HTML or
-copied to query strings, and are deleted on the user's command. Sign-out intentionally
-leaves the user-namespaced keys in that browser. Explicit key removal, successful
-account deletion, site-data clearing, or browser-profile deletion removes them. A
-different signed-in user cannot read them through the application. Supabase Auth
-manages its own namespaced session values. Outreach selection/contact candidates are
+Application-owned browser storage contains only non-secret interface preferences such
+as `autoapply.ui_preferences.v1`; Supabase Auth manages its own namespaced session
+values. Groq, Hunter, and Browserbase keys/project IDs must not be written to
+`localStorage`, `sessionStorage`, IndexedDB, cookies, URLs, DOM HTML, or analytics.
+Credential inputs use `type=password` where appropriate, are posted once over HTTPS to
+the authenticated provider-credential endpoint, and are cleared immediately after the
+request. Subsequent views use only safe status/hints from
+`GET /api/v1/provider-credentials`. Outreach selection/contact candidates remain
 in-memory UI state and reset with the authenticated workspace state.
+
+The sole transition exception is a one-time authenticated import of namespaced legacy
+Groq/Hunter values created by the previous release. The client submits each value to
+the normal validated PUT endpoint and deletes the legacy copy only after successful
+encrypted save (or when that provider is already configured). A failed import retains
+the copy and shows a retry warning; it must never fall back to a key header. New saves
+never write provider credentials to browser storage.
 
 All imported/provider text is rendered through DOM `textContent`, not HTML templates,
 to prevent stored XSS.
@@ -955,9 +1019,14 @@ to prevent stored XSS.
   redaction, fixed redirect, and disconnect-before-replace/delete behavior.
 - Resume path/MIME/size/PDF tests.
 - Five-slot Storage quota and concurrent transactional registration tests.
-- Groq transient-key redaction tests.
-- Groq sign-out/account-deletion browser-storage lifecycle tests.
-- Hunter adapter/API tests covering transient-header secrecy, account-quota allowlisting,
+- Provider-credential API/migration tests covering Groq/Hunter/Browserbase validation,
+  authenticated ownership, versioned encryption, service-role-only persistence, safe
+  hints/status, replacement generation, deletion guards, and account cascade.
+- Frontend tests proving new Groq, Hunter, and Browserbase secrets never enter browser
+  storage, credential inputs are cleared after save, and legacy Groq/Hunter import
+  removes a namespaced browser copy only after successful encrypted persistence while
+  retaining it with a warning on failure.
+- Hunter adapter/API tests covering stored-key secrecy, account-quota allowlisting,
   HR-only 1–10 contact bounds, safe provider failures, and tenant ownership.
 - Send approval/idempotency/tenant and persistent provider-ledger quota tests.
 - OAuth-generation callback/reconnect/disconnect race and revocation-failure tests.
@@ -974,7 +1043,7 @@ to prevent stored XSS.
   confirmation, and sequential reuse of the gated Gmail single-send endpoint.
 - Exact immutable form-revision, stale hash/answers, supersession, ownership, and
   service-RPC lease-binding tests.
-- Google Forms scan/suggestion/exact-submit tests, including automatic browser-side Groq
+- Google Forms scan/suggestion/exact-submit tests, including automatic account-scoped Groq
   request deduplication, deterministic graduation/public-résumé mapping, latest approved
   revision and required-answer gates, single submit activation, fresh confirmation,
   idempotency, and needs-attention-only Live View fallback. Provider-specific
@@ -993,9 +1062,12 @@ For Gmail preview, use named Google test users and verify the disclosed seven-da
 expiration for a Testing app requesting `gmail.send`. Public use of the operator client
 also requires publication plus brand/domain and sensitive-scope verification; users who
 publish their own OAuth project own the equivalent Google obligations.
-Browser-provider launch additionally requires live staging validation with real
-Browserbase credentials, controlled provider accounts/jobs, and current provider terms;
-mocked tests cannot satisfy that gate.
+Browser-provider launch additionally requires live staging validation with a real
+account-scoped Browserbase BYOK pair and the optional platform fallback (if configured),
+controlled provider accounts/jobs, and current provider terms. Validation must prove
+that saving the pair uses only the read-only project endpoint and creates no session;
+worker tests must prove BYOK priority, same-source key/project pairing, immediate close,
+and the 90-second stall cap. Mocked tests cannot satisfy that gate.
 YC and the exact-host generic company-form adapter remain gated controlled canaries
 until such validation explicitly promotes them; implementation code alone is not
 enablement evidence.

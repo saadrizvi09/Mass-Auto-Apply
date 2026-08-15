@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import worker.browser_runtime as browser_runtime_module
 
 from app.saas.browser import BrowserbaseClient, BrowserbaseError, TrustedBrowserSession
 from app.saas.crypto import TokenCipher
@@ -34,6 +37,12 @@ USER_ID = "00000000-0000-0000-0000-000000000002"
 APPLICATION_ID = "00000000-0000-0000-0000-000000000003"
 JOB_ID = "00000000-0000-0000-0000-000000000004"
 REVISION_ID = "00000000-0000-0000-0000-000000000005"
+
+
+def _browserbase_fingerprint(project_id: str) -> str:
+    return hashlib.sha256(
+        b"autoapply.browserbase.project.v1\x00" + project_id.encode("utf-8")
+    ).hexdigest()
 
 
 class FakeResponse:
@@ -589,6 +598,9 @@ def _task(
         phase=phase,  # type: ignore[arg-type]
         target_url="https://job-boards.greenhouse.io/acme/jobs/1",
         context_id="context-1",
+        context_credential_source="platform",
+        context_credential_epoch=0,
+        context_project_fingerprint=_browserbase_fingerprint("platform-project"),
         approval=approval,
     )
 
@@ -1978,7 +1990,7 @@ def test_runtime_connects_playwright_over_trusted_cdp_and_releases_scan_session(
         ("wss://connect.browserbase.com?sessionId=one&token=secret", 30_000)
     ]
     assert browserbase.created == [("context-1", False)]
-    assert browserbase.timeouts == [120]
+    assert browserbase.timeouts == [90]
     assert browserbase.released == ["session-one"]
     assert browser.closed is True
     assert page.unroute_behaviors == ["ignoreErrors"]
@@ -2007,7 +2019,7 @@ def test_public_form_runtime_uses_ephemeral_browserbase_session() -> None:
 
     assert execution.result.code == "application_form_scanned"
     assert browserbase.ephemeral == [False]
-    assert browserbase.timeouts == [120]
+    assert browserbase.timeouts == [90]
     assert browserbase.created == []
 
 
@@ -2036,7 +2048,7 @@ def test_prefill_keeps_bounded_live_review_session_without_exposing_cdp_url() ->
     assert details["live_view_url"].startswith("https://")
     assert "connect.browserbase.com" not in repr(details)
     assert browserbase.created == [("context-1", True)]
-    assert browserbase.timeouts == [120]
+    assert browserbase.timeouts == [90]
     assert browserbase.released == []
     assert browser.closed is False
 
@@ -2405,6 +2417,19 @@ class FakeTenantRepository:
         self.calls.append((name, params))
         if name == "get_application_job_bundle":
             return [self.bundle]
+        if name == "get_application_job_browser_context_binding":
+            ciphertext = self.bundle.get("browser_context_id_ciphertext")
+            return {
+                "browser_context_id_ciphertext": ciphertext,
+                "credential_source": "platform" if ciphertext else None,
+                "credential_generation": None,
+                "credential_epoch": 0 if ciphertext else None,
+                "project_fingerprint": (
+                    _browserbase_fingerprint("platform-project")
+                    if ciphertext
+                    else None
+                ),
+            }
         return self.responses.get(name, True)
 
     async def download_object(self, bucket: str, path: str) -> bytes:
@@ -2590,6 +2615,178 @@ def test_cross_tenant_bundle_is_rejected_before_resume_download() -> None:
     assert repository.downloads == []
 
 
+def test_worker_prefers_lease_bound_tenant_browserbase_credential(
+    monkeypatch: Any,
+) -> None:
+    cipher = TokenCipher(TokenCipher.generate_key())
+    repository = FakeTenantRepository(
+        _bundle(cipher),
+        responses={
+            "get_application_job_browserbase_credential": {
+                "user_id": USER_ID,
+                "credential_ciphertext": cipher.encrypt(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "provider": "browserbase",
+                            "api_key": "tenant-browserbase-key",
+                            "project_id": "tenant-project",
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                ),
+                "verification_status": "verified",
+                "verification_code": None,
+                "credential_source": "user",
+                "generation": 3,
+                "epoch": 3,
+                "binding_fingerprint": _browserbase_fingerprint("tenant-project"),
+            }
+        },
+    )
+    resources = SupabaseTenantResources(
+        repository,
+        cipher,
+        platform_browserbase_api_key="platform-browserbase-key",
+        platform_browserbase_project_id="platform-project",
+        resolve_browserbase_byok=True,
+    )
+    captured: list[tuple[str, str]] = []
+
+    class SelectedClient:
+        pass
+
+    def client_factory(api_key: str, project_id: str) -> SelectedClient:
+        captured.append((api_key, project_id))
+        return SelectedClient()
+
+    monkeypatch.setattr(browser_runtime_module, "BrowserbaseClient", client_factory)
+    job = SimpleNamespace(id=JOB_ID, user_id=USER_ID)
+
+    selected = asyncio.run(resources.browserbase_for_job(job, "worker-1"))
+
+    assert isinstance(selected, SelectedClient)
+    assert captured == [("tenant-browserbase-key", "tenant-project")]
+    assert repository.calls[-1] == (
+        "get_application_job_browserbase_credential",
+        {"job_id": JOB_ID, "worker_id": "worker-1"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("epoch", "binding_fingerprint"),
+    [
+        (4, _browserbase_fingerprint("tenant-project")),
+        (3, _browserbase_fingerprint("a-different-project")),
+    ],
+)
+def test_worker_fails_closed_when_lease_bound_browserbase_binding_is_stale(
+    epoch: int, binding_fingerprint: str
+) -> None:
+    cipher = TokenCipher(TokenCipher.generate_key())
+    repository = FakeTenantRepository(
+        _bundle(cipher),
+        responses={
+            "get_application_job_browserbase_credential": {
+                "user_id": USER_ID,
+                "credential_ciphertext": cipher.encrypt(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "provider": "browserbase",
+                            "api_key": "tenant-browserbase-key",
+                            "project_id": "tenant-project",
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                ),
+                "verification_status": "verified",
+                "verification_code": None,
+                "credential_source": "user",
+                "generation": 3,
+                "epoch": epoch,
+                "binding_fingerprint": binding_fingerprint,
+            }
+        },
+    )
+    resources = SupabaseTenantResources(
+        repository,
+        cipher,
+        platform_browserbase_api_key="platform-browserbase-key",
+        platform_browserbase_project_id="platform-project",
+        resolve_browserbase_byok=True,
+    )
+    job = SimpleNamespace(id=JOB_ID, user_id=USER_ID)
+
+    with pytest.raises(ManagedBrowserError) as error:
+        asyncio.run(resources.browserbase_for_job(job, "worker-1"))
+
+    assert error.value.code == "browserbase_credential_reconfiguration_required"
+
+
+def test_worker_fails_closed_for_unverified_tenant_browserbase_credential() -> None:
+    cipher = TokenCipher(TokenCipher.generate_key())
+    repository = FakeTenantRepository(
+        _bundle(cipher),
+        responses={
+            "get_application_job_browserbase_credential": {
+                "user_id": USER_ID,
+                "credential_ciphertext": cipher.encrypt("not inspected"),
+                "verification_status": "unverified",
+                "verification_code": "browserbase_unavailable",
+                "credential_source": "user",
+                "generation": 1,
+                "epoch": 1,
+                "binding_fingerprint": _browserbase_fingerprint("tenant-project"),
+            }
+        },
+    )
+    resources = SupabaseTenantResources(
+        repository,
+        cipher,
+        platform_browserbase_api_key="platform-browserbase-key",
+        platform_browserbase_project_id="platform-project",
+        resolve_browserbase_byok=True,
+    )
+    job = SimpleNamespace(id=JOB_ID, user_id=USER_ID)
+
+    with pytest.raises(ManagedBrowserError) as error:
+        asyncio.run(resources.browserbase_for_job(job, "worker-1"))
+
+    assert error.value.code == "browserbase_credential_reconfiguration_required"
+
+
+def test_worker_uses_platform_browserbase_only_when_tenant_row_is_absent(
+    monkeypatch: Any,
+) -> None:
+    cipher = TokenCipher(TokenCipher.generate_key())
+    repository = FakeTenantRepository(
+        _bundle(cipher),
+        responses={"get_application_job_browserbase_credential": None},
+    )
+    resources = SupabaseTenantResources(
+        repository,
+        cipher,
+        platform_browserbase_api_key="platform-browserbase-key",
+        platform_browserbase_project_id="platform-project",
+        resolve_browserbase_byok=True,
+    )
+    captured: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        browser_runtime_module,
+        "BrowserbaseClient",
+        lambda api_key, project_id: captured.append((api_key, project_id)) or object(),
+    )
+    job = SimpleNamespace(id=JOB_ID, user_id=USER_ID)
+
+    asyncio.run(resources.browserbase_for_job(job, "worker-1"))
+
+    assert captured == [("platform-browserbase-key", "platform-project")]
+
+
 def test_confirmed_submission_uses_exact_lease_bound_record_rpc() -> None:
     cipher = TokenCipher(TokenCipher.generate_key())
     repository = FakeTenantRepository(
@@ -2632,6 +2829,9 @@ class FakeManagedResources:
 
     async def resolve(self, _job: Any, _worker_id: str) -> ResolvedBrowserTask:
         return self.task
+
+    async def browserbase_for_job(self, _job: Any, _worker_id: str) -> Any:
+        return SimpleNamespace(project_id="platform-project")
 
     async def progress(self, *_args: Any) -> bool:
         return True

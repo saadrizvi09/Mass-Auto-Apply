@@ -516,7 +516,7 @@ def build_job_handler(
         [AutomationJob], HandlerOutcome | Awaitable[HandlerOutcome]
     ] = handle_job
     if (
-        settings.browserbase_configured
+        settings.managed_browser_available
         and settings.token_encryption_configured
         and settings.allowed_browser_providers
     ):

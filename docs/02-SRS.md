@@ -3,7 +3,7 @@
 ## AutoApply Cloud 2.0
 
 **Status:** Implementation baseline
-**Date:** 2026-08-13
+**Date:** 2026-08-15
 
 ## 1. System boundary
 
@@ -13,7 +13,7 @@ AutoApply Cloud consists of:
 2. a stateless FastAPI API deployed as a Vercel Function;
 3. Supabase Auth, Postgres, and private Storage;
 4. Google OAuth and Gmail API integration;
-5. transient, user-supplied Groq and Hunter integrations;
+5. encrypted account-scoped Groq, Hunter, and Browserbase BYOK integrations;
 6. credential-free discovery/import adapters;
 7. a durable job table and separately deployable Python worker; and
 8. optional managed-browser contexts for explicitly permitted providers.
@@ -26,8 +26,8 @@ loaded by the Vercel entrypoint.
 - **Anonymous visitor:** may view the landing page, product configuration, health, terms,
   and privacy information.
 - **Authenticated user:** owns a profile, résumés, connections, jobs, applications,
-  drafts, answer bank, audit history, and queued work; may hold Groq and Hunter keys in
-  their own browser for explicit provider requests.
+  drafts, answer bank, audit history, queued work, and encrypted Groq, Hunter, and
+  Browserbase credentials managed through authenticated APIs.
 - **Worker:** trusted service authenticated with the Supabase secret key; may claim jobs
   but must bind every operation to the claimed row's stored `user_id`.
 - **Operator:** configures Vercel/Supabase/Google/Browserbase and reviews operational
@@ -81,24 +81,30 @@ loaded by the Vercel entrypoint.
 - **RES-07:** Deleting a résumé shall remove that Storage object and résumé metadata but
   shall not delete or rewrite existing job, application, draft, send, or audit history.
 
-### AI — browser-persistent Groq key and drafting
+### AI — encrypted account-scoped Groq key and drafting
 
-- **AI-01:** The frontend shall save the user's Groq key in origin-scoped local storage.
-- **AI-02:** The key shall be masked after entry and removable by the user.
-- **AI-03:** Authenticated AI requests shall send it as `X-Groq-Api-Key` over HTTPS.
-- **AI-04:** The backend shall not store or log the key and shall reject missing or
-  malformed keys without echoing them.
-- **AI-05:** Key validation shall call a minimal Groq endpoint and return only valid/
-  invalid/provider status.
+- **AI-01:** `PUT /api/v1/provider-credentials/groq` shall validate the submitted Groq
+  key, encrypt a versioned JSON payload with `TOKEN_ENCRYPTION_KEY`, and persist only
+  ciphertext in the service-role-only `public.user_provider_credentials` table.
+- **AI-02:** The key shall be masked after entry and removable through
+  `DELETE /api/v1/provider-credentials/groq`; no read/status response shall return
+  plaintext or ciphertext.
+- **AI-03:** Authenticated AI requests shall resolve the owned encrypted credential on
+  the trusted server and decrypt it only for the requested provider operation.
+- **AI-04:** The backend shall not log or echo the key and shall reject missing,
+  malformed, corrupt, or undecryptable credentials without provider fallback.
+- **AI-05:** Key validation shall call a minimal Groq endpoint before persistence and
+  return only validity, safe status, model, timestamps, and a non-secret masked hint.
 - **AI-06:** Draft generation shall use the configured production model, the user's
   profile/résumé, and the selected JD; it shall not invent unsupported experience.
 - **AI-07:** A generated draft shall remain editable and unsent until explicitly
   approved.
-- **AI-08:** Background jobs shall never assume access to a browser-only Groq key.
-- **AI-09:** Groq local-storage keys shall be namespaced by authenticated user ID.
-  Sign-out shall preserve the signed-out user's key; explicit removal and successful
-  account deletion shall remove it. Clearing browser site data also removes it.
-- **AI-10:** `POST /api/v1/discovery/resume-guided` shall use the transient Groq key
+- **AI-08:** Background-job payloads shall never contain the Groq key; trusted code may
+  resolve it by the claimed job's persisted `user_id` only when that job requires it.
+- **AI-09:** Groq credentials shall be unique by authenticated user and provider.
+  Sign-out shall not delete the account credential; explicit removal and successful
+  account deletion shall delete its server-side row.
+- **AI-10:** `POST /api/v1/discovery/resume-guided` shall use the owned Groq credential
   and the owned active parsed résumé/profile to derive bounded roles and search terms,
   return those terms for inspection, and enqueue public discovery without copying the
   key into either automation-job payload.
@@ -106,16 +112,18 @@ loaded by the Vercel entrypoint.
   existing owned-job draft requests. Every generated application shall remain editable
   and require its own exact-content approval.
 
-### HUNT — browser-held Hunter contact lookup
+### HUNT — encrypted account-scoped Hunter contact lookup
 
-- **HUNT-01:** The frontend shall store an optional Hunter key only in origin-scoped,
-  authenticated-user-namespaced local storage and shall mask and delete it on the same
-  explicit browser/account lifecycle boundaries documented for browser-held keys.
-- **HUNT-02:** Authenticated Hunter requests shall transmit the key only over HTTPS in
-  `X-Hunter-Api-Key`; the key shall not enter a URL, database row, analytics event,
-  application log, provider error, or API response.
-- **HUNT-03:** `POST /api/v1/hunter/validate` shall make one bounded account check and
-  return only validity, safe status, and an allowlisted current quota summary.
+- **HUNT-01:** `PUT /api/v1/provider-credentials/hunter` shall validate an optional
+  Hunter key and persist only its encrypted versioned payload in
+  `public.user_provider_credentials`; the frontend shall retain no provider key in
+  local storage.
+- **HUNT-02:** Trusted Hunter requests shall decrypt the owned credential just in time;
+  the key shall not enter a URL, browser-readable row, analytics event, application log,
+  automation payload, provider error, or API response.
+- **HUNT-03:** Hunter credential validation shall make one bounded account check and
+  return only validity, safe status, timestamps, a masked hint, and an allowlisted
+  current quota summary.
 - **HUNT-04:** `POST /api/v1/jobs/{job_id}/contacts/hunter` shall enforce job ownership,
   require the owned job's company name, accept a contact limit from 1 through 10, and
   request HR-department contacts only.
@@ -123,8 +131,29 @@ loaded by the Vercel entrypoint.
   confidence, verification status, and domain fields. The user shall choose a contact;
   lookup shall not approve a draft or send a message.
 - **HUNT-06:** Hunter calls shall be explicit foreground requests. No operator Hunter
-  key, durable Hunter job, unattended contact crawl, or server-side key persistence
-  shall exist.
+  key, durable Hunter job, or unattended contact crawl shall exist. Account-scoped
+  server persistence is permitted only through the encrypted credential store.
+
+### CRED — account-scoped provider credentials
+
+- **CRED-01:** `GET /api/v1/provider-credentials` shall expose only safe status,
+  provider name, validation timestamps, and masked hints for `groq`, `hunter`, and
+  `browserbase`.
+- **CRED-02:** `PUT` and `DELETE /api/v1/provider-credentials/{provider}` shall accept
+  only those three provider IDs, derive ownership from the bearer token, and replace or
+  delete only that user's credential.
+- **CRED-03:** `public.user_provider_credentials` shall have no browser-role grants or
+  policies. All reads/writes require the service role and explicit `user_id` scoping.
+- **CRED-04:** Every payload shall be encrypted with the deployment's Fernet
+  `TOKEN_ENCRYPTION_KEY`; plaintext and ciphertext shall be absent from responses,
+  logs, analytics, audit detail, and automation payloads.
+- **CRED-05:** A missing, corrupt, or undecryptable credential shall fail closed with a
+  stable redacted error. The system shall not try another user's or stale credential.
+- **CRED-06:** On first authenticated use after upgrade, the frontend may import only
+  that user's namespaced legacy Groq/Hunter browser values through the normal validated
+  PUT endpoints. It shall delete a browser copy only after successful encrypted save;
+  failure shall retain it for an explicit retry and shall not use it as a fallback key
+  header. New credential saves shall never write provider secrets to browser storage.
 
 ### JOB — jobs and applications
 
@@ -169,7 +198,7 @@ loaded by the Vercel entrypoint.
   deduplicated by normalized URL when present. One tenant's discovery preferences,
   source cursors, or results shall never affect another tenant.
 - **DISC-10:** `POST /api/v1/discovery/resume-guided` shall require an active parsed
-  owned résumé and a transient Groq key, accept bounded location/remote/result options
+  owned résumé and an account-scoped Groq credential, accept bounded location/remote/result options
   plus an idempotency key, and return HTTP 202 with an inspectable plan and two redacted
   automation jobs.
 - **DISC-11:** The guided plan shall prefer saved target roles, then Groq-analyzed roles,
@@ -283,8 +312,9 @@ loaded by the Vercel entrypoint.
 - **CONN-02:** `linkedin` shall report `partner_required` for hosted apply automation.
 - **CONN-03:** LinkedIn profile/manual handoff may be used without storing LinkedIn
   credentials or cookies.
-- **CONN-04:** A managed-browser login may start only for an operator allowlisted
-  provider and when worker/browser configuration is complete.
+- **CONN-04:** A managed-browser login may start only for an operator-allowlisted
+  provider and when the worker can resolve either the account owner's valid Browserbase
+  BYOK credential or the optional platform fallback.
 - **CONN-05:** Managed browser contexts shall be isolated by `(user_id, provider)` and
   protected by a one-active-job lock.
 - **CONN-06:** Login/MFA input occurs inside the managed provider's Live View, not an
@@ -296,8 +326,8 @@ loaded by the Vercel entrypoint.
 - **CONN-09:** ZipRecruiter shall not appear in the hosted provider catalog, connection
   controls, accepted automation payloads, or worker handler registry.
 - **CONN-10:** A provider adapter shall remain unavailable until Browserbase is
-  configured, the operator allowlists it, and its current flow is validated with a
-  controlled test account/job.
+  available from the user's BYOK credential or platform fallback, the operator
+  allowlists it, and its current flow is validated with a controlled test account/job.
 - **CONN-11:** Connection availability shall not imply application capability. The
   catalog shall report Greenhouse as an aligned managed-browser handler and one-page
   Google Forms as scan plus explicit exact-approved background submit with verified
@@ -307,6 +337,16 @@ loaded by the Vercel entrypoint.
   Instahyre as connection-only until tenant-aware multi-step state machines exist. The
   generic exact-host company-form adapter shall remain internal/gated and absent from
   the public catalog. Multi-page or branching Google Forms shall remain unavailable.
+- **CONN-12:** Browserbase BYOK shall require both API key and Project ID. Validation
+  shall call Browserbase `GET /v1/projects/{project_id}` with `X-BB-API-Key`, require a
+  successful response whose ID matches, and shall not create a browser session.
+- **CONN-13:** Browser execution shall prefer the claimed job owner's encrypted
+  Browserbase credential. `BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_ID` may be used
+  only as a trusted platform fallback when that account has no BYOK credential.
+- **CONN-14:** Managed Browserbase sessions shall close immediately when work finishes
+  and use a 90-second stall cap. Product copy shall disclose Browserbase's one-minute
+  minimum billing period for every created session; reducing the cap shall not be
+  described as reducing the duration of successful runs.
 
 ### FORM — immutable application-form review
 
@@ -321,7 +361,7 @@ loaded by the Vercel entrypoint.
 - **FORM-03:** Approval shall name an exact owned revision and its expected hashes. A
   stale or mismatched revision/hash shall fail closed without queueing browser work.
 - **FORM-04:** When a newly scanned, unapproved revision is loaded and the authenticated
-  browser has a user-namespaced Groq key, the browser shall automatically request one
+  account has a usable Groq credential, the browser shall automatically request one
   set of grounded answer suggestions. The request shall be deduplicated per revision,
   use only the owned profile, linked résumé, job, and captured non-sensitive questions,
   and keep the key and suggested answers out of the worker payload. A missing/failed
@@ -372,23 +412,25 @@ loaded by the Vercel entrypoint.
 - **RUN-10:** Application-form jobs shall reference an owned immutable form revision;
   queue payloads shall not be accepted as an alternate source of answers or approval.
 - **RUN-11:** Durable discovery payloads may contain bounded résumé-derived search
-  terms, but shall contain no résumé text, Groq key, Hunter key, contact candidates, or
-  draft message content.
+  terms, but shall contain no résumé text, Groq key, Hunter key, Browserbase key/project
+  pair, contact candidates, or draft message content.
 
 ### OPS — public operation
 
 - **OPS-01:** `/api/v1/health` shall not contact tenant providers or expose secrets.
 - **OPS-02:** Errors shall use correct 4xx/5xx codes and a stable `{error:{code,message}}`
   shape with a request ID.
-- **OPS-03:** Logs shall exclude authorization headers, API keys, OAuth tokens, résumé
-  text, message bodies, browser context secrets, `X-Groq-Api-Key`, and
-  `X-Hunter-Api-Key`.
+- **OPS-03:** Logs shall exclude authorization headers, API keys, encrypted credential
+  payloads, OAuth tokens, résumé text, message bodies, and browser context secrets.
 - **OPS-04:** A clean deployment ignore list shall exclude local credentials, databases,
   PDFs, profiles, logs, screenshots, browser profiles, backups, and generated output.
 - **OPS-05:** Security headers shall include CSP, frame restrictions, MIME sniffing
   protection, referrer policy, and permissions policy.
 - **OPS-06:** Permanent account deletion shall require an Auth-verified sign-in no more
   than ten minutes old, in addition to the exact deletion confirmation.
+- **OPS-07:** `TOKEN_ENCRYPTION_KEY` shall be present and identical in Vercel and every
+  worker before provider credentials are accepted. Rotation requires an explicit
+  decrypt/re-encrypt migration; silently changing or losing it is prohibited.
 
 ## 4. Non-functional requirements
 
@@ -432,7 +474,7 @@ loaded by the Vercel entrypoint.
 | Public config/health | Read | Read | Read |
 | Profile/settings | None | CRUD own | Explicit user-bound access |
 | Résumé metadata/object | None | CRUD own prefix | Explicit job-user access |
-| Browser-held Groq/Hunter keys | None | Local browser control; transient authenticated header use only | None |
+| Groq/Hunter/Browserbase provider credentials | None | Configure/status/delete through authenticated API; no direct secret/ciphertext read | Resolve only for explicit owned provider work |
 | Jobs/applications/drafts | None | CRUD own | Explicit job-user access |
 | Discovery preferences/results | None | CRUD/read own | Explicit claimed-job user access |
 | Form revisions | None | Create/read/approve exact own revision | Scan/update only through service RPCs bound to claimed job |
@@ -448,10 +490,16 @@ loaded by the Vercel entrypoint.
 - Anonymous calls to every private endpoint return 401.
 - User A cannot select, mutate, delete, or sign URLs for User B's IDs/objects.
 - RLS tests repeat the same attacks through the Supabase REST API.
-- A Groq test key never appears in database writes, logs, errors, or API responses.
-- A Hunter test key never appears in URLs, database writes, logs, provider-error text,
-  automation payloads, or API responses; cross-tenant contact lookup fails before the
-  provider is called, and requested/results limits remain between 1 and 10.
+- Groq, Hunter, and Browserbase test secrets appear in the database only as ciphertext
+  in `user_provider_credentials`, and never appear in URLs, browser-readable queries,
+  logs, errors, automation payloads, analytics, or API responses.
+- Cross-tenant credential status, replacement, deletion, contact lookup, and browser
+  execution fail before a provider is called. Hunter requested/results limits remain
+  between 1 and 10.
+- Browserbase validation uses `GET /v1/projects/{project_id}` and creates no session;
+  invalid or mismatched key/project pairs are not saved. Browser jobs select owner BYOK
+  before platform fallback, stop after the 90-second stall cap, and close immediately
+  on normal completion.
 - OAuth state replay and cross-user callback attempts fail.
 - A newer OAuth start or disconnect makes an older Google callback stale; concurrent
   callback/disconnect execution cannot resurrect a disconnected connection.
@@ -475,8 +523,9 @@ loaded by the Vercel entrypoint.
 - Deterministic form mapping uses the reviewed graduation year for recognized passout/
   graduation questions and only the explicit public HTTPS résumé URL for recognized
   résumé-link questions; a private Storage path or signed URL is never substituted.
-- Sign-out retains the signed-out user's namespaced local Groq key without exposing it
-  to another signed-in user; explicit removal and account deletion remove it.
+- Sign-out retains account-scoped provider credentials without exposing them in browser
+  storage or to another signed-in user; explicit removal and account deletion remove
+  the matching service-only rows.
 - Worker claim concurrency gives a job to only one worker.
 - Telegram/RSS redirect and SSRF tests reject private/loopback/link-local/metadata hosts,
   oversized responses, and an item count above the configured bound.
@@ -518,8 +567,8 @@ loaded by the Vercel entrypoint.
   applications; Form Pilot retains ownership of those revisions, submissions, and
   needs-attention fallbacks.
 - Form Pilot browser tests prove a newly loaded eligible revision automatically makes
-  at most one transient Groq suggestion request, preserves editable/manual review on a
-  missing key or failure, never persists the key, and never grants approval.
+  at most one Groq suggestion request, preserves editable/manual review on a missing
+  credential or provider failure, never returns the key, and never grants approval.
 - A Google Forms canary proves exact latest-revision approval, complete required-answer
   preflight, one idempotent `application_submit`, and success only when the provider
   freshly confirms submission. Login/challenge/schema/confirmation uncertainty proves

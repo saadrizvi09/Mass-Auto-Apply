@@ -5,6 +5,7 @@
 .vercel/
 credentials.json
 token.json
+auth_link.html
 client_secret_*.json
 *.pem
 *.key

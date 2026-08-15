@@ -2,9 +2,9 @@
 
 ## AutoApply Cloud 2.0
 
-**Date:** 2026-08-13
+**Date:** 2026-08-15
 
-This runbook deploys the Vercel control plane, Supabase backend, credential-free
+This runbook deploys the Vercel control plane, Supabase backend, encrypted account-scoped BYOK,
 discovery, reviewed outreach, and reviewed Browserbase application workflow. The main
 sidebar journey is **Profile → Find jobs → Form Pilot → Mass Cold Email**; that last
 destination contains email-only **Build campaign → Review & send** subtabs. Form Pilot
@@ -25,9 +25,11 @@ below.
   projects/clients.
 - Cloudflare account and Turnstile widgets for the exact staging/production hosts.
 - Custom production domain with HTTPS.
-- Browserbase API key/project ID and a persistent worker host for managed-browser work.
-- Controlled Groq and Hunter test accounts/keys for the browser-held BYOK flows. These
-  are user inputs for staging verification, not deployment secrets.
+- A persistent worker host for managed-browser work. A controlled Browserbase API
+  key/project ID may be saved as account BYOK; operator Browserbase values are an
+  optional platform fallback.
+- Controlled Groq and Hunter test accounts/keys for encrypted account-scoped BYOK. These
+  are authenticated user inputs for staging verification, not deployment secrets.
 - Controlled test accounts and test job/form URLs for every browser provider enabled.
 - Python 3.12 for production-parity local tests.
 
@@ -47,7 +49,7 @@ credentials/data in the working directory. Deploy from a clean Git checkout and 
    ```
 
    Verify migrations were applied in filename order through
-   `202608140001_form_submit_attention_snapshot.sql`. Do not stop at
+   `202608150002_user_provider_credentials.sql`. Do not stop at
    `202608130001_google_forms_manual_submit.sql`: it is the temporary fail-closed
    prohibition. The required forward migration `202608130002_google_forms_approved_submit.sql`
    removes that prohibition and installs the exact-approved/required-answer submit gate;
@@ -57,6 +59,7 @@ credentials/data in the working directory. Deploy from a clean Git checkout and 
 
 4. Confirm all tenant tables show RLS enabled.
 5. Confirm `connection_secrets`, `user_google_oauth_clients`,
+   `user_provider_credentials`,
    `connection_lifecycles`, `oauth_states`, and `provider_send_events` have no `anon`
    or `authenticated` grants/policies.
 6. Confirm private bucket `resumes` exists with PDF/6 MB restrictions and policies for
@@ -274,7 +277,21 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 Store it as `TOKEN_ENCRYPTION_KEY` in Vercel and the worker. Do not commit or expose it.
 Back it up securely; losing it requires every user to reconnect Gmail and users of the
-advanced path to re-save their Google OAuth client.
+advanced path to re-save their Google OAuth client, Groq key, Hunter key, and
+Browserbase key/project pair. The value must be identical in the API and all workers.
+
+For an existing deployment, apply
+`202608150002_user_provider_credentials.sql` before deploying code that resolves stored
+credentials. Confirm the new table has RLS enabled, no browser grants/policies, and a
+service-role grant. Deploy API and worker with the same encryption key before the new
+frontend. On the first authenticated load, the frontend performs a one-time import of
+that user's namespaced legacy Groq/Hunter browser values through the normal validated
+PUT endpoints. It removes a legacy browser copy only after the encrypted account save
+succeeds (or when the same credential is already configured); on validation/network
+failure it keeps the browser copy, shows a warning, and allows a safe retry. The value
+must not be copied across users, logged, placed in a queue, or used as a fallback request
+header. Verify no legacy provider-key entry remains after successful import and no
+generation route requires transient key headers.
 
 ## 5. Local SaaS development
 
@@ -328,10 +345,11 @@ login-gated providers require user login inside Live View.
 
 Exercise the reviewed workflow in this order:
 
-1. Complete **Profile**, upload/parse the active résumé, and review the saved target
-   roles, skills, and location.
-2. In **Find jobs**, call `POST /api/v1/discovery/resume-guided` with the user's
-   transient `X-Groq-Api-Key`. Groq derives bounded roles/keywords from the résumé and
+1. Complete **Profile**, upload/parse the active résumé, review the saved target roles,
+   skills, and location, and save a Groq key through
+   `PUT /api/v1/provider-credentials/groq`. Confirm only a safe hint/status returns.
+2. In **Find jobs**, call `POST /api/v1/discovery/resume-guided`; the API resolves the
+   caller's encrypted Groq credential. Groq derives bounded roles/keywords from the résumé and
    profile, the API queues LinkedIn guest and public-feed jobs, and the worker filters
    Telegram/RSS results against those derived search terms. LinkedIn guest discovery is
    unofficial, bounded, and must not use login state or expose an Easy Apply action.
@@ -342,8 +360,8 @@ Exercise the reviewed workflow in this order:
    promotional links are ignored, forms appear in the tenant-scoped inbox from
    `GET /api/v1/discovery/google-forms`, and email applications are available in Mass
    Cold Email. The user explicitly starts preparation. When the scan returns, Form
-   Pilot automatically requests one grounded suggestion set with the transient
-   browser-held Groq key when available. Verify that graduation/passout questions map
+   Pilot automatically requests one grounded suggestion set with the account's stored
+   Groq credential when available. Verify that graduation/passout questions map
    deterministically from the reviewed profile year and résumé/CV link questions use
    only the separately saved public HTTPS résumé URL—not the private PDF path or a
    signed URL. The user reviews/edits the exact revision and chooses **Approve & submit
@@ -353,9 +371,9 @@ Exercise the reviewed workflow in this order:
    and may expose Live View. Parsing, suggestions, and scan never approve or submit on
    their own.
 4. In the **Build campaign** subtab of **Mass Cold Email**, add and validate the
-   browser-held Hunter key at the top of the view, then select no more than ten jobs.
+   encrypted account-scoped Hunter key at the top of the view, then select no more than ten jobs.
    Show projected credit use inline before the explicit lookup calls
-   `POST /api/v1/jobs/{id}/contacts/hunter` with transient `X-Hunter-Api-Key`, and let
+   `POST /api/v1/jobs/{id}/contacts/hunter`, which resolves the owned key, and let
    the user choose a contact for each job.
 5. Generate Groq email drafts, switch to the second **Review & send** subtab in the same
    destination, verify that ATS/form applications are excluded, and review and approve
@@ -395,6 +413,11 @@ BROWSERBASE_PROJECT_ID
 ALLOWED_BROWSER_PROVIDERS
 ```
 
+`BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_ID` are optional only as a pair. They
+provide a trusted platform fallback; a claimed job owner's verified encrypted
+Browserbase BYOK pair takes priority. If neither source exists, managed-browser work is
+unavailable while non-browser product features continue to work.
+
 Keep the allowlist empty until controlled staging validation. The exact initial
 allowlist recommendation is:
 
@@ -410,15 +433,16 @@ entry. Leave `cutshort` and `instahyre` out until tenant-aware multi-step applic
 state machines have been implemented and live-validated. Multi-page or branching Google
 Forms remain unsupported.
 
-The user's Groq key and Hunter key are not Vercel environment variables. Each is held
-in that user's browser and supplied transiently as `X-Groq-Api-Key` or
-`X-Hunter-Api-Key` only for the explicit provider request. `GOOGLE_REDIRECT_URI` is
+Users' Groq, Hunter, and Browserbase credentials are not Vercel environment variables.
+They are validated, encrypted with `TOKEN_ENCRYPTION_KEY`, and stored in the
+service-role-only `user_provider_credentials` table. The browser receives only safe
+status/hints and stores no provider secret. `GOOGLE_REDIRECT_URI` is
 required for both Gmail OAuth paths. `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are
 optional only when the deployment intentionally offers user-managed clients without a
 default platform client. These environment values enable Gmail send only; the
 Supabase Google login client is configured in Supabase itself. Neither is a
 Browserbase/Google Forms credential. `TOKEN_ENCRYPTION_KEY` encrypts Gmail tokens,
-user-managed Google client credentials, and opaque provider secrets; it must have the
+user-managed Google client credentials, account-scoped provider credentials, and opaque provider secrets; it must have the
 same value in trusted API and worker environments.
 
 Deploy a preview:
@@ -445,25 +469,29 @@ Do not promote until all pass:
 - deleting a résumé removes its object/metadata without deleting application history;
 - account deletion rejects a session whose last sign-in is older than ten minutes and
   succeeds after signing out and completing the normal protected sign-in flow again;
-- Groq key validates, generates a draft, survives refresh, and is absent from DB/logs;
-- `POST /api/v1/discovery/resume-guided` requires a parsed active résumé and transient
-  `X-Groq-Api-Key`, returns a bounded search plan, and queues both LinkedIn guest and
-  Telegram/RSS discovery without persisting the key;
+- `PUT /api/v1/provider-credentials/groq` validates and persists only encrypted
+  ciphertext; refresh returns only a safe hint/status, generation uses the owned key,
+  and no plaintext/ciphertext appears in responses, browser storage, or logs;
+- `POST /api/v1/discovery/resume-guided` requires a parsed active résumé and verified
+  owned Groq credential, returns a bounded search plan, and queues both LinkedIn guest
+  and Telegram/RSS discovery without placing the key in a job payload;
 - the worker applies the résumé-derived Groq roles/keywords before retaining
   Telegram/RSS results, while bounded LinkedIn guest discovery remains explicitly
   unofficial, credential-free, and separate from Easy Apply;
 - a newly loaded eligible Form Pilot revision automatically applies exact saved Profile
-  facts first and, when a browser-held key exists, requests Groq suggestions once for
+  facts first and, when an owned Groq credential exists, requests Groq suggestions once for
   unresolved questions; the review desk has no duplicate AI-fill action, suggestions
   remain unpersisted editable drafts, and never approve or enqueue a form action;
-- Groq key survives ordinary sign-out for the same user/browser, is not shown to another
-  signed-in user, and is removed by explicit deletion and account deletion;
+- Groq status survives refresh/sign-out because the encrypted credential is
+  account-scoped, another user cannot resolve or infer it, and explicit/account deletion
+  removes the service-role-only row;
 - job CRUD, draft edit, approval, archive, and application history work;
 - `GET /api/v1/discovery/google-forms` is tenant-scoped and deduplicated, and viewing
   the queue never starts a scan; an explicit scan records fields for the existing
   immutable review/approval flow;
-- the Hunter key validates through `POST /api/v1/hunter/validate`, remains browser-held,
-  is sent transiently as `X-Hunter-Api-Key`, and never appears in database rows or logs;
+- the Hunter key validates through `PUT /api/v1/provider-credentials/hunter`, persists
+  only as encrypted ciphertext, resolves for owned contact searches, and never appears
+  in responses, browser storage, queue payloads, or logs;
 - `POST /api/v1/jobs/{id}/contacts/hunter` enforces job ownership and a bounded contact
   result; the outreach UI shows the projected credit use inline, starts directly from
   the explicit lookup button, and requires an explicit user-selected contact;
@@ -524,6 +552,14 @@ Do not promote until all pass:
 - CAPTCHA, MFA, expired login, unknown required fields, and ambiguous confirmation stop
   visibly as `needs_attention`, may expose an allowlisted Live View, and are never
   bypassed, blindly retried, or reported as success;
+- Browserbase BYOK requires one API key plus Project ID and validates with read-only
+  `GET /v1/projects/{project_id}` without creating a session; an invalid/mismatched pair
+  is not stored, a valid owned pair takes priority over the optional platform fallback,
+  and the key/project always come from the same source;
+- every Browserbase session closes immediately on completion/failure and has a
+  90-second stall cap. Confirm in Browserbase Sessions that normal runs finish sooner;
+  remember every created session is billed for at least one minute, so the cap reduces
+  runaway/stalled usage rather than sub-minute minimum billing;
 - `/api/v1/health` reports ready without loading SQLite/Playwright/APScheduler;
 - deployment bundle contains none of `.env`, tokens, DBs, PDFs, profiles, browser data,
   logs, screenshots, generated outputs, or backups.
@@ -535,8 +571,9 @@ drafting, tracking, manual handoff, and reviewed single Gmail sends. Deploy the
 continuous worker on a persistent process host outside Vercel
 before enabling Telegram/RSS, LinkedIn guest discovery, or browser application jobs.
 Résumé-guided discovery queues the existing LinkedIn guest collector and passes its
-Groq-derived roles/keywords to the Telegram/RSS worker filter. The Groq key is used only
-by the short-lived API request and is never placed in the queue.
+Groq-derived roles/keywords to the Telegram/RSS worker filter. The API decrypts the
+account's Groq credential only for the owned request; the key is never placed in the
+queue.
 
 ### 8.1 Choose a worker host
 
@@ -589,13 +626,29 @@ resets the delay so the worker can drain queued work without an artificial pause
 successful HTTP polling is intentionally absent from the console; job lifecycle entries
 and redacted warnings remain logged.
 
-Managed browser additionally requires:
+Managed browser additionally requires the allowlist and either an account BYOK pair or
+this optional platform fallback pair:
 
 ```text
 BROWSERBASE_API_KEY
 BROWSERBASE_PROJECT_ID
 ALLOWED_BROWSER_PROVIDERS=google_forms,greenhouse
 ```
+
+Users create a Browserbase account at <https://www.browserbase.com/sign-up>, copy the
+API key from <https://www.browserbase.com/settings>, and copy the Project ID from
+<https://www.browserbase.com/overview>. Saving the pair calls Browserbase's read-only
+`GET /v1/projects/{project_id}` endpoint with `X-BB-API-Key`, requires the returned ID
+to match, and creates no session or browser-minute charge. The worker resolves the
+claimed job owner's encrypted BYOK pair first and uses the platform pair only when no
+owned pair exists.
+
+Close every session immediately after success/failure and retain a 90-second stall cap.
+This lowers usage for stuck work and makes the worst ordinary runaway session about two
+minutes, but it does not make successful sub-minute work free: Browserbase bills every
+created session for at least one minute. Consult the current
+[cost-optimization guide](https://docs.browserbase.com/optimizations/cost/cost-optimization)
+and [pricing page](https://www.browserbase.com/pricing) before launch.
 
 Normal verified Google Forms completion does not require `keepAlive`. If the product
 offers a retained Live View after `needs_attention`, the Browserbase plan and session
@@ -655,10 +708,10 @@ Worker health checks:
 - CAPTCHA/MFA/challenges and uncertain submit confirmation become `needs_attention`.
 
 Mocked tests are necessary but not live-provider evidence. Public enablement remains
-blocked until the operator supplies Browserbase credentials, a continuous worker host,
-and controlled test accounts/jobs and records a passing staging run for every enabled
-provider. Third-party markup and policies can change after deployment, so keep one-click
-provider disablement through the allowlist.
+blocked until a validated account BYOK pair or optional operator fallback is available,
+a continuous worker host and controlled test accounts/jobs exist, and a passing staging
+run is recorded for every enabled provider. Third-party markup and policies can change
+after deployment, so keep one-click provider disablement through the allowlist.
 
 ## 9. Production promotion
 
@@ -700,8 +753,8 @@ ledger tests, account deletion cleanup, and multi-worker lease/claim tests.
 
 - Never disable RLS to fix an application bug.
 - Never expose or use the Supabase secret key in the browser.
-- Never log request authorization, `X-Groq-Api-Key`, `X-Hunter-Api-Key`, or other
-  provider headers.
+- Never log request authorization, provider-credential request bodies, decrypted
+  credential envelopes, Browserbase CDP URLs, or other provider headers.
 - Never increase Gmail scopes casually; scope changes can require re-verification.
 - Never accept a per-user OAuth redirect/scope/endpoint or treat an API key as a Gmail
   OAuth client. Never expose a stored user client ID/secret or ciphertext to the
@@ -730,16 +783,20 @@ ledger tests, account deletion cleanup, and multi-worker lease/claim tests.
 - Migrations must be forward-compatible through one application release; avoid immediate
   destructive column removal.
 - On token-encryption-key exposure: stop provider actions, rotate key, re-encrypt stored
-  tokens, and require reconnect where integrity is uncertain.
+  tokens and Groq/Hunter/Browserbase credential envelopes, and require reconnect or
+  credential re-entry where integrity is uncertain.
 - On Supabase secret-key exposure: rotate immediately, audit all tenant tables/storage,
   and invalidate worker/API deployments.
 - On suspected cross-tenant access: disable private APIs, preserve redacted audit logs,
   assess affected rows/objects, fix both API scope and RLS, then notify as required.
-- On Groq browser-key exposure: instruct the affected user to revoke it in Groq Console;
-  the server has no stored copy to rotate.
-- On Hunter browser-key exposure: instruct the affected user to revoke or rotate it in
-  Hunter and remove the browser-held value. The server has no stored copy and there is
-  no Vercel/worker Hunter environment key to rotate.
+- On Groq/Hunter credential exposure: delete the affected encrypted credential from
+  AutoApply, instruct the user to revoke/rotate it with the provider, audit credential
+  access and generation changes, and save the replacement through the authenticated
+  API. There is no deployment-wide Groq/Hunter environment key.
+- On Browserbase BYOK exposure: stop the user's browser jobs, disconnect retained
+  contexts, delete the AutoApply credential, rotate the key in Browserbase Settings,
+  then validate/save the new key with the same Project ID. Rotate the operator fallback
+  separately if it was involved.
 - On Google revocation failure: confirm local encrypted rows are gone, keep the UI
   warning visible, and direct the user to remove access from their Google Account.
 - On a user-managed Google client-secret exposure: disconnect Gmail, rotate/delete the
@@ -765,15 +822,19 @@ ledger tests, account deletion cleanup, and multi-worker lease/claim tests.
 - [ ] No unsupported provider marketing or controls
 - [ ] Continuous worker deployed on a persistent host outside Vercel and lease recovery/
       monitoring verified
-- [ ] Browserbase key/project configured only in trusted environments
+- [ ] Account Browserbase BYOK setup links/status are present; API key and Project ID
+      validate through read-only project lookup without session creation, remain
+      encrypted/service-role-only, and take priority over the optional trusted fallback
+- [ ] Browser sessions close immediately and the 90-second stall cap is verified;
+      product copy discloses the one-minute minimum charge per created session
 - [ ] Initial `google_forms,greenhouse` allowlist reviewed; unsupported providers and ZipRecruiter absent
 - [ ] Live stage-appropriate validation recorded for every enabled provider; Google
       Forms specifically submits only the exact approved complete revision and requires
       fresh confirmation, while Live View appears only for `needs_attention`
 - [ ] Telegram/RSS and LinkedIn guest network bounds/partial failures exercised
-- [ ] Résumé-guided discovery tested with transient Groq BYOK and worker-side
+- [ ] Résumé-guided discovery tested with encrypted account-scoped Groq BYOK and worker-side
       Telegram/RSS relevance filtering
-- [ ] Google Forms queue tested for tenant isolation/deduplication, automatic transient
+- [ ] Google Forms queue tested for tenant isolation/deduplication, automatic stored-credential
       suggestion generation after scan, deterministic graduation/public-résumé mapping,
       exact review, one approval-bound idempotent submit, verified confirmation, and
       needs-attention-only Live View fallback
@@ -788,7 +849,8 @@ ledger tests, account deletion cleanup, and multi-worker lease/claim tests.
       Google-picker résumé uploads fail with `provider_login_required` without a
       context, and the same approved revision reuses only that tenant's saved Google
       context
-- [ ] Hunter BYOK validation/contact search tested without server persistence or logs
+- [ ] Hunter BYOK validation/contact search tested with encrypted service-role-only
+      persistence and without plaintext/ciphertext in responses, browser storage, or logs
 - [ ] Max-ten reviewed outreach tested end to end: inline credit disclosure, explicit
       lookup, contact choice, exact-draft approvals, final confirmation, and sequential
       gated Gmail sends; no ATS/form application appears in either Mass Cold Email subtab

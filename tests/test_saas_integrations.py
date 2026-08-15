@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -457,6 +458,40 @@ class FakeBrowserHttp:
     def request(self, *args: object, **kwargs: object) -> FakeResponse:
         self.calls.append((args, kwargs))
         return self.response
+
+
+def test_browserbase_project_validation_is_read_only_and_allowlisted() -> None:
+    http = FakeBrowserHttp(
+        FakeResponse(
+            200,
+            {
+                "id": "project-1",
+                "name": "Tenant project",
+                "concurrency": 3,
+                "defaultTimeout": 120,
+                "privateAccountField": "not returned",
+            },
+        )
+    )
+    client = BrowserbaseClient("api-secret", "project-1", http=http)
+
+    result = client.validate_project()
+
+    assert result == {
+        "valid": True,
+        "status": "ready",
+        "project_name": "Tenant project",
+        "concurrency": 3,
+        "default_timeout": 120,
+    }
+    assert "project_id" not in result
+    assert "project-1" not in json.dumps(result)
+    assert http.calls[0][0][:2] == (
+        "GET",
+        "https://api.browserbase.com/v1/projects/project-1",
+    )
+    assert http.calls[0][1]["headers"]["X-BB-API-Key"] == "api-secret"
+    assert "/sessions" not in str(http.calls)
 
 
 def test_browser_adapter_allowlists_returned_session_fields() -> None:

@@ -151,6 +151,44 @@ class BrowserbaseClient:
         self.timeout = (float(timeout[0]), float(timeout[1]))
         self._http = http or requests.Session()
 
+    def validate_project(self) -> dict[str, Any]:
+        """Verify that this key can access exactly the configured project.
+
+        Project validation is a read-only request and therefore does not create a
+        metered browser session.  Only a small allowlist is returned; provider
+        account data and the API key never cross the adapter boundary.
+        """
+
+        project_id = _identifier(self.project_id, "Browserbase project ID")
+        payload = self._request(
+            "GET", f"/projects/{quote(project_id, safe='')}"
+        )
+        if payload.get("id") != project_id:
+            raise BrowserbaseError(
+                "browserbase_project_mismatch",
+                "The Browserbase API key does not match the selected project.",
+            )
+        result: dict[str, Any] = {
+            "valid": True,
+            "status": "ready",
+        }
+        name = payload.get("name")
+        if isinstance(name, str) and name and len(name) <= 200 and not any(
+            character in name for character in ("\r", "\n", "\x00")
+        ):
+            result["project_name"] = name
+        concurrency = payload.get("concurrency")
+        if isinstance(concurrency, int) and not isinstance(concurrency, bool) and concurrency >= 0:
+            result["concurrency"] = concurrency
+        default_timeout = payload.get("defaultTimeout")
+        if (
+            isinstance(default_timeout, int)
+            and not isinstance(default_timeout, bool)
+            and default_timeout >= 0
+        ):
+            result["default_timeout"] = default_timeout
+        return result
+
     def _request(
         self,
         method: str,

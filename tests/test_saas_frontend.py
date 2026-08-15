@@ -426,19 +426,19 @@ def test_outreach_is_a_bounded_review_gated_workflow() -> None:
     ):
         assert step in outreach_view
     assert "Mass Cold Email" in INDEX_HTML
-    assert "Add your Hunter key" in outreach_view
+    assert "Add or replace your Hunter key" in outreach_view
     assert 'id="hunter-key-message"' in outreach_view
     assert outreach_view.index('id="hunter-setup-form"') < outreach_view.index('id="outreach-hero-heading"')
     assert outreach_view.index('id="hunter-setup-form"') < outreach_view.index('id="outreach-job-list"')
     assert "Select up to 10 saved jobs" in outreach_view
     assert "Nothing is sent automatically" in outreach_view
 
-    assert 'headers.set("X-Hunter-Api-Key", key)' in APP_JS
+    assert 'headers.set("X-Hunter-Api-Key", key)' not in APP_JS
     assert 'title: "Mass Cold Email"' in APP_JS
     assert 'id="referral-ingest-form"' not in outreach_view
     assert 'id="referral-digest"' not in outreach_view
     assert '"hunter-key-message"' in APP_JS
-    assert 'apiRequest("/hunter/validate"' in APP_JS
+    assert 'apiRequest(`/provider-credentials/${encodeURIComponent(provider)}`' in APP_JS
     assert '/contacts/hunter?limit=5' in APP_JS
     assert "state.outreachSelectedJobIds.size >= 10" in APP_JS
     assert "selected: contacts[0]?.email" not in APP_JS
@@ -579,17 +579,154 @@ def test_resume_and_groq_setup_are_consolidated_on_profile() -> None:
 
 
 def test_groq_validation_displays_the_provider_status_instead_of_a_generic_error() -> None:
-    assert 'groq_model_forbidden: { label: "Model blocked", tone: "status-warning" }' in APP_JS
-    assert 'groq_rate_limited: { label: "Rate limited", tone: "status-warning" }' in APP_JS
-    assert 'typeof payload?.message === "string"' in APP_JS
-    assert 'error?.code === "groq_request_rate_limited"' in APP_JS
-    assert 'pill.textContent = temporarilyLimited ? "Wait a moment" : "Validation failed"' in APP_JS
+    save_credential = APP_JS.split("async function saveProviderCredential", 1)[1].split(
+        "async function deleteProviderCredential", 1
+    )[0]
+    assert 'method: "PUT"' in save_credential
+    assert 'setCredentialMessage(provider, errorMessage(error' in save_credential
+    assert "Save &amp; validate" in INDEX_HTML
+    assert 'id="credential-groq-status"' in INDEX_HTML
     assert '"Groq did not accept this key."' not in APP_JS
 
 
+def test_account_credential_vault_supports_groq_hunter_and_browserbase_byok() -> None:
+    connections_view = INDEX_HTML.split('id="view-connections"', 1)[1].split(
+        'id="view-automation"', 1
+    )[0]
+    for identifier in (
+        "provider-credential-vault",
+        "credential-vault-status",
+        "credential-card-groq",
+        "credential-groq-api-key",
+        "credential-card-hunter",
+        "credential-hunter-api-key",
+        "credential-card-browserbase",
+        "credential-browserbase-api-key",
+        "credential-browserbase-project-id",
+    ):
+        assert f'id="{identifier}"' in connections_view
+
+    assert connections_view.index('id="provider-credential-vault"') < connections_view.index(
+        'id="connection-list"'
+    )
+    assert 'href="https://www.browserbase.com/sign-up"' in connections_view
+    assert 'href="https://www.browserbase.com/settings"' in connections_view
+    assert 'href="https://www.browserbase.com/overview"' in connections_view
+    assert 'href="https://docs.browserbase.com/welcome/getting-started"' in connections_view
+    assert "Copy API key" in connections_view
+    assert "Copy Project ID" in connections_view
+    assert 'type="password"' in connections_view
+    assert "Usage is charged to your Browserbase account" in connections_view
+    assert ".credential-card-grid" in STYLES_CSS
+
+    load_credentials = APP_JS.split("async function loadProviderCredentials", 1)[1].split(
+        "function providerCredentialVerifiedCopy", 1
+    )[0]
+    assert 'apiRequest("/provider-credentials"' in load_credentials
+    assert "Array.isArray(data?.items)" in APP_JS
+    save_credentials = APP_JS.split("async function saveProviderCredential", 1)[1].split(
+        "async function deleteProviderCredential", 1
+    )[0]
+    assert 'method: "PUT"' in save_credentials
+    assert 'provider === "browserbase" ? { project_id: projectId }' in save_credentials
+    delete_credentials = APP_JS.split("async function deleteProviderCredential", 1)[1].split(
+        "function focusProviderCredential", 1
+    )[0]
+    assert 'method: "DELETE"' in delete_credentials
+    assert 'headers.set("X-Groq-Api-Key"' not in APP_JS
+    assert 'headers.set("X-Hunter-Api-Key"' not in APP_JS
+    assert 'provider !== "browserbase" || credential.verification_status === "verified"' in APP_JS
+    normalize_credentials = APP_JS.split("function normalizedProviderCredential", 1)[1].split(
+        "function replaceProviderCredentialState", 1
+    )[0]
+    assert "{ ...candidate" not in normalize_credentials
+    assert "candidate.credential_ciphertext" not in normalize_credentials
+    assert "candidate.api_key" not in normalize_credentials
+    assert "api_key:" not in normalize_credentials
+    assert "const keyHint = rawHint" in normalize_credentials
+    for safe_field in (
+        "verification_status",
+        "verification_code",
+        "verified_at",
+        "updated_at",
+        "key_hint",
+        "project_id_hint",
+        "requires_reconfiguration",
+    ):
+        assert safe_field in normalize_credentials
+    clear_private = APP_JS.split("function clearPrivateState", 1)[1].split(
+        "function setSession", 1
+    )[0]
+    assert "state.providerCredentials = { groq: {}, hunter: {}, browserbase: {} }" in clear_private
+    assert "state.providerCredentialMigrationUserId = null" in clear_private
+
+
+def test_contextual_groq_and_hunter_forms_use_the_same_account_vault_api() -> None:
+    profile_view = INDEX_HTML.split('id="view-profile"', 1)[1].split(
+        'id="view-discovery"', 1
+    )[0]
+    outreach_view = INDEX_HTML.split('id="view-outreach"', 1)[1].split(
+        'id="view-jobs"', 1
+    )[0]
+    assert 'id="groq-form"' in profile_view
+    assert 'data-provider-credential="groq"' in profile_view
+    assert 'id="groq-key"' in profile_view
+    assert 'Add or replace your Groq key' in profile_view
+    assert 'id="hunter-setup-form"' in outreach_view
+    assert 'data-provider-credential="hunter"' in outreach_view
+    assert 'id="hunter-api-key"' in outreach_view
+    assert 'id="hunter-saved-summary"' in outreach_view
+    assert 'id="hunter-masked-key"' in outreach_view
+    assert 'Add or replace your Hunter key' in outreach_view
+    assert 'all("[data-provider-credential]").forEach' in APP_JS
+    assert "saveGroqKey" not in APP_JS
+    assert "saveHunterKey" not in APP_JS
+    assert "localStorage.setItem(storageKey, value)" not in APP_JS
+
+
+def test_account_switch_clears_typed_secrets_and_restores_only_masked_server_status() -> None:
+    clear_private = APP_JS.split("function clearPrivateState", 1)[1].split(
+        "function setSession", 1
+    )[0]
+    set_session = APP_JS.split("function setSession", 1)[1].split(
+        "function identitySnapshot", 1
+    )[0]
+    load_workspace = APP_JS.split("async function loadWorkspace", 1)[1].split(
+        "function updateUserIdentity", 1
+    )[0]
+    normalize_credentials = APP_JS.split("function normalizedProviderCredential", 1)[1].split(
+        "function replaceProviderCredentialState", 1
+    )[0]
+
+    assert 'all("[data-provider-credential]").forEach((form) => form.reset())' in clear_private
+    assert "if (nextUserId !== state.identityUserId)" in set_session
+    assert "clearPrivateState();" in set_session
+    assert "loadProviderCredentials(true, identity)" in load_workspace
+    assert "key_hint: keyHint" in normalize_credentials
+    assert "candidate.api_key" not in normalize_credentials
+    assert "candidate.credential_ciphertext" not in normalize_credentials
+    assert "input.value = credential" not in APP_JS
+
+
+def test_legacy_browser_keys_migrate_once_and_are_removed_only_after_server_save() -> None:
+    migration = APP_JS.split("async function migrateLegacyProviderCredentials", 1)[1].split(
+        "async function loadProviderCredentials", 1
+    )[0]
+    assert "state.providerCredentialMigrationUserId === identity.userId" in migration
+    assert "getLegacyGroqKey(identity.userId)" in migration
+    assert "getLegacyHunterKey(identity.userId)" in migration
+    assert 'method: "PUT"' in migration
+    assert migration.index('await apiRequest(`/provider-credentials/${encodeURIComponent(provider)}`') < migration.index(
+        "removeLegacyProviderKey(provider, identity.userId);",
+        migration.index('await apiRequest(`/provider-credentials/${encodeURIComponent(provider)}`'),
+    )
+    assert "The browser copy was kept so you can retry safely." in APP_JS
+    assert "BROWSERBASE_STORAGE_PREFIX" not in APP_JS
+
+
 def test_local_frontend_assets_are_versioned_to_avoid_stale_validation_code() -> None:
-    assert 'href="/styles.css?v=20260815.1"' in INDEX_HTML
-    assert 'src="/app.js?v=20260815.1"' in INDEX_HTML
+    assert 'href="/styles.css?v=20260815.3"' in INDEX_HTML
+    assert 'src="/app.js?v=20260815.3"' in INDEX_HTML
 
 
 def test_ziprecruiter_is_not_presented_in_hosted_frontend() -> None:
@@ -767,7 +904,7 @@ def test_form_pilot_merges_server_profile_answers_without_an_extra_resume_input(
     request_suggest = APP_JS.split("async function requestFormSuggestions", 1)[1].split(
         "async function maybeSuggestFormAnswers", 1
     )[0]
-    assert '...(getGroqKey() ? { groq: true } : {})' in request_suggest
+    assert '...(credentialConfigured("groq") ? { groq: true } : {})' in request_suggest
     assert 'id="suggest-form-answers"' not in form_pilot_view
     assert "Regenerate with Groq" not in form_pilot_view
     assert 'byId("suggest-form-answers").addEventListener' not in APP_JS

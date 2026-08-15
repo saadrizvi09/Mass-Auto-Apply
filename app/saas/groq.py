@@ -1,7 +1,10 @@
 """Small, stateless Groq adapter for the hosted application.
 
-The caller supplies a user's browser-held API key for every request.  This module
-never logs, caches, or returns that key.
+The trusted control plane either validates a newly submitted key or resolves an
+account-scoped, encrypted provider credential and supplies its plaintext only for
+the current operation.  Credential storage, decryption, and one-time migration of
+legacy browser keys live outside this adapter; this module never logs, caches, or
+returns a supplied key.
 """
 from __future__ import annotations
 
@@ -67,7 +70,7 @@ def _response_json(response: requests.Response) -> dict[str, Any]:
 
 
 def validate_groq_key(key: str, model: str) -> dict[str, Any]:
-    """Validate a transient API key and model without generating paid output.
+    """Validate a resolved API key and model without generating paid output.
 
     Validation failures are returned as a stable, secret-free result so a settings
     screen can display them directly.  The key itself is never included.
@@ -404,7 +407,7 @@ def generate_application_draft(
     job: Mapping[str, Any] | Any,
     resume_text: str,
 ) -> dict[str, str]:
-    """Generate one factual, job-specific cold-email draft using a transient key."""
+    """Generate one factual, job-specific cold-email draft with a resolved key."""
 
     clean_key = _clean_required(key, "key")
     clean_model = _clean_required(model, "model")

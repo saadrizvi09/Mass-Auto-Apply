@@ -3566,6 +3566,18 @@ button[data-busy="true"] {
   border-radius: var(--radius);
 }
 
+.hunter-setup-form > .stack-form {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  align-items: end;
+  gap: 12px 16px;
+}
+
+.hunter-setup-form > .stack-form .field {
+  margin-bottom: 0;
+}
+
 .hunter-key-actions,
 .outreach-stage-actions {
   display: flex;
@@ -4420,6 +4432,203 @@ button[data-busy="true"] {
   background:
     linear-gradient(120deg, rgb(20 45 54 / 97%), rgb(36 79 71 / 94%)),
     var(--navy);
+}
+
+.credential-vault {
+  position: relative;
+  padding: clamp(24px, 3vw, 38px);
+  margin-bottom: 22px;
+  overflow: hidden;
+  scroll-margin-top: 126px;
+  background:
+    linear-gradient(145deg, rgb(255 255 255 / 98%), rgb(244 247 242 / 92%)),
+    var(--surface);
+  border-top: 4px solid var(--sage-deep);
+}
+
+.credential-vault::after {
+  position: absolute;
+  width: 210px;
+  height: 210px;
+  right: -112px;
+  bottom: -126px;
+  content: "";
+  pointer-events: none;
+  background: radial-gradient(circle, rgb(217 101 62 / 13%), transparent 68%);
+}
+
+.credential-vault-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+
+.credential-vault-heading h2 {
+  margin-bottom: 8px;
+}
+
+.credential-vault-heading p:last-child {
+  max-width: 760px;
+  margin-bottom: 0;
+  color: var(--ink-soft);
+}
+
+.credential-vault-message {
+  margin-bottom: 20px;
+}
+
+.credential-card-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.credential-card {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 350px;
+  flex-direction: column;
+  padding: 20px;
+  background: rgb(255 255 255 / 84%);
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--blue-deep);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+}
+
+.credential-card[data-credential-provider="hunter"] {
+  border-top-color: var(--sage-deep);
+}
+
+.credential-card.is-browserbase {
+  border-top-color: #e65c2f;
+}
+
+.credential-card-heading {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 15px;
+}
+
+.credential-card-heading h3,
+.credential-card-heading .eyebrow {
+  margin-bottom: 0;
+}
+
+.credential-card-heading .status-pill {
+  white-space: nowrap;
+}
+
+.credential-provider-mark {
+  display: inline-grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  color: #fff;
+  background: var(--blue-deep);
+  border-radius: 11px;
+  font-size: 0.66rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+}
+
+.credential-provider-mark.is-hunter {
+  background: var(--sage-deep);
+}
+
+.credential-provider-mark.is-browserbase {
+  background: #e65c2f;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 1rem;
+}
+
+.credential-card > p {
+  min-height: 64px;
+  margin-bottom: 16px;
+  color: var(--ink-soft);
+  font-size: 0.74rem;
+}
+
+.credential-summary {
+  display: grid;
+  gap: 7px;
+  padding: 15px;
+  margin-bottom: 14px;
+  color: var(--ink-soft);
+  background: var(--sage-soft);
+  border: 1px solid #cbdac9;
+  border-radius: var(--radius-sm);
+}
+
+.credential-summary code {
+  overflow: hidden;
+  color: var(--ink);
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.credential-summary small,
+.credential-summary strong {
+  font-size: 0.68rem;
+}
+
+.credential-summary .button-row {
+  margin-top: 7px;
+}
+
+.credential-form {
+  margin-bottom: 12px;
+}
+
+.credential-form .field {
+  margin-bottom: 11px;
+}
+
+.credential-provider-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: auto;
+  color: var(--accent-dark);
+  font-size: 0.7rem;
+  font-weight: 800;
+}
+
+.credential-provider-link.is-muted {
+  color: var(--ink-soft);
+}
+
+.credential-link-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 14px;
+  margin-top: auto;
+}
+
+.credential-link-row .credential-provider-link {
+  margin-top: 0;
+}
+
+.credential-card .form-message {
+  min-height: 0;
+  margin-top: 10px;
+}
+
+@media (max-width: 1120px) {
+  .credential-card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .credential-card.is-browserbase {
+    grid-column: 1 / -1;
+    min-height: 0;
+  }
 }
 
 .connection-grid {
@@ -5946,9 +6155,28 @@ button[data-busy="true"] {
   }
 
   .activity-strip,
+  .credential-card-grid,
   .connection-grid,
   .discovery-clippings {
     grid-template-columns: 1fr;
+  }
+
+  .credential-card.is-browserbase {
+    grid-column: auto;
+  }
+
+  .credential-vault-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .credential-card-heading {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .credential-card-heading > .status-pill {
+    grid-column: 2;
+    justify-self: start;
   }
 
   .source-ledger {
@@ -5987,6 +6215,10 @@ button[data-busy="true"] {
   }
 
   .hunter-setup-form {
+    grid-template-columns: 1fr;
+  }
+
+  .hunter-setup-form > .stack-form {
     grid-template-columns: 1fr;
   }
 

@@ -3,9 +3,10 @@
 AutoApply Cloud is a multi-user job-application workspace designed for Vercel and
 Supabase. Each user signs in, uploads a private PDF résumé, maintains their own profile
 and job pipeline, derives bounded public-job searches from that résumé, finds a
-recruiting contact with a browser-held Hunter key, drafts tailored outreach with a
-browser-held Groq key, connects Gmail through OAuth, reviews every message, and tracks
-applications.
+recruiting contact with an account-scoped Hunter key, drafts tailored outreach with an
+account-scoped Groq key, connects Gmail through OAuth, reviews every message, and tracks
+applications. User-supplied provider credentials are encrypted before service-role-only
+persistence, so they follow the account across browsers without becoming browser data.
 
 The hosted application is the supported product entrypoint. The earlier single-user
 desktop implementation remains in the repository only as migration/reference code and
@@ -18,8 +19,9 @@ is never imported by the Vercel application.
 | Authentication | Supabase email/password sign-up, confirmation, sign-in, reset, and sign-out, with Turnstile on public auth flows and recent sign-in enforcement for account deletion |
 | Tenant isolation | Every user-owned database row and résumé object is protected by Supabase RLS |
 | Résumés and profile facts | Up to five fixed private Storage slots, atomic registration/activation, PDF parsing, and conservative profile suggestions. A user-supplied public HTTPS résumé URL is stored separately from the private PDF; common graduation/passout questions use `graduation_year`, while recognized résumé/CV URL questions use only that public URL. |
-| Groq | Per-user key persists in that browser's `localStorage`; sign-out preserves it, while explicit removal/account deletion clears it; the key supports résumé-guided search planning, reviewed email drafts, and one automatic grounded suggestion request when an eligible Form Pilot revision loads |
-| Hunter | Optional per-user key stays in the browser and is sent transiently as `X-Hunter-Api-Key` only for explicit validation/contact searches; no deployment-level Hunter key is required |
+| Groq | A per-user key is validated, encrypted with `TOKEN_ENCRYPTION_KEY`, and stored in the service-role-only `user_provider_credentials` table. API responses expose only safe status/hints; the key supports résumé-guided search planning, reviewed email drafts, and one automatic grounded suggestion request when an eligible Form Pilot revision loads. |
+| Hunter | An optional per-user key uses the same encrypted account-scoped credential store. It is decrypted only for an explicit validation/contact search and is never returned to the browser; no deployment-level Hunter key is required. |
+| Browserbase | A user may bring a Browserbase API key and Project ID. AutoApply validates the pair without creating a session, stores the encrypted pair per account, and prefers it for that user's browser work. Trusted deployment credentials are an optional platform fallback. |
 | Discovery | Résumé-guided Groq terms for bounded Telegram/RSS filtering and LinkedIn guest search, full referral-digest parsing, CSV/XLSX imports, individual ATS URL detection, a review queue for discovered Google Forms, and bounded public-board enumeration |
 | Jobs | Review/deduplicate discovered roles, save job descriptions and URLs, edit/archive records, and create tailored drafts |
 | Applications | Form Pilot owns Google Form scan, answer review, and one explicit **Approve & submit in background** action. The worker submits only the exact approved revision and reports success only after fresh provider confirmation; Browserbase Live View appears only when a run needs attention. Mass Cold Email separately handles only email drafts, exact approval, sequential Gmail sending, and status/history. |
@@ -41,9 +43,9 @@ Email**. The final destination contains two ordered subtabs: **Build campaign �
 & send**.
 
 1. **Profile:** complete the applicant profile, upload and parse an active résumé, and
-   save a Groq key in the current browser.
-2. **Find jobs:** `POST /api/v1/discovery/resume-guided` sends the key transiently in
-   `X-Groq-Api-Key`, derives bounded roles/keywords from the owned résumé and profile,
+   save an encrypted account-scoped Groq key.
+2. **Find jobs:** `POST /api/v1/discovery/resume-guided` resolves the user's stored Groq
+   credential server-side, derives bounded roles/keywords from the owned résumé/profile,
    and queues LinkedIn guest plus Telegram/RSS discovery. The worker applies the
    derived terms to Telegram/RSS candidates before saving them. LinkedIn remains an
    unofficial, best-effort guest source with no login or Easy Apply.
@@ -53,20 +55,20 @@ Email**. The final destination contains two ordered subtabs: **Build campaign �
    Forms into its preparation inbox; and makes email applications available in **Mass
    Cold Email**. After an explicit scan returns its immutable revision, the signed-in
    browser automatically applies exact saved Profile facts and asks Groq only for
-   unresolved questions when a browser-held key is available. There is no duplicate
+   unresolved questions when a stored Groq credential is available. There is no duplicate
    AI-fill action. The user reviews the exact answers and chooses **Approve & submit in
    background** once. The API seals that immutable revision, verifies that every
    required answer is complete, and queues an idempotent submit. The worker fills only
    those sealed values and reports success only after it observes a fresh Google Forms
    confirmation. Live View is exposed only when the run stops at `needs_attention`;
    parsing, scanning, and suggestion generation never approve or submit by themselves.
-4. **Mass Cold Email — Build campaign:** add and validate a browser-held Hunter key at
+4. **Mass Cold Email — Build campaign:** add and validate an encrypted account-scoped Hunter key at
    the top of the view, select at most 10 saved jobs, review the projected Hunter credit
    use shown inline, start the lookup, choose one returned recruiting contact per job,
    and ask Groq to create editable drafts.
    `POST /api/v1/hunter/validate` and
-   `POST /api/v1/jobs/{id}/contacts/hunter` receive the browser-held key only as
-   `X-Hunter-Api-Key`; the server does not store it.
+   `POST /api/v1/jobs/{id}/contacts/hunter` resolve the owned encrypted credential
+   server-side and never return it.
    Open the second **Review & send** subtab to review and approve the exact content of
    every application individually, then confirm the final send. The browser invokes
    the existing one-message Gmail endpoint sequentially for at most 10 approved
@@ -81,9 +83,9 @@ and every provider send remain explicit.
 ## Discovery and application review
 
 Users can bring jobs into their own workspace through credential-free public sources
-and, for résumé-guided planning, an optional browser-held Groq key:
+and, for résumé-guided planning, an optional encrypted account-scoped Groq key:
 
-- derive roles and keywords from the active parsed résumé with the transient Groq key,
+- derive roles and keywords from the active parsed résumé with the stored Groq key,
   then queue both public-feed and LinkedIn guest searches;
 - fetch configured Telegram public-channel previews and RSS feeds through bounded HTTP
   requests, filtering their results against those résumé-derived search terms when the
@@ -107,7 +109,7 @@ scan, approval, submit, or send follows automatically.
 saved Google Forms jobs and form links found in saved-job metadata. Queue membership
 does not start browser automation: the user must save a metadata-only form when needed
 and request a scan. When that asynchronous scan returns, the browser automatically
-requests grounded suggestions when its user-namespaced Groq key is present. The user
+requests grounded suggestions when the account has a Groq credential. The user
 reviews the exact revision and explicitly approves it for background submission in one
 action. A run is marked submitted only when the worker returns
 `code=application_submitted` with `submission_state=confirmed`; otherwise it stops
@@ -121,10 +123,10 @@ The 4 MB spreadsheet cap leaves margin under Vercel's Function payload limit. R�
 PDFs still upload directly to Supabase Storage and keep their separate 6 MiB limit.
 
 Application automation uses sealed form revisions. A scan records the exact fields,
-résumé selection, and schema hash. When possible, the browser immediately asks Groq for
+résumé selection, and schema hash. When possible, the browser immediately asks the API for Groq
 factual answer suggestions grounded in the owned profile, linked résumé, job, and
-captured non-sensitive questions. The key and suggestions do not enter the worker
-queue, and the suggestions never approve themselves. The first approval atomically
+captured non-sensitive questions. The key never enters the worker queue, and the
+suggestions never approve themselves. The first approval atomically
 seals the exact answers the user reviewed. After sealing, any field, answer, résumé, or
 schema change requires a new revision. For Google Forms, the normal path queues a
 single approval-bound `application_submit` job. The worker revalidates the latest
@@ -160,28 +162,62 @@ résumé removes that object and its résumé metadata, not the user's applicati
 Browser (public SPA)
   ├─ Supabase Auth session
   ├─ private direct résumé upload
-  ├─ browser-only Groq + Hunter keys
   └─ non-authoritative outreach selection (maximum 10)
             │ bearer JWT
             ▼
 Vercel FastAPI control plane
   ├─ validates the current Supabase user
   ├─ accesses tenant rows with the user's JWT/RLS
-  ├─ runs foreground Groq drafting
-  ├─ proxies explicit, transient Hunter validation/contact searches
+  ├─ resolves account-scoped encrypted Groq/Hunter credentials just in time
+  ├─ runs foreground Groq drafting and explicit Hunter contact searches
   ├─ ingests bounded paste/file discovery
   └─ manages Google OAuth and reviewed Gmail sends
             │
             ├─ Supabase Postgres + private Storage
-            ├─ Groq + Hunter (transient user keys)
+            ├─ Groq + Hunter (decrypted only for the owned request)
             └─ persistent worker
                  ├─ résumé-term-filtered Telegram/RSS + LinkedIn guest discovery
                  ├─ Greenhouse/Lever/Ashby public-board discovery
                  └─ Browserbase scan + exact-approved submit + verified confirmation
+                    (user BYOK first; optional platform fallback)
 ```
 
 No SQLite database, local browser profile, APScheduler job, or process-global user state
 is used by `app.saas_main:app`.
+
+### Account-scoped provider credentials
+
+`GET /api/v1/provider-credentials` returns safe connection status and masked hints for
+`groq`, `hunter`, and `browserbase`. `PUT` and `DELETE`
+`/api/v1/provider-credentials/{provider}` validate/replace or remove the authenticated
+user's credential. The API encrypts a versioned JSON payload with
+`TOKEN_ENCRYPTION_KEY` and writes only ciphertext to the service-role-only
+`public.user_provider_credentials` table. Browser clients and authenticated database
+roles cannot read that table, ciphertext, or plaintext, and no API response returns a
+saved key.
+
+During the upgrade from the former browser-local Groq/Hunter design, the authenticated
+frontend performs a one-time import of only the signed-in user's namespaced legacy
+values through these same validated PUT endpoints. It removes a browser copy only after
+the encrypted save succeeds; a failed import keeps the copy and shows a retry warning.
+New credentials are never written to browser storage.
+
+Browserbase BYOK requires an API key and Project ID. New users can
+[create a free Browserbase account](https://www.browserbase.com/sign-up); existing
+users can copy credentials from [Browserbase Settings](https://www.browserbase.com/settings)
+or [Overview](https://www.browserbase.com/overview). Validation performs a read-only
+`GET /v1/projects/{project_id}` with `X-BB-API-Key`, verifies the returned ID, and does
+not create or charge a browser session. At execution time the worker prefers the
+claimed job owner's Browserbase credential and uses `BROWSERBASE_API_KEY` plus
+`BROWSERBASE_PROJECT_ID` only as an optional platform fallback.
+
+The managed-browser stall cap is 90 seconds. Successful runs still close immediately,
+so lowering this cap affects only stalled work. Browserbase applies a one-minute
+minimum billing period to each created session; therefore a run that finishes in less
+than one minute still consumes at least one browser minute. See Browserbase's
+[cost-optimization guidance](https://docs.browserbase.com/optimizations/cost/cost-optimization),
+[project validation API](https://docs.browserbase.com/reference/api/get-a-project), and
+[current pricing](https://www.browserbase.com/pricing).
 
 ## Local cloud-mode setup
 
@@ -356,19 +392,21 @@ or allowlist entry. Leave `cutshort` and `instahyre` out until their tenant-awar
 multi-step state machines exist and pass live staging. `google_forms` covers one-page
 forms only.
 
-The Browserbase values are required only for managed-browser login and application
-jobs. `GOOGLE_REDIRECT_URI` is the deployment's one fixed Gmail callback. The
+The Browserbase values are optional platform fallback credentials for managed-browser
+login and application jobs. An account's validated Browserbase BYOK pair takes
+priority; if neither source exists, browser work fails closed as unavailable.
+`GOOGLE_REDIRECT_URI` is the deployment's one fixed Gmail callback. The
 `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` variables are optional only when every
 Gmail user will configure the advanced user-managed client; setting both enables the
 default platform-managed path. These values do not enable Supabase Google account
 login and do not connect Google Forms.
-`TOKEN_ENCRYPTION_KEY` is required for Gmail token storage and user-managed OAuth
-client storage, and is shared by trusted API/worker environments for encrypted provider
-context identifiers.
+`TOKEN_ENCRYPTION_KEY` is required for Gmail token storage, user-managed OAuth clients,
+account-scoped Groq/Hunter/Browserbase credentials, and encrypted provider context
+identifiers. It must be identical in every trusted API/worker environment.
 
 There is deliberately no `HUNTER_API_KEY` deployment variable. A user may keep their
-own Hunter key in this browser; explicit Hunter requests send it over HTTPS in the
-`X-Hunter-Api-Key` header and the API neither persists nor returns it.
+own Hunter key in their encrypted account credential; explicit Hunter requests decrypt
+it only for the provider call and the API never returns it.
 
 Then deploy a preview and promote only after the runbook checks pass:
 
@@ -409,8 +447,9 @@ The worker needs `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `TOKEN_ENCRYPTION_KEY`,
 `WORKER_ID`, `WORKER_POLL_SECONDS`, `WORKER_MAX_IDLE_POLL_SECONDS`, and
 `WORKER_LEASE_SECONDS`. It polls at the short interval when work is active, backs off
 toward the idle ceiling after consecutive empty claims, and resets immediately after a
-claim. Browser work additionally needs `BROWSERBASE_API_KEY`,
-`BROWSERBASE_PROJECT_ID`, and the exact provider allowlist above. Keep the allowlist
+claim. Browser work additionally needs the exact provider allowlist above and either
+an account-scoped Browserbase BYOK credential or the platform fallback
+`BROWSERBASE_API_KEY`/`BROWSERBASE_PROJECT_ID`. Keep the allowlist
 empty until staging has exercised Greenhouse and one-page Google Forms, then begin with
 only those two entries.
 

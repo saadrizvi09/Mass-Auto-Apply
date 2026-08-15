@@ -1,6 +1,6 @@
 # AutoApply Cloud — Vercel production deployment checklist
 
-Last reviewed: 2026-08-13
+Last reviewed: 2026-08-15
 
 Use this file when moving the current local SaaS application to a public domain. It
 covers the Vercel control plane, Supabase, Google login, Gmail sending, Turnstile, the
@@ -8,7 +8,7 @@ separate worker, Browserbase, and the checks required before opening the product
 other users. The deployed sidebar journey is **Profile → Find jobs → Form Pilot →
 Mass Cold Email**. The final destination contains **Build campaign → Review & send**
 email-only subtabs. Form Pilot separately owns Google Form scan, browser-side answer
-suggestions, exact review, and the user's one explicit **Approve & submit in
+suggestion display backed by an encrypted account Groq credential, exact review, and the user's one explicit **Approve & submit in
 background** action. The worker may submit only that immutable approved revision and
 may report success only after a fresh provider confirmation. Browserbase Live View is
 an observable `needs_attention` fallback, not the normal completion step.
@@ -56,6 +56,10 @@ origin for `SITE_URL` and Gmail OAuth.
   View session; keep-alive is relevant only when an attention fallback must remain
   available. Keep browser automation disabled until account limits, worker capacity,
   and provider canaries support it.
+- Browserbase bills every created session for at least one minute. AutoApply closes
+  sessions immediately when work finishes and applies a 90-second stall cap; this
+  reduces runaway/stalled usage but does not reduce a sub-minute run below the
+  one-minute minimum.
 
 References: [Vercel FastAPI](https://vercel.com/docs/frameworks/backend/fastapi),
 [Function limits](https://vercel.com/docs/functions/limitations),
@@ -70,10 +74,9 @@ References: [Vercel FastAPI](https://vercel.com/docs/frameworks/backend/fastapi)
       branch or commit containing `public/`, `app/saas/`, `app/saas_main.py`,
       `supabase/`, `worker/`, `vercel.json`, `pyproject.toml`, `.python-version`, and
       `.vercelignore`.
-- [ ] Confirm `.env`, `.env.*`, PDFs, browser profiles, databases, OAuth exports, and
-      `auth_link.html` are excluded from the deployment bundle.
-- [ ] Remove the tracked legacy `auth_link.html` from Git when it is no longer needed.
-      It contains a personal OAuth authorization artifact and is not part of the SaaS.
+- [ ] Confirm `.env`, `.env.*`, PDFs, browser profiles, databases, and OAuth exports
+      are excluded from the deployment bundle. The obsolete tracked `auth_link.html`
+      artifact has been removed and is ignored so it cannot be recommitted.
 - [ ] Replace every `[REQUIRED BEFORE PUBLIC LAUNCH]` value in `public/privacy.html` and
       `public/terms.html`: operator/entity, dates, address, support/privacy contacts,
       jurisdiction, provider/retention details, and refund terms if applicable.
@@ -114,8 +117,9 @@ Do not reuse the pasted values.
   ```
 
 Do not casually rotate or lose `TOKEN_ENCRYPTION_KEY` after launch. Existing encrypted
-Gmail tokens, user-owned Google client secrets, and managed-browser context identifiers
-would become unreadable and users would need to reconnect.
+Gmail tokens, user-owned Google client secrets, managed-browser context identifiers,
+and account-scoped Groq/Hunter/Browserbase credentials would become unreadable. Users
+would need to reconnect and re-enter provider credentials.
 
 Reference: [Vercel secret rotation](https://vercel.com/docs/environment-variables/rotating-secrets).
 
@@ -132,7 +136,13 @@ supabase db lint --linked --level warning
 ```
 
 - [ ] Confirm every migration through
-      `202608140001_form_submit_attention_snapshot.sql` was applied in filename order.
+      `202608150002_user_provider_credentials.sql` was applied in filename order.
+- [ ] Confirm `user_provider_credentials` has RLS enabled, no browser policy or
+      `public`/`anon`/`authenticated` grant, and only `service_role` access. Its allowed
+      providers must be exactly `groq`, `hunter`, and `browserbase`.
+- [ ] Confirm save/delete RPCs increment credential generations, write only secret-free
+      audit metadata, cascade on account deletion, and block Browserbase replacement or
+      deletion while owned browser jobs/contexts are active.
 - [ ] Do not stop at `202608130001_google_forms_manual_submit.sql`. That migration was a
       temporary fail-closed prohibition. The forward migration
       `202608130002_google_forms_approved_submit.sql` removes it and installs the strict
@@ -374,12 +384,24 @@ left empty only if the product intentionally supports user-owned Google clients 
 | `BROWSERBASE_PROJECT_ID` | Browserbase project ID | No |
 | `ALLOWED_BROWSER_PROVIDERS` | Empty for first production deploy | No |
 
+The Browserbase environment pair is an optional platform fallback. For every claimed
+browser job, the worker prefers that account owner's validated encrypted BYOK pair and
+uses the fallback only when no owned credential exists. Configure both fallback values
+or neither; never combine a user API key with the platform Project ID (or vice versa).
+
+Before rotating an operator fallback after launch, stop new managed-browser work,
+drain or cancel every queued/running browser job, and disconnect all retained managed
+browser connections while the old key still works. Only then replace both fallback
+values together in the API and worker environments and redeploy them. A Browserbase
+context belongs to the project that created it; replacing the fallback first can leave
+the product unable to delete an old-project context with the new key.
+
 Do not configure these in Vercel:
 
-- `GROQ_API_KEY`: each user supplies a key stored only in that browser profile.
-- `HUNTER_API_KEY`: each user supplies a browser-held key. The API receives it only as
-  transient `X-Hunter-Api-Key` on explicit validation/contact-search requests and does
-  not persist it.
+- `GROQ_API_KEY`: each user supplies a key encrypted in their service-role-only account
+  credential row.
+- `HUNTER_API_KEY`: each user supplies a key encrypted in the same account-scoped
+  store; contact search resolves it only for the authenticated owned request.
 - `SUPABASE_JWKS_URL`: the application does not consume it.
 - Turnstile secret: it belongs in Supabase Auth.
 - Supabase Google-login secret: it belongs in Supabase Auth.
@@ -489,6 +511,7 @@ WORKER_HEARTBEAT_SECONDS=20
 WORKER_LOG_LEVEL=INFO
 
 TOKEN_ENCRYPTION_KEY=SAME_FERNET_KEY_AS_VERCEL
+# Optional platform fallback; omit both when relying exclusively on user BYOK.
 BROWSERBASE_API_KEY=ROTATED_BROWSERBASE_KEY
 BROWSERBASE_PROJECT_ID=YOUR_BROWSERBASE_PROJECT_ID
 ALLOWED_BROWSER_PROVIDERS=
@@ -500,10 +523,12 @@ delay. A healthy idle deployment does not print each successful Supabase HTTP re
 monitor worker lifecycle, claimed-job, completion, and warning entries instead.
 
 - [ ] Give every worker replica a unique `WORKER_ID`.
-- [ ] Use the exact Vercel encryption key, Browserbase credentials, and provider
-      allowlist.
+- [ ] Use the exact Vercel encryption key and provider allowlist. If a platform
+      Browserbase fallback is configured, use the exact same pair in trusted API/worker
+      environments.
 - [ ] A discovery-only worker needs Supabase URL/secret and worker identity; managed
-      browser jobs additionally need encryption and Browserbase settings.
+      browser jobs additionally need encryption and either the job owner's verified
+      Browserbase BYOK pair or the optional fallback settings.
 - [ ] Start with `ALLOWED_BROWSER_PROVIDERS` empty.
 - [ ] Once Browserbase capacity and controlled canaries pass, begin with only:
 
@@ -530,15 +555,30 @@ monitor worker lifecycle, claimed-job, completion, and warning entries instead.
 - [ ] Test SIGTERM recovery: an interrupted job should be reclaimable after lease expiry.
 
 Credential-free Telegram/RSS, LinkedIn guest discovery, and public ATS discovery use the
-worker but do not require Browserbase. `POST /api/v1/discovery/resume-guided` uses the
-transient `X-Groq-Api-Key` in the Vercel request to derive bounded search terms, then
+worker but do not require Browserbase. `POST /api/v1/discovery/resume-guided` resolves
+the caller's encrypted account Groq credential to derive bounded search terms, then
 queues LinkedIn guest and public-feed work without the key. The worker filters
 Telegram/RSS results against those terms. LinkedIn guest discovery remains unofficial,
 bounded, credential-free, and unrelated to Easy Apply. Managed-browser scan,
 approval-bound submission, verified confirmation, and any needs-attention Live View do
 require Browserbase.
 
+Browserbase account setup:
+
+1. Create a free account at <https://www.browserbase.com/sign-up>.
+2. Copy the API key from <https://www.browserbase.com/settings>.
+3. Copy the Project ID from <https://www.browserbase.com/overview>.
+4. Save both through `PUT /api/v1/provider-credentials/browserbase`.
+
+Validation must call read-only
+`GET https://api.browserbase.com/v1/projects/{project_id}` with `X-BB-API-Key`, require
+HTTP 200 plus a matching response ID, and create no session. Verify worker sessions use
+the owned pair before the fallback, close immediately, and stop at the 90-second stall
+cap. Browserbase's one-minute minimum still applies to each created session.
+
 References: [Browserbase pricing](https://www.browserbase.com/pricing) and
+[Browserbase cost optimization](https://docs.browserbase.com/optimizations/cost/cost-optimization),
+[project validation API](https://docs.browserbase.com/reference/api/get-a-project), and
 [Browserbase contexts](https://docs.browserbase.com/platform/browser/core-features/contexts).
 
 ## 15. Production smoke test
@@ -550,10 +590,11 @@ References: [Browserbase pricing](https://www.browserbase.com/pricing) and
       `/api/openapi.json` return expected responses.
 - [ ] `/api/v1/profile` without a bearer token returns 401.
 - [ ] `/api/v1/config` contains the exact production Site URL and no secret, OAuth token,
-      encryption key, user Groq key, or user Hunter key.
-- [ ] Confirm `X-Groq-Api-Key` and `X-Hunter-Api-Key` are redacted from function,
-      worker, proxy, and observability logs; neither user key is configured in Vercel or
-      the worker host.
+      encryption key, user Groq/Hunter/Browserbase secret, project ID, or ciphertext.
+- [ ] Confirm provider-credential request bodies, decrypted envelopes, ciphertext,
+      Browserbase CDP URLs, and provider headers are absent from function, worker,
+      proxy, analytics, and observability logs; no user Groq/Hunter key is configured in
+      Vercel or the worker host.
 - [ ] Confirm CSP, referrer, permissions, nosniff, and frame-deny headers on public pages.
 - [ ] Confirm API responses are `private, no-store`.
 - [ ] Inspect every `/api/v1/health` check. `status=ready` alone does not prove Gmail,
@@ -576,11 +617,13 @@ References: [Browserbase pricing](https://www.browserbase.com/pricing) and
       substituted for it.
 - [ ] Jobs are ranked by explainable résumé alignment and the UI states that this is not
       a hiring prediction.
-- [ ] A user's browser-held Groq key validates and produces a grounded draft without
-      appearing in logs, API responses, Supabase, or another user's browser namespace.
-- [ ] From **Find jobs**, `POST /api/v1/discovery/resume-guided` with a transient
-      `X-Groq-Api-Key` requires a parsed active résumé, returns a bounded plan, and
-      queues LinkedIn guest plus Telegram/RSS work without persisting the key.
+- [ ] `PUT /api/v1/provider-credentials/groq` validates and stores only encrypted
+      ciphertext; `GET /api/v1/provider-credentials` exposes only a safe hint/status,
+      and owned résumé analysis/drafting works without a key in browser storage,
+      responses, logs, or another account.
+- [ ] From **Find jobs**, `POST /api/v1/discovery/resume-guided` with the verified owned
+      Groq credential requires a parsed active résumé, returns a bounded plan, and
+      queues LinkedIn guest plus Telegram/RSS work without placing the key in the job.
 - [ ] The same **Find matching jobs** screen polls both returned automation-job IDs,
       prevents duplicate clicks while they are active, and automatically refreshes jobs
       and Form Pilot when they reach a terminal state. Activity remains diagnostics, not
@@ -594,7 +637,7 @@ References: [Browserbase pricing](https://www.browserbase.com/pricing) and
       is ready; Activity is diagnostics rather than a required navigation step.
 - [ ] When an eligible unapproved revision loads, Form Pilot automatically applies
       deterministic Profile facts and calls the suggestion endpoint at most once. A
-      browser-held Groq key is used only for unresolved questions; the review desk has
+      stored account Groq credential is used only for unresolved questions; the review desk has
       no duplicate AI-fill button. Suggestions remain editable/browser-visible, exclude
       protected or unknown keys, never grant approval, and missing keys/Groq failure
       leave unknown fields for explicit review.
@@ -640,11 +683,18 @@ References: [Browserbase pricing](https://www.browserbase.com/pricing) and
       form, ambiguous submit control, timeout, or uncertain confirmation becomes
       `needs_attention` without a blind retry. Only that fallback may expose the
       allowlisted Browserbase Live View so the user can inspect and continue safely.
-- [ ] A user's browser-held Hunter key validates through
-      `POST /api/v1/hunter/validate` and reaches
-      `POST /api/v1/jobs/{id}/contacts/hunter` only as transient
-      `X-Hunter-Api-Key`; no key appears in API responses, Supabase, logs, Vercel, or the
-      worker environment.
+- [ ] `PUT /api/v1/provider-credentials/browserbase` requires an API key and Project ID,
+      validates them using the read-only project endpoint without creating a session,
+      and stores only an encrypted envelope. Status returns safe hints only.
+- [ ] A tenant browser job uses that tenant's Browserbase BYOK pair before the optional
+      platform fallback, never mixes credential sources, closes the session immediately
+      on every terminal path, and enforces the 90-second stall cap. The UI explains
+      that each created session is billed for at least one minute.
+- [ ] A user's Hunter key validates through
+      `PUT /api/v1/provider-credentials/hunter`, persists only as encrypted ciphertext,
+      and is resolved only for owned `POST /api/v1/jobs/{id}/contacts/hunter` requests;
+      no plaintext/ciphertext appears in browser storage, responses, logs, Vercel, or
+      the worker environment.
 - [ ] **Mass Cold Email** is the only related sidebar item and exposes **Build campaign**
       and **Review & send** as subtabs. Build campaign enforces a ten-job maximum, shows
       projected Hunter credit use inline before the explicit lookup, and requires the
@@ -670,7 +720,9 @@ Recommended order:
 
 1. Rotate credentials and save the encryption key.
 2. Commit/review the deployment branch and legal pages.
-3. Apply/lint Supabase migrations.
+3. Apply/lint Supabase migrations through
+   `202608150002_user_provider_credentials.sql`; verify its no-browser-access contract
+   before deploying provider-credential code.
 4. Configure Supabase Site URL, redirects, Google provider, SMTP, and Turnstile.
 5. Configure Google identity and Gmail clients.
 6. Deploy the stable staging Vercel build.
@@ -689,7 +741,18 @@ If cutover fails:
   migration.
 - Revoke a compromised provider credential, update every environment, and redeploy.
 - Preserve `TOKEN_ENCRYPTION_KEY` unless deliberately invalidating all encrypted
-  connections and requiring every user to reconnect.
+  connections/provider credentials and requiring every user to reconnect or re-enter
+  keys.
+
+For an upgrade from the prior browser-local Groq/Hunter design, deploy and verify the
+table/API before the new frontend. On a user's first authenticated load, the frontend
+imports only that user's namespaced legacy values through the normal validated PUT
+endpoints. It deletes each browser copy only after a successful encrypted account save
+(or when that provider is already configured); validation/network failure keeps the
+copy, displays a retry warning, and must not send it as a fallback key header. Test
+successful import, failure retention, user isolation, and removal of legacy entries.
+Browserbase BYOK begins empty per account; the optional platform fallback keeps
+controlled browser features available during gradual adoption.
 
 ## Official reference index
 
@@ -705,6 +768,11 @@ If cutover fails:
 - [Gmail OAuth scopes](https://developers.google.com/workspace/gmail/api/auth/scopes)
 - [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/get-started/)
 - [Browserbase pricing](https://www.browserbase.com/pricing)
+- [Browserbase sign up](https://www.browserbase.com/sign-up)
+- [Browserbase API-key settings](https://www.browserbase.com/settings)
+- [Browserbase project overview](https://www.browserbase.com/overview)
+- [Browserbase get-project API](https://docs.browserbase.com/reference/api/get-a-project)
+- [Browserbase cost optimization](https://docs.browserbase.com/optimizations/cost/cost-optimization)
 - [Northflank pricing](https://northflank.com/pricing)
 - [Northflank build and deploy](https://northflank.com/docs/v1/application/getting-started/build-and-deploy-your-code)
 - [OCI Always Free resources](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm)

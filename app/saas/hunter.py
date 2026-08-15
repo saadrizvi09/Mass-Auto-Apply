@@ -1,9 +1,12 @@
 """Stateless Hunter API primitives for account checks and HR contact search.
 
-The caller supplies a transient Hunter API key for each operation.  Hunter V2
-supports header authentication, so this adapter deliberately uses ``X-API-Key``
-instead of the documented ``api_key`` query parameter.  Keys are never logged,
-cached, returned, or copied into URLs.
+The trusted control plane either validates a newly submitted key or resolves an
+account-scoped, encrypted provider credential and supplies its plaintext only for
+the current operation.  Credential storage, decryption, and one-time migration of
+legacy browser keys live outside this adapter.  Hunter V2 supports header
+authentication, so provider requests use ``X-API-Key`` instead of the documented
+``api_key`` query parameter.  Keys are never logged, cached, returned, or copied
+into URLs.
 """
 from __future__ import annotations
 
@@ -192,7 +195,7 @@ def _quota_summary(data: Mapping[str, Any], *, secret: str) -> dict[str, Any]:
 
 
 def validate_hunter_key(key: str) -> dict[str, Any]:
-    """Validate a caller-held key using Hunter's free account endpoint.
+    """Validate a resolved key using Hunter's free account endpoint.
 
     Both successful and failed results are safe to return to a settings screen.
     Account identity, provider error bodies, and the supplied key are omitted.

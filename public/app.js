@@ -16,6 +16,7 @@ const FORM_WORKFLOW_POLL_INTERVAL_MS = 2_000;
 const FORM_WORKFLOW_MONITOR_TIMEOUT_MS = 300_000;
 const BOOT_STEP_ORDER = ["service", "session", "workspace"];
 const WORKSPACE_OPEN_TIMEOUT_MS = 30_000;
+const PROVIDER_CREDENTIAL_NAMES = ["groq", "hunter", "browserbase"];
 
 const viewCopy = {
   overview: {
@@ -87,6 +88,9 @@ const state = {
   googleOauthClient: {},
   googleOauthMode: null,
   googleOauthEditing: false,
+  providerCredentials: { groq: {}, hunter: {}, browserbase: {} },
+  providerCredentialEditing: new Set(),
+  providerCredentialMigrationUserId: null,
   publicProviders: [],
   automationJobs: [],
   discoverySources: [],
@@ -389,6 +393,13 @@ function clearPrivateState() {
   state.googleOauthClient = {};
   state.googleOauthMode = null;
   state.googleOauthEditing = false;
+  state.providerCredentials = { groq: {}, hunter: {}, browserbase: {} };
+  state.providerCredentialEditing = new Set();
+  state.providerCredentialMigrationUserId = null;
+  // A typed-but-unsaved secret lives in the DOM, not application state. Clear
+  // every provider form at the same identity boundary so it cannot appear in
+  // the next account's workspace after sign-out or an account switch.
+  all("[data-provider-credential]").forEach((form) => form.reset());
   state.automationJobs = [];
   state.discoverySources = [];
   state.googleForms = [];
@@ -654,7 +665,7 @@ function groqStorageKey(userId = state.identityUserId) {
   return typeof userId === "string" && userId ? `${GROQ_STORAGE_PREFIX}.${userId}` : null;
 }
 
-function getGroqKey(userId = state.identityUserId) {
+function getLegacyGroqKey(userId = state.identityUserId) {
   try {
     const storageKey = groqStorageKey(userId);
     return storageKey ? localStorage.getItem(storageKey) || "" : "";
@@ -663,17 +674,7 @@ function getGroqKey(userId = state.identityUserId) {
   }
 }
 
-function saveGroqKey(value, userId = state.identityUserId) {
-  const storageKey = groqStorageKey(userId);
-  if (!storageKey) throw new AppError("Sign in before saving a Groq key.", "not_authenticated");
-  try {
-    localStorage.setItem(storageKey, value);
-  } catch {
-    throw new AppError("This browser blocked local storage. Allow site storage to save the Groq key.", "storage_unavailable");
-  }
-}
-
-function deleteGroqKey(userId = state.identityUserId) {
+function deleteLegacyGroqKey(userId = state.identityUserId) {
   try {
     const storageKey = groqStorageKey(userId);
     if (storageKey) localStorage.removeItem(storageKey);
@@ -686,7 +687,7 @@ function hunterStorageKey(userId = state.identityUserId) {
   return typeof userId === "string" && userId ? `${HUNTER_STORAGE_PREFIX}.${userId}` : null;
 }
 
-function getHunterKey(userId = state.identityUserId) {
+function getLegacyHunterKey(userId = state.identityUserId) {
   try {
     const storageKey = hunterStorageKey(userId);
     return storageKey ? localStorage.getItem(storageKey) || "" : "";
@@ -695,17 +696,7 @@ function getHunterKey(userId = state.identityUserId) {
   }
 }
 
-function saveHunterKey(value, userId = state.identityUserId) {
-  const storageKey = hunterStorageKey(userId);
-  if (!storageKey) throw new AppError("Sign in before saving a Hunter key.", "not_authenticated");
-  try {
-    localStorage.setItem(storageKey, value);
-  } catch {
-    throw new AppError("This browser blocked local storage. Allow site storage to save the Hunter key.", "storage_unavailable");
-  }
-}
-
-function deleteHunterKey(userId = state.identityUserId) {
+function deleteLegacyHunterKey(userId = state.identityUserId) {
   try {
     const storageKey = hunterStorageKey(userId);
     if (storageKey) localStorage.removeItem(storageKey);
@@ -757,11 +748,25 @@ function clearDiscoveryRun(userId = state.identityUserId) {
   }
 }
 
-function maskSecret(value) {
-  if (!value) return "";
-  const prefix = value.startsWith("gsk_") ? "gsk_" : "key_";
-  const suffix = value.slice(-4);
-  return `${prefix}••••••••${suffix}`;
+function providerCredential(provider) {
+  return state.providerCredentials?.[provider] || {};
+}
+
+function credentialSaved(provider) {
+  return providerCredential(provider).configured === true;
+}
+
+function credentialConfigured(provider) {
+  const credential = providerCredential(provider);
+  return credential.configured === true
+    && credential.requires_reconfiguration !== true
+    && credential.verification_status !== "invalid"
+    && (provider !== "browserbase" || credential.verification_status === "verified");
+}
+
+function credentialHint(provider) {
+  const value = String(providerCredential(provider).key_hint || "").trim();
+  return value || "Saved secret";
 }
 
 async function publicRequest(path) {
@@ -838,16 +843,6 @@ async function apiRequest(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set("Accept", "application/json");
   headers.set("Authorization", `Bearer ${session.access_token}`);
-  if (options.groq) {
-    const key = getGroqKey(identity.userId);
-    if (!key) throw new AppError("Save a Groq API key in this browser first.", "groq_key_missing");
-    headers.set("X-Groq-Api-Key", key);
-  }
-  if (options.hunter) {
-    const key = getHunterKey(identity.userId);
-    if (!key) throw new AppError("Save a Hunter API key in this browser first.", "hunter_key_missing");
-    headers.set("X-Hunter-Api-Key", key);
-  }
 
   const init = {
     method,
@@ -1288,6 +1283,7 @@ async function loadWorkspace(identity = identitySnapshot()) {
     loadJobs(true, identity),
     loadApplications(true, identity),
     loadFormApplications(true, identity),
+    loadProviderCredentials(true, identity),
     loadConnections(true, identity),
     loadAutomationJobs(true, identity),
     loadDiscoverySources(true, identity),
@@ -1634,12 +1630,12 @@ function updateAccountDeletionRetryButton() {
 async function finishDeletedAccount(identity, form = null) {
   let localKeyRemoved = true;
   try {
-    deleteGroqKey(identity.userId);
+    deleteLegacyGroqKey(identity.userId);
   } catch {
     localKeyRemoved = false;
   }
   try {
-    deleteHunterKey(identity.userId);
+    deleteLegacyHunterKey(identity.userId);
   } catch {
     localKeyRemoved = false;
   }
@@ -1659,7 +1655,7 @@ async function finishDeletedAccount(identity, form = null) {
   setAuthMode("signin");
 
   if (localKeyRemoved) {
-    toast("Your account, workspace, and browser-stored Groq and Hunter keys were permanently deleted.", "success", "Account deleted", 0);
+    toast("Your account, workspace, and encrypted provider credentials were permanently deleted.", "success", "Account deleted", 0);
   } else {
     toast("Your account was deleted, but this browser blocked removal of a local API key. Clear site data and rotate the key with its provider.", "error", "Account deleted with a local cleanup warning", 0);
   }
@@ -1882,7 +1878,7 @@ async function parseResume(resumeId, button = null, quiet = false) {
         : null;
       renderResumeSuggestions();
       await loadResumes(true);
-      if (getGroqKey()) {
+      if (credentialConfigured("groq")) {
         await analyzeResume(resumeId, { quiet, autoFill: true });
       } else {
         const filled = applyResumeSuggestions({ navigate: false, notify: false });
@@ -2060,7 +2056,7 @@ async function fillProfileFromResume(button) {
     switchView("profile");
     return;
   }
-  if (!getGroqKey()) {
+  if (!credentialConfigured("groq")) {
     switchView("profile");
     requestAnimationFrame(() => byId("groq-key")?.focus());
     toast("Add a Groq key to extract the complete profile from your résumé.", "info");
@@ -2093,79 +2089,21 @@ async function removeResume(resume, button) {
 }
 
 function renderGroqState() {
-  const key = getGroqKey();
+  const credential = providerCredential("groq");
+  const saved = credential.configured === true;
+  const ready = credentialConfigured("groq");
   const summary = byId("groq-saved-summary");
   const pill = byId("groq-status-pill");
-  summary.hidden = !key;
-  setText("groq-masked-key", key ? maskSecret(key) : "");
-  pill.className = `status-pill ${key ? "status-info" : "status-neutral"}`;
-  pill.textContent = key ? "Saved in browser" : "Not saved";
-  byId("validate-groq").disabled = !key;
-  byId("delete-groq").disabled = !key;
+  if (!summary || !pill) return;
+  summary.hidden = !saved;
+  setText("groq-masked-key", saved ? credentialHint("groq") : "");
+  pill.className = `status-pill ${ready ? credential.verified_at ? "status-success" : "status-info" : saved ? "status-warning" : "status-neutral"}`;
+  pill.textContent = ready ? credential.verified_at ? "Groq ready" : "Saved · check pending" : saved ? "Replace required" : "Not connected";
+  byId("delete-groq").disabled = !saved;
   renderOverview();
   renderJobIntelligence();
   renderResumeDiscoveryPlan();
   renderOutreach();
-}
-
-function saveGroq(event) {
-  event.preventDefault();
-  const input = byId("groq-key");
-  const key = input.value.trim();
-  setFormMessage("groq-message");
-  if (key.length < 10) {
-    setFormMessage("groq-message", "Enter a complete Groq API key.", "error");
-    return;
-  }
-  try {
-    saveGroqKey(key);
-    input.value = "";
-    input.type = "password";
-    byId("toggle-groq-visibility").setAttribute("aria-label", "Show API key");
-    renderGroqState();
-    setFormMessage("groq-message", "Saved only in this browser. Validate it before drafting.", "success");
-    toast("Groq key saved in this browser.", "success");
-  } catch (error) {
-    setFormMessage("groq-message", errorMessage(error), "error");
-  }
-}
-
-async function validateGroq(button) {
-  await withBusy(button, "Validating…", async () => {
-    try {
-      const payload = await apiRequest("/groq/validate", { method: "POST", groq: true });
-      const valid = payload?.valid === true;
-      const failureState = {
-        groq_invalid_key: { label: "Invalid key", tone: "status-danger" },
-        groq_model_forbidden: { label: "Model blocked", tone: "status-warning" },
-        groq_model_unavailable: { label: "Model unavailable", tone: "status-warning" },
-        groq_rate_limited: { label: "Rate limited", tone: "status-warning" },
-        unavailable: { label: "Groq unavailable", tone: "status-warning" },
-        groq_unavailable: { label: "Groq unavailable", tone: "status-warning" },
-      }[payload?.status] || { label: "Validation failed", tone: "status-warning" };
-      const pill = byId("groq-status-pill");
-      pill.className = `status-pill ${valid ? "status-success" : failureState.tone}`;
-      pill.textContent = valid ? "Validated" : failureState.label;
-      const failureMessage = typeof payload?.message === "string" && payload.message.trim()
-        ? payload.message.trim()
-        : "Groq could not validate this key. Try again.";
-      setFormMessage(
-        "groq-message",
-        valid ? `Validated${payload.model ? ` for ${payload.model}` : ""}.` : failureMessage,
-        valid ? "success" : "error",
-      );
-      if (valid) {
-        saveUiPreferences({ groq_validated_at: new Date().toISOString(), groq_model: payload.model || null });
-        toast("Groq key validated. It remains stored only in this browser.", "success");
-      }
-    } catch (error) {
-      const pill = byId("groq-status-pill");
-      const temporarilyLimited = error?.code === "groq_request_rate_limited";
-      pill.className = "status-pill status-warning";
-      pill.textContent = temporarilyLimited ? "Wait a moment" : "Validation failed";
-      setFormMessage("groq-message", errorMessage(error, "The key could not be validated."), "error");
-    }
-  });
 }
 
 function discoveryRunKey(prefix) {
@@ -2532,11 +2470,11 @@ function renderResumeDiscoveryPlan(plan = state.resumeDiscoveryPlan) {
     container.append(createElement("span", { className: "muted", text: "Your target roles will appear after résumé analysis." }));
   }
   const hasResume = Boolean(activeParsedResume());
-  const hasGroq = Boolean(getGroqKey());
+  const hasGroq = credentialConfigured("groq");
   const activeRun = discoveryRunIsActive();
   run.disabled = !hasResume || !hasGroq || activeRun || run.dataset.busy === "true";
   if (!hasResume || !hasGroq) {
-    status.textContent = `${!hasResume ? "Upload and parse a résumé" : "Résumé ready"}; ${!hasGroq ? "add a Groq key in Profile" : "Groq key ready"}.`;
+    status.textContent = `${!hasResume ? "Upload and parse a résumé" : "Résumé ready"}; ${!hasGroq ? "connect a Groq key in Profile or Connections" : "Groq key ready"}.`;
     status.className = "form-message is-error";
   } else if (activeRun) {
     status.textContent = "Search in progress. Fresh jobs and Google Forms will appear automatically when the public collectors finish.";
@@ -2557,7 +2495,7 @@ function renderResumeDiscoveryPlan(plan = state.resumeDiscoveryPlan) {
 async function submitResumeGuidedDiscovery(event) {
   event.preventDefault();
   const button = event.submitter || byId("resume-discovery-run");
-  if (!activeParsedResume() || !getGroqKey()) {
+  if (!activeParsedResume() || !credentialConfigured("groq")) {
     renderResumeDiscoveryPlan();
     toast("Complete the résumé and Groq setup in Profile first.", "error");
     return;
@@ -3204,65 +3142,24 @@ function applicationForOutreachJob(jobId) {
 function renderHunterState() {
   const pill = byId("hunter-key-status");
   const quota = byId("hunter-quota");
-  const validateButton = byId("hunter-validate");
   const deleteButton = byId("hunter-delete");
-  if (!pill || !quota || !validateButton || !deleteButton) return;
-  const key = getHunterKey();
-  const validation = state.hunterValidation;
-  const valid = validation?.valid === true;
-  const rejected = validation && validation.valid === false;
-  pill.className = `status-pill ${valid ? "status-success" : rejected ? "status-danger" : key ? "status-info" : "status-neutral"}`;
-  pill.textContent = valid ? "Hunter ready" : rejected ? "Validation failed" : key ? "Saved in browser" : "Not connected";
-  validateButton.disabled = !key;
-  deleteButton.disabled = !key;
-  if (!key) {
+  const summary = byId("hunter-saved-summary");
+  if (!pill || !quota || !deleteButton || !summary) return;
+  const credential = providerCredential("hunter");
+  const saved = credential.configured === true;
+  const ready = credentialConfigured("hunter");
+  summary.hidden = !saved;
+  setText("hunter-masked-key", saved ? credentialHint("hunter") : "");
+  pill.className = `status-pill ${ready ? credential.verified_at ? "status-success" : "status-info" : saved ? "status-warning" : "status-neutral"}`;
+  pill.textContent = ready ? credential.verified_at ? "Hunter ready" : "Saved · check pending" : saved ? "Replace required" : "Not connected";
+  deleteButton.disabled = !saved;
+  if (!saved) {
     quota.textContent = "Add a free Hunter key to search HR and recruiting contacts only when you request it.";
-  } else if (valid) {
-    const requests = validation.quota?.requests || {};
-    const bucket = requests.searches || requests.credits || {};
-    const remaining = Number.isFinite(bucket.remaining) ? bucket.remaining : null;
-    quota.textContent = `${validation.quota?.plan_name || "Hunter"} plan${remaining == null ? " is connected" : ` · ${remaining} search credit${remaining === 1 ? "" : "s"} remaining`}${validation.quota?.reset_date ? ` · resets ${validation.quota.reset_date}` : ""}.`;
+  } else if (!ready) {
+    quota.textContent = "The saved Hunter credential did not validate. Paste a replacement above.";
   } else {
-    quota.textContent = validation?.message || "Validate the saved key before using contact credits.";
+    quota.textContent = `${hunterCredentialQuotaCopy(credential)}.`;
   }
-}
-
-function saveHunter(event) {
-  event.preventDefault();
-  const input = byId("hunter-api-key");
-  const key = input?.value.trim() || "";
-  if (key.length < 8) {
-    setFormMessage("hunter-key-message", "Enter a complete Hunter API key.", "error");
-    return;
-  }
-  try {
-    saveHunterKey(key);
-    input.value = "";
-    state.hunterValidation = null;
-    renderOutreach();
-    setFormMessage("hunter-key-message", "Hunter key saved only in this browser. Validate it before spending searches.", "success");
-  } catch (error) {
-    setFormMessage("hunter-key-message", errorMessage(error), "error");
-  }
-}
-
-async function validateHunter(button) {
-  await withBusy(button, "Checking quota…", async () => {
-    try {
-      const payload = await apiRequest("/hunter/validate", { method: "POST", hunter: true });
-      state.hunterValidation = payload && typeof payload === "object" ? payload : null;
-      renderOutreach();
-      setFormMessage(
-        "hunter-key-message",
-        payload?.valid ? "Hunter is ready. Contact searches run only for selected companies." : payload?.message || "Hunter rejected this key.",
-        payload?.valid ? "success" : "error",
-      );
-    } catch (error) {
-      state.hunterValidation = null;
-      renderOutreach();
-      setFormMessage("hunter-key-message", errorMessage(error, "Hunter could not validate this key."), "error");
-    }
-  });
 }
 
 function toggleOutreachJob(jobId, checked) {
@@ -3282,8 +3179,8 @@ function renderOutreachPrerequisites() {
   clearNode(container);
   const checks = [
     [Boolean(activeParsedResume()), "Résumé parsed", "Profile"],
-    [Boolean(getGroqKey()), "Groq key", "Profile"],
-    [Boolean(getHunterKey()), "Hunter key", "This page"],
+    [credentialConfigured("groq"), "Groq key", "Profile or Connections"],
+    [credentialConfigured("hunter"), "Hunter key", "This page or Connections"],
     [isGmailConnected(), "Gmail connected", "Connections"],
   ];
   for (const [ready, label, location] of checks) {
@@ -3380,8 +3277,8 @@ async function findOutreachContacts(button) {
     setFormMessage("outreach-contact-status", "Select at least one relevant job first.", "error");
     return;
   }
-  if (!getHunterKey()) {
-    setFormMessage("outreach-contact-status", "Add your Hunter key in the setup card above, then start the search again.", "error");
+  if (!credentialConfigured("hunter")) {
+    setFormMessage("outreach-contact-status", "Add your Hunter key above or in Connections, then start the search again.", "error");
     byId("hunter-api-key")?.focus();
     return;
   }
@@ -3395,7 +3292,7 @@ async function findOutreachContacts(button) {
         if (state.hunterValidation?.valid !== true) {
           setFormMessage(
             "outreach-contact-status",
-            state.hunterValidation?.message || "Hunter rejected this key. Replace it in the setup card above.",
+            state.hunterValidation?.message || "Hunter rejected this key. Replace it above or in Connections.",
             "error",
           );
           return;
@@ -3471,8 +3368,8 @@ function renderOutreachDrafts() {
 async function createOutreachDrafts(button) {
   const jobs = selectedOutreachJobs();
   const ready = jobs.filter((job) => selectedContactForJob(job));
-  if (!getGroqKey()) {
-    setFormMessage("outreach-draft-status", "Save a Groq key in Profile first.", "error");
+  if (!credentialConfigured("groq")) {
+    setFormMessage("outreach-draft-status", "Connect a Groq key in Profile or Connections first.", "error");
     return;
   }
   if (!ready.length || ready.length !== jobs.length) {
@@ -3575,7 +3472,7 @@ function renderOutreach() {
   const findButton = byId("outreach-find-contacts");
   const draftButton = byId("outreach-create-drafts");
   const sendButton = byId("outreach-send-approved");
-  const hunterKey = getHunterKey();
+  const hunterKey = credentialConfigured("hunter");
   setText(
     "outreach-credit-estimate",
     selected.length
@@ -3587,7 +3484,7 @@ function renderOutreach() {
     findButton.title = !selected.length
       ? "Select at least one company first."
       : !hunterKey
-        ? "Add your Hunter API key in the setup card above."
+        ? "Add your Hunter API key above or in Connections."
         : state.hunterValidation?.valid === true
           ? `Search ${selected.length} selected compan${selected.length === 1 ? "y" : "ies"}.`
           : "Your saved Hunter key will be validated automatically before this search.";
@@ -3597,9 +3494,9 @@ function renderOutreach() {
   } else if (selected.length && state.hunterValidation?.valid === false) {
     setFormMessage("outreach-contact-status", state.hunterValidation.message || "Hunter rejected this key. Replace or validate it above.", "error");
   } else if (selected.length && !hunterKey) {
-    setFormMessage("outreach-contact-status", "Add your Hunter key in the setup card above to unlock contact search.", "error");
+    setFormMessage("outreach-contact-status", "Add your Hunter key above or in Connections to unlock contact search.", "error");
   }
-  if (draftButton) draftButton.disabled = !selected.length || withContacts.length !== selected.length || !getGroqKey();
+  if (draftButton) draftButton.disabled = !selected.length || withContacts.length !== selected.length || !credentialConfigured("groq");
   if (sendButton) sendButton.disabled = !approved.length || !isGmailConnected();
 }
 
@@ -4237,7 +4134,7 @@ async function monitorFormScan(
     if (state.selectedFormApplicationId === applicationId) {
       showFormWorkflowProgress({
         title: "Questions captured",
-        detail: getGroqKey()
+        detail: credentialConfigured("groq")
           ? "Form Pilot is now preparing résumé-grounded suggestions for your review."
           : "Review the captured fields below and complete any missing answers manually.",
         value: "Ready",
@@ -4731,9 +4628,9 @@ function renderFormRevision(revision) {
     "form-revision-message",
     approved
       ? "This revision is already approved and sealed. Queue its one-time background submission when ready."
-      : getGroqKey()
+      : credentialConfigured("groq")
         ? "Profile facts and Groq suggestions are applied automatically once per captured revision. Review every answer before approving and submitting."
-        : "Saved Profile facts are applied automatically. Add a Groq key in Profile for open-ended answers, then review the completed form.",
+        : "Saved Profile facts are applied automatically. Connect Groq in Profile or Connections for open-ended answers, then review the completed form.",
   );
 }
 
@@ -4895,7 +4792,7 @@ async function requestFormSuggestions(revision, { button = null, automatic = fal
   const run = async () => {
     showFormWorkflowProgress({
       title: "Preparing grounded answers",
-      detail: getGroqKey()
+      detail: credentialConfigured("groq")
         ? "AutoApply applies exact Profile facts first, then asks Groq only for remaining answers grounded in your active résumé and this role."
         : "AutoApply is applying exact saved Profile facts. Unknown questions stay blank for your review.",
       value: "Drafting",
@@ -4906,7 +4803,7 @@ async function requestFormSuggestions(revision, { button = null, automatic = fal
         method: "POST",
         // The endpoint always returns deterministic Profile facts. It uses Groq
         // only when this browser has supplied a key and open questions remain.
-        ...(getGroqKey() ? { groq: true } : {}),
+        ...(credentialConfigured("groq") ? { groq: true } : {}),
       });
       if (state.selectedFormRevisionId !== revision.id) return false;
       const suggestionData = unwrapData(payload) || {};
@@ -5278,6 +5175,308 @@ async function loadConnections(quiet = false, identity = identitySnapshot()) {
   return state.connections;
 }
 
+function normalizedProviderCredential(provider, payload) {
+  const data = unwrapData(payload);
+  const candidate = Array.isArray(data?.items)
+    ? data.items.find((item) => item?.provider === provider)
+    : data && typeof data === "object" && !Array.isArray(data) && data[provider]
+      ? data[provider]
+      : data;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return {};
+
+  // Treat even an authenticated status response as untrusted input. Provider
+  // secrets and ciphertext must never be copied into browser state if a server
+  // regression accidentally adds them to this response. Only the small,
+  // documented status surface is retained here.
+  const safeString = (value, maxLength = 160) => (
+    typeof value === "string" && value.length <= maxLength ? value : null
+  );
+  const rawHint = safeString(candidate.key_hint, 32);
+  const keyHint = rawHint && (rawHint.match(/[\u2022*]/g) || []).length >= 2
+    ? rawHint
+    : null;
+
+  return {
+    provider,
+    configured: candidate.configured === true,
+    verification_status: safeString(candidate.verification_status, 32) || "missing",
+    verification_code: safeString(candidate.verification_code, 80),
+    verified_at: safeString(candidate.verified_at, 64),
+    updated_at: safeString(candidate.updated_at, 64),
+    key_hint: keyHint,
+    project_id_hint: safeString(candidate.project_id_hint, 48),
+    project_name: safeString(candidate.project_name, 160),
+    requires_reconfiguration: candidate.requires_reconfiguration === true,
+  };
+}
+
+function replaceProviderCredentialState(provider, payload) {
+  state.providerCredentials = {
+    ...state.providerCredentials,
+    [provider]: normalizedProviderCredential(provider, payload),
+  };
+}
+
+function removeLegacyProviderKey(provider, userId) {
+  if (provider === "groq") deleteLegacyGroqKey(userId);
+  if (provider === "hunter") deleteLegacyHunterKey(userId);
+}
+
+async function migrateLegacyProviderCredentials(identity = identitySnapshot()) {
+  if (state.providerCredentialMigrationUserId === identity.userId) return;
+  state.providerCredentialMigrationUserId = identity.userId;
+  const candidates = [
+    ["groq", getLegacyGroqKey(identity.userId)],
+    ["hunter", getLegacyHunterKey(identity.userId)],
+  ];
+  let imported = 0;
+  const failures = [];
+  for (const [provider, apiKey] of candidates) {
+    if (!apiKey) continue;
+    if (credentialConfigured(provider)) {
+      try {
+        removeLegacyProviderKey(provider, identity.userId);
+      } catch {
+        failures.push(`${humanize(provider)} is already synced, but its old browser copy could not be removed.`);
+      }
+      continue;
+    }
+    try {
+      const payload = await apiRequest(`/provider-credentials/${encodeURIComponent(provider)}`, {
+        method: "PUT",
+        identity,
+        body: { api_key: apiKey },
+      });
+      assertCurrentIdentity(identity);
+      replaceProviderCredentialState(provider, payload);
+      removeLegacyProviderKey(provider, identity.userId);
+      imported += 1;
+    } catch (error) {
+      failures.push(errorMessage(error, `${humanize(provider)} could not be imported.`));
+    }
+  }
+  if (imported) {
+    toast(`${imported} browser-only credential${imported === 1 ? " was" : "s were"} moved into your encrypted account vault.`, "success");
+  }
+  if (failures.length) {
+    const message = failures.join(" ");
+    const banner = byId("credential-vault-message");
+    if (banner) {
+      banner.hidden = false;
+      banner.className = "notice notice-warning credential-vault-message";
+      banner.textContent = `${message} The browser copy was kept so you can retry safely.`;
+    }
+  }
+}
+
+async function loadProviderCredentials(quiet = false, identity = identitySnapshot()) {
+  const status = byId("credential-vault-status");
+  if (!quiet && status) {
+    status.className = "status-pill status-info";
+    status.textContent = "Refreshing credentials";
+  }
+  const payload = await apiRequest("/provider-credentials", { identity });
+  assertCurrentIdentity(identity);
+  const data = unwrapData(payload);
+  state.providerCredentials = Object.fromEntries(PROVIDER_CREDENTIAL_NAMES.map((provider) => [
+    provider,
+    normalizedProviderCredential(provider, data),
+  ]));
+  state.hunterValidation = credentialConfigured("hunter")
+    ? { ...providerCredential("hunter"), valid: true }
+    : null;
+  await migrateLegacyProviderCredentials(identity);
+  assertCurrentIdentity(identity);
+  state.hunterValidation = credentialConfigured("hunter")
+    ? { ...providerCredential("hunter"), valid: true }
+    : null;
+  renderProviderCredentials();
+  return state.providerCredentials;
+}
+
+function providerCredentialVerifiedCopy(credential) {
+  return credential.verified_at
+    ? `Validated ${formatDate(credential.verified_at, true)}`
+    : credential.updated_at
+      ? `Saved ${formatDate(credential.updated_at, true)}`
+      : "Validated and stored securely";
+}
+
+function hunterCredentialQuotaCopy(credential = providerCredential("hunter")) {
+  const quota = credential.quota && typeof credential.quota === "object" ? credential.quota : credential;
+  const requests = quota.requests && typeof quota.requests === "object" ? quota.requests : {};
+  const bucket = requests.searches || requests.credits || {};
+  const remaining = Number.isFinite(bucket.remaining)
+    ? bucket.remaining
+    : Number.isFinite(quota.remaining)
+      ? quota.remaining
+      : null;
+  const plan = quota.plan_name || credential.plan_name || "Hunter";
+  return `${plan} plan${remaining == null ? " connected" : ` · ${remaining} search credit${remaining === 1 ? "" : "s"} remaining`}${quota.reset_date ? ` · resets ${quota.reset_date}` : ""}`;
+}
+
+function setCredentialMessage(provider, message = "", type = "") {
+  for (const id of [`credential-${provider}-message`, provider === "groq" ? "groq-message" : provider === "hunter" ? "hunter-key-message" : null]) {
+    if (id && byId(id)) setFormMessage(id, message, type);
+  }
+}
+
+function renderProviderCredentials() {
+  const vault = byId("provider-credential-vault");
+  if (!vault) return;
+  let configuredCount = 0;
+  for (const provider of PROVIDER_CREDENTIAL_NAMES) {
+    const credential = providerCredential(provider);
+    const configured = credential.configured === true;
+    const ready = credentialConfigured(provider);
+    if (ready) configuredCount += 1;
+    const editing = state.providerCredentialEditing.has(provider);
+    const summary = byId(`credential-${provider}-summary`);
+    const form = byId(`credential-form-${provider}`);
+    const status = byId(`credential-${provider}-status`);
+    if (summary) summary.hidden = !configured || editing;
+    if (form) {
+      form.hidden = configured && !editing;
+      all("input", form).forEach((input) => { input.disabled = configured && !editing; });
+    }
+    const cancel = form?.querySelector(`[data-credential-cancel="${provider}"]`);
+    if (cancel) cancel.hidden = !configured || !editing;
+    if (status) {
+      status.className = `status-pill ${ready ? credential.verified_at ? "status-success" : "status-info" : configured ? "status-warning" : "status-neutral"}`;
+      status.textContent = ready
+        ? credential.verified_at ? "Ready" : "Saved · check pending"
+        : configured ? "Replace required" : "Not connected";
+    }
+    setText(`credential-${provider}-key-hint`, configured ? credentialHint(provider) : "");
+    setText(`credential-${provider}-verified-at`, configured ? providerCredentialVerifiedCopy(credential) : "");
+    if (provider === "hunter") setText("credential-hunter-quota", configured ? hunterCredentialQuotaCopy(credential) : "");
+    if (provider === "browserbase") {
+      const project = credential.project_name || credential.project_id_hint || "Project connected";
+      setText("credential-browserbase-project", project);
+    }
+  }
+  const vaultStatus = byId("credential-vault-status");
+  if (vaultStatus) {
+    vaultStatus.className = `status-pill ${configuredCount === PROVIDER_CREDENTIAL_NAMES.length ? "status-success" : configuredCount ? "status-info" : "status-neutral"}`;
+    vaultStatus.textContent = `${configuredCount} of ${PROVIDER_CREDENTIAL_NAMES.length} ready`;
+  }
+  renderGroqState();
+  renderHunterState();
+}
+
+function editProviderCredential(provider, { focus = true } = {}) {
+  if (!PROVIDER_CREDENTIAL_NAMES.includes(provider)) return;
+  state.providerCredentialEditing.add(provider);
+  renderProviderCredentials();
+  const input = byId(`credential-${provider}-api-key`);
+  if (focus) {
+    byId(`credential-card-${provider}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    window.setTimeout(() => input?.focus({ preventScroll: true }), 250);
+  }
+}
+
+function cancelProviderCredentialEdit(provider) {
+  state.providerCredentialEditing.delete(provider);
+  byId(`credential-form-${provider}`)?.reset();
+  setCredentialMessage(provider);
+  renderProviderCredentials();
+}
+
+async function saveProviderCredential(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const provider = form.dataset.providerCredential;
+  if (!PROVIDER_CREDENTIAL_NAMES.includes(provider)) return;
+  const apiKey = String(new FormData(form).get("api_key") || "").trim();
+  const projectId = String(new FormData(form).get("project_id") || "").trim();
+  if (apiKey.length < 8) {
+    setCredentialMessage(provider, `Enter a complete ${humanize(provider)} API key.`, "error");
+    return;
+  }
+  if (provider === "browserbase" && !projectId) {
+    setCredentialMessage(provider, "Enter the Browserbase Project ID shown beside your API key in Overview.", "error");
+    return;
+  }
+  const button = event.submitter || form.querySelector('button[type="submit"]');
+  await withBusy(button, "Validating…", async () => {
+    try {
+      const payload = await apiRequest(`/provider-credentials/${encodeURIComponent(provider)}`, {
+        method: "PUT",
+        body: { api_key: apiKey, ...(provider === "browserbase" ? { project_id: projectId } : {}) },
+      });
+      replaceProviderCredentialState(provider, payload);
+      state.providerCredentialEditing.delete(provider);
+      form.reset();
+      if (provider === "hunter") {
+        state.hunterValidation = { ...providerCredential("hunter"), valid: true };
+      }
+      renderProviderCredentials();
+      const credential = providerCredential(provider);
+      const verification = payload?.verification && typeof payload.verification === "object" ? payload.verification : {};
+      if (credentialConfigured(provider)) {
+        const pending = credential.verification_status === "unverified";
+        setCredentialMessage(
+          provider,
+          pending
+            ? verification.message || `${humanize(provider)} was saved; provider validation is temporarily pending.`
+            : `${humanize(provider)} was validated and saved to your account.`,
+          pending ? "" : "success",
+        );
+        toast(`${humanize(provider)} credential ${pending ? "was saved for a later check" : "is ready"}.`, pending ? "info" : "success");
+      } else {
+        setCredentialMessage(
+          provider,
+          verification.message || `${humanize(provider)} did not accept this credential. Replace it before using this service.`,
+          "error",
+        );
+      }
+    } catch (error) {
+      setCredentialMessage(provider, errorMessage(error, `${humanize(provider)} could not validate this credential.`), "error");
+    }
+  });
+}
+
+async function deleteProviderCredential(provider, trigger = null) {
+  if (!PROVIDER_CREDENTIAL_NAMES.includes(provider) || !credentialSaved(provider)) return;
+  const confirmed = await confirmAction({
+    eyebrow: "Account credential vault",
+    title: `Delete the ${humanize(provider)} credential?`,
+    message: `${humanize(provider)} features and queued work that needs this service will stop until you save a replacement key.`,
+    confirmLabel: "Delete credential",
+    cancelLabel: "Keep credential",
+    tone: "danger",
+    ticketLabel: "Encrypted secret",
+    symbol: provider === "browserbase" ? "B" : provider === "hunter" ? "H" : "AI",
+  });
+  if (!confirmed) return;
+  await withBusy(trigger, "Deleting…", async () => {
+    try {
+      await apiRequest(`/provider-credentials/${encodeURIComponent(provider)}`, { method: "DELETE" });
+      state.providerCredentials = { ...state.providerCredentials, [provider]: {} };
+      state.providerCredentialEditing.delete(provider);
+      if (provider === "hunter") {
+        state.hunterValidation = null;
+        state.outreachContacts = {};
+      }
+      renderProviderCredentials();
+      setCredentialMessage(provider, `${humanize(provider)} was removed from your account.`, "success");
+      toast(`${humanize(provider)} credential deleted.`, "success");
+    } catch (error) {
+      setCredentialMessage(provider, errorMessage(error, `${humanize(provider)} could not be deleted.`), "error");
+    }
+  });
+}
+
+function focusProviderCredential(provider) {
+  switchView("connections");
+  state.providerCredentialEditing.add(provider);
+  renderProviderCredentials();
+  window.setTimeout(() => {
+    byId(`credential-card-${provider}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    byId(`credential-${provider}-api-key`)?.focus({ preventScroll: true });
+  }, 250);
+}
+
 function mergedProviders() {
   if (state.connections.length) return state.connections;
   return state.publicProviders;
@@ -5476,6 +5675,7 @@ function focusGoogleOauthSetup() {
 
 function renderConnections() {
   const container = byId("connection-list");
+  renderProviderCredentials();
   renderGmailRevocationWarning();
   renderGoogleOauthSetup();
   clearNode(container);
@@ -5951,7 +6151,7 @@ function stopAutomationPolling() {
 
 function renderJobIntelligence() {
   if (!byId("job-fit-summary")) return;
-  const groqReady = Boolean(getGroqKey());
+  const groqReady = credentialConfigured("groq");
   const activeResume = state.resumes.find((resume) => resume.is_active !== false) || state.resumes[0] || null;
   const resumeReady = activeResume?.parse_status === "parsed";
   const profileReady = Boolean(state.profile?.onboarding_completed);
@@ -5994,7 +6194,7 @@ function renderJobIntelligence() {
     setText(buttonId, ready ? readyButton : missingButton);
     byId(statusId)?.closest(".kit-gate")?.classList.toggle("is-ready", ready);
   };
-  setGate("jobs-groq-status", groqReady, "Saved in this browser", "Not saved", "jobs-open-groq", "Manage", "Add key");
+  setGate("jobs-groq-status", groqReady, "Connected to account", "Not connected", "jobs-open-groq", "Manage", "Add key");
   setGate(
     "jobs-resume-status",
     resumeReady,
@@ -6046,7 +6246,7 @@ function renderOverview() {
   const readinessItems = [
     [Boolean(state.profile.onboarding_completed), "Profile completed", "Profile needs review"],
     [activeResumes > 0, "Résumé uploaded", "Upload a PDF résumé"],
-    [Boolean(getGroqKey()), "Groq key saved locally", "Save a Groq key"],
+    [credentialConfigured("groq"), "Groq credential connected", "Connect a Groq key"],
     [isGmailConnected(), "Gmail connected", "Connect Gmail when ready"],
   ];
   for (const [ready, yes, no] of readinessItems) {
@@ -6245,32 +6445,12 @@ function bindWorkspaceEvents() {
   });
   byId("apply-suggestions").addEventListener("click", () => applyResumeSuggestions());
 
-  byId("groq-form").addEventListener("submit", saveGroq);
-  byId("validate-groq").addEventListener("click", (event) => validateGroq(event.currentTarget));
-  byId("delete-groq").addEventListener("click", async () => {
-    if (!await confirmAction({
-      eyebrow: "Browser-held AI key",
-      title: "Remove the Groq key?",
-      message: "Résumé analysis and draft generation will remain unavailable until a key is saved again in this browser.",
-      confirmLabel: "Remove key",
-      cancelLabel: "Keep key",
-      tone: "danger",
-      ticketLabel: "Local secret",
-      symbol: "AI",
-    })) return;
-    try {
-      deleteGroqKey();
-      renderGroqState();
-      setFormMessage("groq-message", "The key was removed from this browser.", "success");
-    } catch (error) {
-      setFormMessage("groq-message", errorMessage(error), "error");
-    }
-  });
-  byId("toggle-groq-visibility").addEventListener("click", () => {
-    const input = byId("groq-key");
-    input.type = input.type === "password" ? "text" : "password";
-    byId("toggle-groq-visibility").setAttribute("aria-label", input.type === "password" ? "Show API key" : "Hide API key");
-  });
+  all("[data-provider-credential]").forEach((form) => form.addEventListener("submit", saveProviderCredential));
+  all("[data-credential-edit]").forEach((button) => button.addEventListener("click", () => editProviderCredential(button.dataset.credentialEdit)));
+  all("[data-credential-cancel]").forEach((button) => button.addEventListener("click", () => cancelProviderCredentialEdit(button.dataset.credentialCancel)));
+  all("[data-credential-delete]").forEach((button) => button.addEventListener("click", () => deleteProviderCredential(button.dataset.credentialDelete, button)));
+  byId("delete-groq").addEventListener("click", (event) => deleteProviderCredential("groq", event.currentTarget));
+  byId("manage-groq-credential").addEventListener("click", () => focusProviderCredential("groq"));
 
   byId("job-form").addEventListener("submit", saveJob);
   byId("job-cancel-edit").addEventListener("click", resetJobForm);
@@ -6334,29 +6514,8 @@ function bindWorkspaceEvents() {
     await scanJobApplication(job, providerForJob(job) || "google_forms", event.currentTarget);
   });
 
-  byId("hunter-setup-form").addEventListener("submit", saveHunter);
-  byId("hunter-validate").addEventListener("click", (event) => validateHunter(event.currentTarget));
-  byId("hunter-delete").addEventListener("click", async () => {
-    if (!await confirmAction({
-      eyebrow: "Browser-held contact key",
-      title: "Remove the Hunter key?",
-      message: "The key and current contact-search results will be removed from this browser. Saved jobs and drafts will stay intact.",
-      confirmLabel: "Remove key",
-      cancelLabel: "Keep key",
-      tone: "danger",
-      ticketLabel: "Local secret",
-      symbol: "H",
-    })) return;
-    try {
-      deleteHunterKey();
-      state.hunterValidation = null;
-      state.outreachContacts = {};
-      renderOutreach();
-      setFormMessage("hunter-key-message", "The Hunter key and current contact results were removed from this browser.", "success");
-    } catch (error) {
-      setFormMessage("hunter-key-message", errorMessage(error), "error");
-    }
-  });
+  byId("hunter-delete").addEventListener("click", (event) => deleteProviderCredential("hunter", event.currentTarget));
+  byId("manage-hunter-credential").addEventListener("click", () => focusProviderCredential("hunter"));
   byId("outreach-find-contacts").addEventListener("click", (event) => findOutreachContacts(event.currentTarget));
   byId("outreach-create-drafts").addEventListener("click", (event) => createOutreachDrafts(event.currentTarget));
   byId("outreach-send-approved").addEventListener("click", (event) => sendApprovedOutreach(event.currentTarget));
@@ -6384,7 +6543,10 @@ function bindWorkspaceEvents() {
     });
   }
 
-  byId("connections-refresh").addEventListener("click", (event) => withBusy(event.currentTarget, "Refreshing…", () => loadConnections()));
+  byId("connections-refresh").addEventListener("click", (event) => withBusy(event.currentTarget, "Refreshing…", () => Promise.all([
+    loadProviderCredentials(),
+    loadConnections(true),
+  ])));
   byId("gmail-oauth-mode-platform").addEventListener("change", (event) => {
     if (event.currentTarget.checked) selectGoogleOauthMode("platform");
   });

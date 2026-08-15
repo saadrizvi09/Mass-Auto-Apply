@@ -9,8 +9,11 @@ structure and fill exact approved values; they do not infer answers.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import re
+import secrets
 import tempfile
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -49,7 +52,7 @@ _MAX_RESUME_BYTES = 6 * 1024 * 1024
 # roughly one-minute Google Forms submission path. Browserbase ends completed
 # sessions on disconnect, so this is a stall ceiling rather than a minimum run
 # time.
-_BROWSER_SESSION_TIMEOUT_SECONDS = 120
+_BROWSER_SESSION_TIMEOUT_SECONDS = 90
 _GOOGLE_FORM_RENDER_TIMEOUT_MS = 8_000
 _GOOGLE_FORM_CONTROL_SELECTOR = (
     'form input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]),'
@@ -172,6 +175,12 @@ class ResolvedBrowserTask:
     phase: ExecutionPhase
     target_url: str
     context_id: str | None = field(repr=False)
+    context_credential_source: Literal["platform", "user"] | None = field(
+        default=None, repr=False
+    )
+    context_credential_generation: int | None = field(default=None, repr=False)
+    context_credential_epoch: int | None = field(default=None, repr=False)
+    context_project_fingerprint: str | None = field(default=None, repr=False)
     approval: ApprovalSnapshot | None = field(default=None, repr=False)
     resume_path: str | None = field(default=None, repr=False)
     resume_size_bytes: int | None = field(default=None, repr=False)
@@ -202,6 +211,14 @@ def _first_row(value: Any) -> Mapping[str, Any] | None:
     if isinstance(value, list) and value and isinstance(value[0], Mapping):
         return value[0]
     return None
+
+
+def _browserbase_project_fingerprint(project_id: str) -> str:
+    """Mirror the control-plane's domain-separated Browserbase binding."""
+
+    return hashlib.sha256(
+        b"autoapply.browserbase.project.v1\x00" + project_id.encode("utf-8")
+    ).hexdigest()
 
 
 def _uuid(value: Any, label: str) -> str:
@@ -296,9 +313,112 @@ def _resume_record(bundle: Mapping[str, Any]) -> Mapping[str, Any] | None:
 class SupabaseTenantResources:
     """Resolve only the bundle attached to the current queue lease and tenant."""
 
-    def __init__(self, repository: TenantRepository, cipher: TokenCipher) -> None:
+    def __init__(
+        self,
+        repository: TenantRepository,
+        cipher: TokenCipher,
+        *,
+        platform_browserbase_api_key: str = "",
+        platform_browserbase_project_id: str = "",
+        resolve_browserbase_byok: bool = False,
+    ) -> None:
         self.repository = repository
         self.cipher = cipher
+        self.platform_browserbase_api_key = platform_browserbase_api_key
+        self.platform_browserbase_project_id = platform_browserbase_project_id
+        self.resolve_browserbase_byok = resolve_browserbase_byok
+
+    async def browserbase_for_job(
+        self, job: JobView, worker_id: str
+    ) -> BrowserbaseWorkerClient | None:
+        """Resolve Browserbase only through the current tenant's active lease.
+
+        A present tenant row always wins and fails closed if it is unverified or
+        unreadable.  This prevents a context created in one Browserbase project
+        from ever being reused against the platform account after key rotation.
+        """
+
+        if not self.resolve_browserbase_byok:
+            return None
+        row = _first_row(
+            await self.repository.rpc(
+                "get_application_job_browserbase_credential",
+                {"job_id": job.id, "worker_id": worker_id},
+            )
+        )
+        if row is None:
+            if self.platform_browserbase_api_key and self.platform_browserbase_project_id:
+                return BrowserbaseClient(
+                    self.platform_browserbase_api_key,
+                    self.platform_browserbase_project_id,
+                )
+            raise ManagedBrowserError(
+                "browserbase_credential_required",
+                "Add and validate a Browserbase API key and project ID before running browser work.",
+            )
+        if (
+            row.get("credential_source") != "user"
+            or str(row.get("user_id")) != str(job.user_id)
+        ):
+            raise ManagedBrowserError(
+                "browserbase_credential_mismatch",
+                "The Browserbase credential no longer matches this queue job.",
+            )
+        if row.get("verification_status") != "verified":
+            raise ManagedBrowserError(
+                "browserbase_credential_reconfiguration_required",
+                "Validate or replace the saved Browserbase credential before running browser work.",
+            )
+        generation = row.get("generation")
+        epoch = row.get("epoch")
+        binding_fingerprint = row.get("binding_fingerprint")
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 1
+            or not isinstance(epoch, int)
+            or isinstance(epoch, bool)
+            or epoch < 1
+            or generation != epoch
+            or not isinstance(binding_fingerprint, str)
+            or not _HASH.fullmatch(binding_fingerprint)
+        ):
+            raise ManagedBrowserError(
+                "browserbase_credential_reconfiguration_required",
+                "Re-save the Browserbase credential before running browser work.",
+            )
+        try:
+            plaintext = self.cipher.decrypt(row["credential_ciphertext"])
+            envelope = json.loads(plaintext)
+            if (
+                not isinstance(envelope, dict)
+                or set(envelope) != {"version", "provider", "api_key", "project_id"}
+                or envelope.get("version") != 1
+                or envelope.get("provider") != "browserbase"
+            ):
+                raise ValueError("invalid Browserbase credential envelope")
+            api_key = envelope.get("api_key")
+            project_id = envelope.get("project_id")
+            if (
+                not isinstance(api_key, str)
+                or not 8 <= len(api_key) <= 512
+                or not api_key.isascii()
+                or any(character.isspace() or ord(character) < 33 for character in api_key)
+                or not isinstance(project_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{5,254}", project_id)
+            ):
+                raise ValueError("invalid Browserbase credential values")
+            expected_fingerprint = _browserbase_project_fingerprint(project_id)
+            if not secrets.compare_digest(
+                binding_fingerprint, expected_fingerprint
+            ):
+                raise ValueError("Browserbase project binding mismatch")
+            return BrowserbaseClient(api_key, project_id)
+        except Exception as exc:
+            raise ManagedBrowserError(
+                "browserbase_credential_reconfiguration_required",
+                "Re-save the Browserbase credential before running browser work.",
+            ) from exc
 
     async def resolve(self, job: JobView, worker_id: str) -> ResolvedBrowserTask:
         row = _first_row(
@@ -333,6 +453,10 @@ class SupabaseTenantResources:
                 "The application does not have a provider URL.",
             )
         ciphertext = row.get("browser_context_id_ciphertext")
+        context_credential_source: Literal["platform", "user"] | None = None
+        context_credential_generation: int | None = None
+        context_credential_epoch: int | None = None
+        context_project_fingerprint: str | None = None
         if not isinstance(ciphertext, str) or not ciphertext:
             if provider in _PUBLIC_SESSION_PROVIDERS:
                 context_id = None
@@ -342,6 +466,48 @@ class SupabaseTenantResources:
                     "Connect this provider before running a managed application.",
                 )
         else:
+            binding = _first_row(
+                await self.repository.rpc(
+                    "get_application_job_browser_context_binding",
+                    {"job_id": job.id, "worker_id": worker_id},
+                )
+            )
+            if binding is None or binding.get("browser_context_id_ciphertext") != ciphertext:
+                raise ManagedBrowserError(
+                    "provider_connection_invalid",
+                    "Reconnect this provider before running a managed application.",
+                )
+            source = binding.get("credential_source")
+            generation = binding.get("credential_generation")
+            epoch = binding.get("credential_epoch")
+            fingerprint = binding.get("project_fingerprint")
+            valid_binding = (
+                source in {"platform", "user"}
+                and isinstance(epoch, int)
+                and not isinstance(epoch, bool)
+                and epoch >= 0
+                and isinstance(fingerprint, str)
+                and _HASH.fullmatch(fingerprint) is not None
+                and (
+                    (source == "platform" and generation is None)
+                    or (
+                        source == "user"
+                        and isinstance(generation, int)
+                        and not isinstance(generation, bool)
+                        and generation >= 1
+                        and generation == epoch
+                    )
+                )
+            )
+            if not valid_binding:
+                raise ManagedBrowserError(
+                    "provider_connection_invalid",
+                    "Reconnect this provider before running a managed application.",
+                )
+            context_credential_source = source
+            context_credential_generation = generation
+            context_credential_epoch = epoch
+            context_project_fingerprint = fingerprint
             try:
                 context_id = self.cipher.decrypt(ciphertext)
             except Exception as exc:
@@ -383,6 +549,10 @@ class SupabaseTenantResources:
             phase=phase,
             target_url=target_url,
             context_id=context_id,
+            context_credential_source=context_credential_source,
+            context_credential_generation=context_credential_generation,
+            context_credential_epoch=context_credential_epoch,
+            context_project_fingerprint=context_project_fingerprint,
             approval=approval,
             resume_path=resume_path,
             resume_size_bytes=resume_size_bytes,
@@ -485,7 +655,7 @@ class BrowserRuntime:
 
     def __init__(
         self,
-        browserbase: BrowserbaseWorkerClient,
+        browserbase: BrowserbaseWorkerClient | None,
         *,
         playwright_factory: Any | None = None,
         navigation_timeout_ms: int = 30_000,
@@ -949,6 +1119,7 @@ class BrowserRuntime:
         *,
         resume_path: str | None,
         before_submit: Any | None = None,
+        browserbase: BrowserbaseWorkerClient | None = None,
     ) -> BrowserExecution:
         adapter = get_adapter(task.provider, target_url=task.target_url)
         if adapter is None:
@@ -977,6 +1148,13 @@ class BrowserRuntime:
                 )
             )
 
+        selected_browserbase = browserbase or self.browserbase
+        if selected_browserbase is None:
+            raise ManagedBrowserError(
+                "browserbase_credential_required",
+                "Add and validate a Browserbase API key and project ID before running browser work.",
+            )
+
         keep_alive = task.phase == "prefill" or (
             task.provider in _RETAINED_SUBMIT_PROVIDERS and task.phase == "submit"
         )
@@ -987,14 +1165,14 @@ class BrowserRuntime:
         }
         if task.context_id is None:
             session = await asyncio.to_thread(
-                self.browserbase.create_ephemeral_session_for_worker,
+                selected_browserbase.create_ephemeral_session_for_worker,
                 keep_alive=keep_alive,
                 timeout_seconds=_BROWSER_SESSION_TIMEOUT_SECONDS,
                 user_metadata=metadata,
             )
         else:
             session = await asyncio.to_thread(
-                self.browserbase.create_session_for_worker,
+                selected_browserbase.create_session_for_worker,
                 task.context_id,
                 keep_alive=keep_alive,
                 timeout_seconds=_BROWSER_SESSION_TIMEOUT_SECONDS,
@@ -1040,7 +1218,7 @@ class BrowserRuntime:
                         if wants_live_view:
                             try:
                                 live = await asyncio.to_thread(
-                                    self.browserbase.get_session_live_view, session.id
+                                    selected_browserbase.get_session_live_view, session.id
                                 )
                                 live_view_url = live.get("live_view_url")
                             except Exception:
@@ -1096,7 +1274,7 @@ class BrowserRuntime:
                     pass
             if not retain_session:
                 try:
-                    await asyncio.to_thread(self.browserbase.release_session, session.id)
+                    await asyncio.to_thread(selected_browserbase.release_session, session.id)
                 except Exception:
                     pass
 
@@ -1138,13 +1316,37 @@ class ManagedBrowserJobHandler:
 
         try:
             task = await self.resources.resolve(job, self.worker_id)
+            credential_resolver = getattr(self.resources, "browserbase_for_job", None)
+            selected_browserbase = (
+                await credential_resolver(job, self.worker_id)
+                if callable(credential_resolver)
+                else None
+            )
+            if task.context_id is not None:
+                selected_project_id = getattr(selected_browserbase, "project_id", None)
+                if (
+                    not isinstance(selected_project_id, str)
+                    or not isinstance(task.context_project_fingerprint, str)
+                    or not secrets.compare_digest(
+                        task.context_project_fingerprint,
+                        _browserbase_project_fingerprint(selected_project_id),
+                    )
+                ):
+                    raise ManagedBrowserError(
+                        "browserbase_credential_reconfiguration_required",
+                        "Reconnect this provider with the active Browserbase project before running browser work.",
+                    )
             if not await self.resources.progress(task, self.worker_id, "opening_provider"):
                 raise ManagedBrowserError(
                     "automation_lease_lost",
                     "The application lease ended before browser work began.",
                 )
             if task.phase == "scan":
-                execution = await self.runtime.execute(task, resume_path=None)
+                execution = await self.runtime.execute(
+                    task,
+                    resume_path=None,
+                    browserbase=selected_browserbase,
+                )
             else:
                 async def before_submit() -> bool:
                     return await self.resources.progress(
@@ -1156,6 +1358,7 @@ class ManagedBrowserJobHandler:
                         task,
                         resume_path=resume_path,
                         before_submit=before_submit if task.phase == "submit" else None,
+                        browserbase=selected_browserbase,
                     )
             if task.phase == "scan":
                 stored = await self.resources.store_scan(
@@ -1235,8 +1438,18 @@ def build_managed_job_handler(
     allowed_providers: tuple[str, ...],
     fallback: Any,
 ) -> ManagedBrowserJobHandler:
-    browserbase = BrowserbaseClient(browserbase_api_key, browserbase_project_id)
-    resources = SupabaseTenantResources(repository, TokenCipher(token_encryption_key))
+    browserbase = (
+        BrowserbaseClient(browserbase_api_key, browserbase_project_id)
+        if browserbase_api_key and browserbase_project_id
+        else None
+    )
+    resources = SupabaseTenantResources(
+        repository,
+        TokenCipher(token_encryption_key),
+        platform_browserbase_api_key=browserbase_api_key,
+        platform_browserbase_project_id=browserbase_project_id,
+        resolve_browserbase_byok=True,
+    )
     return ManagedBrowserJobHandler(
         resources,
         BrowserRuntime(browserbase),

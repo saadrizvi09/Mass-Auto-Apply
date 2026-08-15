@@ -44,6 +44,12 @@ class AccountDeletionRequest(StrictModel):
     confirmation: Literal["DELETE"]
 
 
+class BrowserbaseLocalAbandonRequest(StrictModel):
+    """Explicit acknowledgement for abandoning unreachable remote resources."""
+
+    confirmation: Literal["ABANDON REMOTE BROWSER DATA"]
+
+
 class GoogleOAuthClientUpsert(StrictModel):
     """A user's self-managed Google Web OAuth client credentials.
 
@@ -90,6 +96,47 @@ class GoogleOAuthStartRequest(StrictModel):
     """Choose which OAuth app should authorize the user's Gmail account."""
 
     credential_source: Literal["platform", "user"] = "platform"
+
+
+class ProviderCredentialUpsert(StrictModel):
+    """One tenant-owned provider credential accepted by the control plane.
+
+    The route selects the provider from the URL.  ``project_id`` is required only
+    for Browserbase; Groq and Hunter reject it.  Secret fields are deliberately
+    omitted from model representations and validation errors are rendered by the
+    application's non-reflecting validation handler.
+    """
+
+    api_key: str = Field(min_length=8, max_length=512, repr=False)
+    project_id: str | None = Field(default=None, min_length=6, max_length=255)
+
+    @field_validator("api_key", "project_id", mode="before")
+    @classmethod
+    def reject_implicit_credential_trimming(cls, value: Any) -> Any:
+        if isinstance(value, str) and value != value.strip():
+            raise ValueError("Provider credentials cannot contain surrounding whitespace")
+        return value
+
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key(cls, value: str) -> str:
+        if not value.isascii() or any(
+            character.isspace() or ord(character) < 33 or ord(character) > 126
+            for character in value
+        ):
+            raise ValueError("Enter a valid provider API key")
+        return value
+
+    @field_validator("project_id")
+    @classmethod
+    def validate_project_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.isascii() or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_-]{5,254}", value
+        ):
+            raise ValueError("Enter a valid Browserbase project ID")
+        return value
 
 
 class ProfileUpdate(StrictModel):

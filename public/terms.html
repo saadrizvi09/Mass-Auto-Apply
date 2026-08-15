@@ -133,14 +133,22 @@
           a failed hourly job can delay that physical deletion and is monitored by the operator.
         </p>
 
-        <h2>Your Groq key</h2>
+        <h2>Your provider API credentials</h2>
         <p>
-          If you use your own Groq API key, you are responsible for keeping it secure, following
-          Groq's terms, monitoring its use, and paying any provider charges. The key is saved in
-          a user-namespaced area of the browser profile you use, not your AutoApply account.
-          Ordinary sign-out preserves it; explicit key removal, successful account deletion, or
-          clearing browser site data removes it. Removing it from AutoApply does not revoke it at
-          Groq; rotate or revoke it with Groq when appropriate.
+          If you use your own Groq, Hunter, or Browserbase credentials, you are responsible for
+          keeping them secure, following each provider's terms, monitoring use and quotas, and
+          paying any provider charges. AutoApply validates the credential, encrypts it in
+          server-only account storage, and returns only safe status or masked hints to your
+          browser. Trusted service code may decrypt it only to perform an operation for your
+          account. Removing a credential from AutoApply does not revoke it at the provider;
+          rotate or revoke it with the provider when appropriate.
+        </p>
+        <p>
+          Browserbase requires an API key and Project ID. A saved pair is preferred for your
+          managed-browser sessions; the deployment may use its own trusted fallback when you have
+          not saved one. Browserbase currently applies at least one billable minute to every
+          created session. AutoApply closes sessions promptly and limits stalled work to 120
+          seconds, but you remain responsible for usage charged to your Browserbase account.
         </p>
 
         <h2>Your content</h2>

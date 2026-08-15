@@ -67,6 +67,7 @@ from app.saas.providers import browser_provider_allowed, get_provider, provider_
 from app.saas.resume import ResumeParseError, extract_pdf_text, profile_suggestions
 from app.saas.schemas import (
     AccountDeletionRequest,
+    BrowserbaseLocalAbandonRequest,
     ApplicationFormApprovalRequest,
     ApplicationFormSubmissionResolutionRequest,
     ApplicationStageRequest,
@@ -80,6 +81,7 @@ from app.saas.schemas import (
     JobCreate,
     JobUpdate,
     LinkedInDiscoveryRequest,
+    ProviderCredentialUpsert,
     PublicAtsBoardDiscoveryRequest,
     PublicAtsDiscoveryRequest,
     PublicFeedDiscoveryRequest,
@@ -126,6 +128,20 @@ PERSISTENT_CONTEXT_REQUIRED_PROVIDERS = frozenset(
 )
 ACCOUNT_DELETION_REAUTH_WINDOW = timedelta(minutes=10)
 ACCOUNT_DELETION_CLOCK_SKEW = timedelta(minutes=2)
+# Interactive provider login is the longest Browserbase flow.  Sessions are
+# released as soon as the user completes login; this is only a hard ceiling for
+# abandoned tabs so they cannot consume five full minutes per attempt.
+MANAGED_BROWSER_LOGIN_TIMEOUT_SECONDS = 180
+STORED_PROVIDER_IDS = ("groq", "hunter", "browserbase")
+PROVIDER_CREDENTIAL_LINKS: dict[str, dict[str, str]] = {
+    "groq": {"key_url": "https://console.groq.com/keys"},
+    "hunter": {"key_url": "https://hunter.io/api-keys"},
+    "browserbase": {
+        "key_url": "https://www.browserbase.com/settings",
+        "signup_url": "https://www.browserbase.com/sign-up",
+        "project_url": "https://www.browserbase.com/overview",
+    },
+}
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -136,6 +152,39 @@ class GoogleOAuthCredentials:
     client_id: str
     client_secret: str
     credential_generation: int | None = None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class StoredProviderCredential:
+    """A decrypted tenant credential that never crosses an API response boundary."""
+
+    provider: Literal["groq", "hunter", "browserbase"]
+    api_key: str
+    project_id: str | None
+    verification_status: Literal["verified", "unverified", "invalid"]
+    verification_code: str | None
+    generation: int
+    binding_fingerprint: str | None = None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class BrowserbaseCredentials:
+    """The Browserbase account selected consistently for one tenant."""
+
+    source: Literal["platform", "user"]
+    api_key: str
+    project_id: str
+    generation: int | None = None
+    project_fingerprint: str = ""
+    epoch: int = 0
+
+
+def _browserbase_project_fingerprint(project_id: str) -> str:
+    """Return a domain-separated non-reversible binding for one project ID."""
+
+    return hashlib.sha256(
+        b"autoapply.browserbase.project.v1\x00" + project_id.encode("utf-8")
+    ).hexdigest()
 
 
 def _first(value: Any) -> dict[str, Any] | None:
@@ -152,6 +201,16 @@ def _positive_integer(value: Any) -> int | None:
     if isinstance(value, str) and value.isascii() and value.isdigit():
         parsed = int(value)
         return parsed if parsed > 0 else None
+    return None
+
+
+def _nonnegative_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
     return None
 
 
@@ -183,11 +242,83 @@ def _browser_lifecycle_snapshot(value: Any, *, include_reuse: bool = False) -> d
         ):
             generation = None
         result[key] = ciphertext
+    # These fields describe an already-persisted context.  Start responses also
+    # carry a separate active credential binding below; keeping the names
+    # distinct prevents an old context from being mistaken for the credential
+    # selected for a new Browserbase session.
+    credential_source = value.get("context_credential_source")
+    if credential_source is None:
+        credential_source = value.get("credential_source")
+    if credential_source is not None and credential_source not in {"platform", "user"}:
+        generation = None
+    credential_generation = value.get("context_credential_generation")
+    if credential_generation is None:
+        credential_generation = value.get("credential_generation")
+    if credential_generation is not None:
+        credential_generation = _positive_integer(credential_generation)
+        if credential_generation is None:
+            generation = None
+    project_fingerprint = value.get("context_project_fingerprint")
+    if project_fingerprint is None:
+        project_fingerprint = value.get("project_fingerprint")
+    if project_fingerprint is not None and (
+        not isinstance(project_fingerprint, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", project_fingerprint)
+    ):
+        generation = None
+    result.update(
+        {
+            "credential_source": credential_source,
+            "credential_generation": credential_generation,
+            "project_fingerprint": project_fingerprint,
+        }
+    )
+    credential_epoch = value.get("context_credential_epoch")
+    if credential_epoch is None and not include_reuse:
+        credential_epoch = value.get("credential_epoch")
+    if credential_epoch is not None:
+        credential_epoch = _nonnegative_integer(credential_epoch)
+        if credential_epoch is None:
+            generation = None
+    result["context_credential_epoch"] = credential_epoch
+    if not include_reuse:
+        result["credential_epoch"] = credential_epoch
     if include_reuse:
         reuse_context = value.get("reuse_context")
         if not isinstance(reuse_context, bool):
             generation = None
         result["reuse_context"] = reuse_context
+        active_epoch = _nonnegative_integer(value.get("credential_epoch"))
+        active_source = value.get("active_credential_source")
+        active_generation = value.get("active_credential_generation")
+        active_fingerprint = value.get("active_project_fingerprint")
+        if active_source not in {"platform", "user"} or active_epoch is None:
+            generation = None
+        if active_generation is not None:
+            active_generation = _positive_integer(active_generation)
+            if active_generation is None:
+                generation = None
+        if active_fingerprint is not None and (
+            not isinstance(active_fingerprint, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", active_fingerprint)
+        ):
+            generation = None
+        if active_source == "user" and (
+            active_generation is None
+            or active_generation != active_epoch
+            or active_fingerprint is None
+        ):
+            generation = None
+        if active_source == "platform" and active_generation is not None:
+            generation = None
+        result.update(
+            {
+                "active_credential_source": active_source,
+                "active_credential_generation": active_generation,
+                "active_project_fingerprint": active_fingerprint,
+                "credential_epoch": active_epoch,
+            }
+        )
     if generation is None:
         raise ApiError(
             503,
@@ -492,6 +623,63 @@ def _google_client_id_hint(value: str) -> str:
     return f"{masked_stem}{suffix}" if value.endswith(suffix) else masked_stem
 
 
+def _provider_id(value: str) -> Literal["groq", "hunter", "browserbase"]:
+    clean = value.strip().lower() if isinstance(value, str) else ""
+    if clean not in STORED_PROVIDER_IDS:
+        raise ApiError(404, "provider_credential_unknown", "Choose a supported credential provider.")
+    return clean  # type: ignore[return-value]
+
+
+def _validated_provider_body(
+    provider: Literal["groq", "hunter", "browserbase"],
+    body: ProviderCredentialUpsert,
+) -> ProviderCredentialUpsert:
+    if provider == "browserbase":
+        if body.project_id is None:
+            raise ApiError(
+                422,
+                "browserbase_project_required",
+                "Enter the Browserbase project ID shown beside your API key.",
+            )
+    elif body.project_id is not None:
+        raise ApiError(
+            422,
+            "provider_credential_invalid",
+            "A project ID is supported only for Browserbase.",
+        )
+    return body
+
+
+def _provider_credential_plaintext(
+    provider: Literal["groq", "hunter", "browserbase"],
+    body: ProviderCredentialUpsert,
+) -> str:
+    envelope: dict[str, Any] = {
+        "version": 1,
+        "provider": provider,
+        "api_key": body.api_key,
+    }
+    if provider == "browserbase":
+        envelope["project_id"] = body.project_id
+    return json.dumps(envelope, separators=(",", ":"), sort_keys=True)
+
+
+def _credential_hint(value: str) -> str:
+    if len(value) <= 8:
+        return f"••••{value[-2:]}"
+    prefix = value.split("_", 1)[0]
+    visible_prefix = f"{prefix}_" if value.startswith(f"{prefix}_") else ""
+    return f"{visible_prefix}••••{value[-4:]}"
+
+
+def _identifier_hint(value: str | None) -> str | None:
+    if not value:
+        return None
+    if len(value) <= 12:
+        return f"{value[:4]}…"
+    return f"{value[:8]}…{value[-4:]}"
+
+
 async def _required_row(
     client: StoreClient, table: str, user: AuthUser, resource_id: UUID | str
 ) -> dict[str, Any]:
@@ -708,6 +896,419 @@ def create_app(
             "The Google OAuth app selection is invalid. Start the Gmail connection again.",
         )
 
+    async def load_user_provider_credential(
+        user_id: UUID | str,
+        provider: Literal["groq", "hunter", "browserbase"],
+        *,
+        required: bool = False,
+    ) -> StoredProviderCredential | None:
+        """Decrypt one tenant credential without exposing it to user-scoped REST.
+
+        A present-but-corrupt row fails closed.  In particular, falling back to
+        the platform Browserbase account after a tenant row becomes unreadable
+        could try to reuse a context ID in the wrong Browserbase project.
+        """
+
+        if not runtime_settings.provider_credential_store_ready:
+            if required:
+                raise ApiError(
+                    503,
+                    "provider_credential_store_unavailable",
+                    "Saved provider credentials are not available for this deployment.",
+                )
+            return None
+        row = await store_service.secret().fetch_one(
+            "user_provider_credentials",
+            columns=(
+                "user_id,provider,credential_ciphertext,verification_status,"
+                "verification_code,generation,binding_fingerprint,verified_at,"
+                "created_at,updated_at"
+            ),
+            filters={"user_id": str(user_id), "provider": provider},
+        )
+        if row is None:
+            if required:
+                raise ApiError(
+                    409,
+                    f"{provider}_credential_required",
+                    f"Save your {provider.title()} credential before using this feature.",
+                )
+            return None
+        try:
+            plaintext = _cipher(runtime_settings).decrypt(row["credential_ciphertext"])
+            envelope = json.loads(plaintext)
+            if not isinstance(envelope, dict):
+                raise ValueError("invalid provider credential envelope")
+            expected_keys = {"version", "provider", "api_key"}
+            if provider == "browserbase":
+                expected_keys.add("project_id")
+            if set(envelope) != expected_keys:
+                raise ValueError("invalid provider credential envelope")
+            if envelope.get("version") != 1 or envelope.get("provider") != provider:
+                raise ValueError("invalid provider credential envelope")
+            body = _validated_provider_body(
+                provider,
+                ProviderCredentialUpsert.model_validate(
+                    {
+                        "api_key": envelope.get("api_key"),
+                        "project_id": envelope.get("project_id"),
+                    }
+                ),
+            )
+            generation = _positive_integer(row.get("generation"))
+            verification_status = row.get("verification_status")
+            verification_code = row.get("verification_code")
+            binding_fingerprint = row.get("binding_fingerprint")
+            if generation is None or verification_status not in {
+                "verified",
+                "unverified",
+                "invalid",
+            }:
+                raise ValueError("invalid provider credential metadata")
+            if verification_code is not None and (
+                not isinstance(verification_code, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_]{1,63}", verification_code)
+            ):
+                raise ValueError("invalid provider verification code")
+            if provider == "browserbase":
+                expected_fingerprint = _browserbase_project_fingerprint(
+                    body.project_id or ""
+                )
+                if (
+                    not isinstance(binding_fingerprint, str)
+                    or not secrets.compare_digest(
+                        binding_fingerprint, expected_fingerprint
+                    )
+                ):
+                    raise ValueError("invalid Browserbase project binding")
+            elif binding_fingerprint is not None:
+                raise ValueError("unexpected provider credential binding")
+        except (
+            ApiError,
+            KeyError,
+            TokenCipherError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise ApiError(
+                409,
+                f"{provider}_credential_reconfiguration_required",
+                f"Re-save your {provider.title()} credential before using this feature.",
+            ) from exc
+        return StoredProviderCredential(
+            provider=provider,
+            api_key=body.api_key,
+            project_id=body.project_id,
+            verification_status=verification_status,
+            verification_code=verification_code,
+            generation=generation,
+            binding_fingerprint=binding_fingerprint,
+        )
+
+    def validated_header_key(value: str | None, provider: str) -> str | None:
+        if value is None:
+            return None
+        try:
+            return ProviderCredentialUpsert(api_key=value).api_key
+        except ValueError as exc:
+            raise ApiError(
+                400,
+                f"{provider}_key_required" if provider == "groq" else "hunter_missing_key",
+                f"Enter a valid {provider.title()} API key.",
+            ) from exc
+
+    async def resolve_groq_key(value: str | None, user: AuthUser) -> str:
+        header_key = validated_header_key(value, "groq")
+        if header_key is not None:
+            return header_key
+        stored = await load_user_provider_credential(user.user_id, "groq")
+        if stored is None:
+            raise ApiError(400, "groq_key_required", "Save a valid Groq API key first.")
+        if stored.verification_status == "invalid":
+            raise ApiError(
+                409,
+                "groq_credential_reconfiguration_required",
+                "The saved Groq key was rejected. Replace it before continuing.",
+            )
+        return stored.api_key
+
+    async def resolve_hunter_key(value: str | None, user: AuthUser) -> str:
+        header_key = validated_header_key(value, "hunter")
+        if header_key is not None:
+            return header_key
+        stored = await load_user_provider_credential(user.user_id, "hunter")
+        if stored is None:
+            raise ApiError(400, "hunter_missing_key", "Save a valid Hunter API key first.")
+        if stored.verification_status == "invalid":
+            raise ApiError(
+                409,
+                "hunter_credential_reconfiguration_required",
+                "The saved Hunter key was rejected. Replace it before continuing.",
+            )
+        return stored.api_key
+
+    async def load_browserbase_epoch(user_id: UUID | str) -> int:
+        if not runtime_settings.provider_credential_store_ready:
+            return 0
+        value = await store_service.secret().rpc(
+            "get_browserbase_credential_state", {"user_id_input": str(user_id)}
+        )
+        if isinstance(value, Mapping):
+            value = value.get("epoch")
+        epoch = _nonnegative_integer(value)
+        if epoch is None:
+            raise ApiError(
+                503,
+                "data_store_invalid_response",
+                "The data service returned an invalid Browserbase credential state.",
+            )
+        return epoch
+
+    async def resolve_browserbase_credentials(
+        user_id: UUID | str,
+        *,
+        expected_epoch: int | None = None,
+    ) -> BrowserbaseCredentials:
+        epoch = (
+            expected_epoch
+            if expected_epoch is not None
+            else await load_browserbase_epoch(user_id)
+        )
+        if _nonnegative_integer(epoch) is None:
+            raise ApiError(
+                503,
+                "data_store_invalid_response",
+                "The data service returned an invalid Browserbase credential state.",
+            )
+        stored = await load_user_provider_credential(user_id, "browserbase")
+        if stored is not None:
+            if stored.verification_status != "verified" or not stored.project_id:
+                raise ApiError(
+                    409,
+                    "browserbase_credential_reconfiguration_required",
+                    "Validate or replace your saved Browserbase credential before continuing.",
+                )
+            if stored.generation != epoch:
+                raise ApiError(
+                    409,
+                    "browserbase_credential_reconfiguration_required",
+                    "The saved Browserbase credential is stale. Re-save it before continuing.",
+                )
+            return BrowserbaseCredentials(
+                source="user",
+                api_key=stored.api_key,
+                project_id=stored.project_id,
+                generation=stored.generation,
+                project_fingerprint=stored.binding_fingerprint or "",
+                epoch=epoch,
+            )
+        if runtime_settings.browserbase_configured:
+            return BrowserbaseCredentials(
+                source="platform",
+                api_key=runtime_settings.browserbase_api_key,
+                project_id=runtime_settings.browserbase_project_id,
+                project_fingerprint=_browserbase_project_fingerprint(
+                    runtime_settings.browserbase_project_id
+                ),
+                epoch=epoch,
+            )
+        raise ApiError(
+            409,
+            "browserbase_credential_required",
+            "Add and validate your Browserbase API key and project ID first.",
+        )
+
+    async def browserbase_client_for(user_id: UUID | str) -> BrowserbaseClient:
+        credentials = await resolve_browserbase_credentials(user_id)
+        return BrowserbaseClient(credentials.api_key, credentials.project_id)
+
+    def assert_browserbase_binding(
+        credentials: BrowserbaseCredentials,
+        snapshot: Mapping[str, Any],
+        *,
+        allow_unbound_legacy_cleanup: bool = False,
+    ) -> None:
+        """Fail closed when a context is not bound to the selected account/project."""
+
+        bound_source = snapshot.get("credential_source") or snapshot.get(
+            "browser_credential_source"
+        )
+        bound_generation = snapshot.get("credential_generation")
+        if bound_generation is None:
+            bound_generation = snapshot.get("browser_credential_generation")
+        bound_fingerprint = snapshot.get("project_fingerprint") or snapshot.get(
+            "browser_project_fingerprint"
+        )
+        bound_epoch = snapshot.get("context_credential_epoch")
+        if bound_epoch is None:
+            bound_epoch = snapshot.get("credential_epoch")
+        if bound_epoch is None:
+            bound_epoch = snapshot.get("browser_credential_epoch")
+        if bound_source is None and bound_generation is None and bound_fingerprint is None:
+            if allow_unbound_legacy_cleanup:
+                # A user-requested disconnect may make one best-effort cleanup
+                # attempt. Start/complete must never adopt or rebind an old
+                # context whose Browserbase project cannot be proven.
+                return
+            raise ApiError(
+                409,
+                "browserbase_credential_binding_stale",
+                "The saved browser context predates project binding. Disconnect it or "
+                "explicitly abandon it before starting again.",
+            )
+        valid = (
+            bound_source == credentials.source
+            and isinstance(bound_fingerprint, str)
+            and secrets.compare_digest(
+                bound_fingerprint, credentials.project_fingerprint
+            )
+            and (
+                (credentials.source == "user" and bound_generation == credentials.generation)
+                or (credentials.source == "platform" and bound_generation is None)
+            )
+            and (
+                bound_epoch is None or bound_epoch == credentials.epoch
+            )
+        )
+        if not valid:
+            raise ApiError(
+                409,
+                "browserbase_credential_binding_stale",
+                "The saved browser context belongs to a different Browserbase project.",
+            )
+
+    def assert_active_browserbase_binding(
+        credentials: BrowserbaseCredentials, snapshot: Mapping[str, Any]
+    ) -> None:
+        """Match credentials resolved after ``begin_browser_start`` to its CAS."""
+
+        source = snapshot.get("active_credential_source")
+        generation = snapshot.get("active_credential_generation")
+        fingerprint = snapshot.get("active_project_fingerprint")
+        epoch = snapshot.get("credential_epoch")
+        valid = (
+            source == credentials.source
+            and epoch == credentials.epoch
+            and (
+                (
+                    source == "user"
+                    and generation == credentials.generation
+                    and isinstance(fingerprint, str)
+                    and secrets.compare_digest(
+                        fingerprint, credentials.project_fingerprint
+                    )
+                )
+                or (
+                    source == "platform"
+                    and generation is None
+                    and fingerprint is None
+                )
+            )
+        )
+        if not valid:
+            raise ApiError(
+                409,
+                "browserbase_credential_binding_stale",
+                "The Browserbase credential changed while the login was starting.",
+            )
+
+    async def disconnect_managed_browser_connection(
+        provider_id: str,
+        user: AuthUser,
+        *,
+        missing_ok: bool = False,
+        browserbase_credentials: BrowserbaseCredentials | None = None,
+    ) -> dict[str, bool]:
+        """Remove one remote context before discarding its encrypted handle."""
+
+        provider_id = provider_id.strip().lower()
+        if provider_id not in MANAGED_BROWSER_LIFECYCLE_PROVIDERS:
+            raise ApiError(
+                409,
+                "provider_connection_unavailable",
+                "This provider does not support a managed-browser connection.",
+            )
+        if missing_ok:
+            connection = await store_service.user(user.access_token).fetch_one(
+                "connections",
+                columns="id,provider,mode,status",
+                filters={"user_id": str(user.user_id), "provider": provider_id},
+            )
+            if connection is None:
+                return {"ok": True}
+
+        server = store_service.secret()
+        lifecycle = _browser_lifecycle_snapshot(
+            await server.rpc(
+                "begin_browser_disconnect",
+                {"user_id_input": str(user.user_id), "provider_input": provider_id},
+            )
+        )
+        context_ciphertext = lifecycle["context_ciphertext"]
+        session_ciphertext = lifecycle["session_ciphertext"]
+        if context_ciphertext or session_ciphertext:
+            try:
+                cipher = _cipher(runtime_settings)
+                context_id = cipher.decrypt_optional(context_ciphertext)
+                session_id = cipher.decrypt_optional(session_ciphertext)
+                credentials = browserbase_credentials or await resolve_browserbase_credentials(
+                    user.user_id
+                )
+                assert_browserbase_binding(
+                    credentials,
+                    lifecycle,
+                    allow_unbound_legacy_cleanup=True,
+                )
+                browser = BrowserbaseClient(credentials.api_key, credentials.project_id)
+                if session_id:
+                    await run_in_threadpool(browser.release_session, session_id)
+                if context_id:
+                    await run_in_threadpool(browser.delete_context, context_id)
+            except (ApiError, BrowserbaseError, TokenCipherError) as exc:
+                raise ApiError(
+                    503,
+                    "provider_disconnect_failed",
+                    "The remote browser context could not be removed. Try again.",
+                ) from exc
+        finished = await server.rpc(
+            "finish_browser_disconnect",
+            {
+                "user_id_input": str(user.user_id),
+                "provider_input": provider_id,
+                "expected_generation_input": lifecycle["generation"],
+                "expected_connection_id_input": lifecycle["connection_id"],
+            },
+        )
+        if finished is not True:
+            raise ApiError(
+                503,
+                "data_store_invalid_response",
+                "The data service returned an invalid browser lifecycle response.",
+            )
+        return {"ok": True}
+
+    async def disconnect_all_managed_browser_connections(
+        user: AuthUser,
+        *,
+        browserbase_credentials: BrowserbaseCredentials | None = None,
+    ) -> None:
+        rows = await store_service.user(user.access_token).fetch_many(
+            "connections",
+            columns="id,provider,mode,status",
+            filters={"user_id": str(user.user_id), "mode": "managed_browser"},
+            limit=100,
+        )
+        for row in rows:
+            provider = row.get("provider")
+            if isinstance(provider, str) and provider in MANAGED_BROWSER_LIFECYCLE_PROVIDERS:
+                await disconnect_managed_browser_connection(
+                    provider,
+                    user,
+                    missing_ok=True,
+                    browserbase_credentials=browserbase_credentials,
+                )
+
     async def ingest_discovered_jobs(
         jobs: list[Mapping[str, Any]], user: AuthUser
     ) -> dict[str, Any]:
@@ -839,7 +1440,7 @@ def create_app(
             provider,
             runtime_settings.allowed_browser_providers,
             google_configured=runtime_settings.google_configured,
-            browserbase_configured=runtime_settings.browserbase_configured,
+            browserbase_configured=runtime_settings.managed_browser_available,
         )
         capability_key = {
             "scan": "can_scan",
@@ -857,6 +1458,7 @@ def create_app(
                 "provider_automation_unavailable",
                 f"Managed-browser {operation} support is not enabled for this provider.",
             )
+        await resolve_browserbase_credentials(user.user_id)
         connection = await store_service.user(user.access_token).fetch_one(
             "connections",
             filters={"user_id": str(user.user_id), "provider": provider},
@@ -894,7 +1496,7 @@ def create_app(
         catalog = provider_catalog(
             runtime_settings.allowed_browser_providers,
             google_configured=runtime_settings.gmail_connection_available,
-            browserbase_configured=runtime_settings.browserbase_configured,
+            browserbase_configured=runtime_settings.managed_browser_available,
         )
         return _items(catalog)
 
@@ -1119,8 +1721,7 @@ def create_app(
     ) -> dict[str, Any]:
         """Derive a bounded public-source search plan from the active résumé."""
 
-        if not groq_key or len(groq_key) > 512:
-            raise ApiError(400, "groq_key_required", "Save a valid Groq API key first.")
+        groq_key = await resolve_groq_key(groq_key, user)
         client = store_service.user(user.access_token)
         resume = await client.fetch_one(
             "resumes",
@@ -1483,7 +2084,7 @@ def create_app(
     async def delete_account(
         body: AccountDeletionRequest,
         user: AuthUser = Depends(authenticated_user),
-    ) -> dict[str, bool]:
+    ) -> dict[str, Any]:
         """Delete provider state, private objects, database rows, and the Auth user."""
 
         signed_in_at = user.last_sign_in_at
@@ -1501,9 +2102,19 @@ def create_app(
 
         client = store_service.user(user.access_token)
         server = store_service.secret()
-        await client.rpc(
+        deletion_ready = await client.rpc(
             "begin_account_deletion", {"confirmation_input": body.confirmation}
         )
+        if deletion_ready is not True:
+            # The RPC commits cancellation requests and keeps the account in its
+            # deletion-only state. A later authenticated retry may proceed only
+            # after every worker has stopped holding tenant plaintext/browser
+            # credentials.
+            raise ApiError(
+                409,
+                "account_automation_jobs_running",
+                "Account deletion requested cancellation of active work. Retry after the running worker stops.",
+            )
         connections = await client.fetch_many(
             "connections",
             filters={"user_id": str(user.user_id)},
@@ -1536,33 +2147,35 @@ def create_app(
                     # privacy page also explains Google-account-side revocation.
                     pass
 
-            context_ciphertext = secret_row.get("browser_context_id_ciphertext")
-            session_ciphertext = secret_row.get("browser_session_id_ciphertext")
-            if context_ciphertext or session_ciphertext:
-                if not runtime_settings.browserbase_configured:
-                    raise ApiError(
-                        503,
-                        "account_remote_cleanup_unavailable",
-                        "A managed-browser login must be cleaned up before account deletion.",
-                    )
-                try:
-                    cipher = _cipher(runtime_settings)
-                    context_id = cipher.decrypt_optional(context_ciphertext)
-                    session_id = cipher.decrypt_optional(session_ciphertext)
-                    browser = BrowserbaseClient(
-                        runtime_settings.browserbase_api_key,
-                        runtime_settings.browserbase_project_id,
-                    )
-                    if session_id:
-                        await run_in_threadpool(browser.release_session, session_id)
-                    if context_id:
-                        await run_in_threadpool(browser.delete_context, context_id)
-                except (ApiError, BrowserbaseError, TokenCipherError) as exc:
+        remote_browser_cleanup_confirmed = True
+        if any(
+            connection.get("mode") == "managed_browser"
+            for connection in connections
+        ):
+            try:
+                old_credentials = await resolve_browserbase_credentials(user.user_id)
+                await disconnect_all_managed_browser_connections(
+                    user, browserbase_credentials=old_credentials
+                )
+            except (ApiError, BrowserbaseError, TokenCipherError):
+                # Total account deletion is already explicitly confirmed and the
+                # profile is in `deleting`. If a revoked/corrupt key makes remote
+                # cleanup impossible, record the loss of remote confirmation and
+                # remove the local handles so Auth deletion cannot strand PII.
+                abandoned = await server.rpc(
+                    "abandon_browserbase_resources",
+                    {
+                        "user_id_input": str(user.user_id),
+                        "confirmation_input": "ABANDON REMOTE BROWSER DATA",
+                    },
+                )
+                if abandoned is not True:
                     raise ApiError(
                         503,
                         "account_remote_cleanup_failed",
                         "A managed-browser login could not be removed. Try account deletion again.",
-                    ) from exc
+                    )
+                remote_browser_cleanup_confirmed = False
 
         try:
             object_paths = await _list_owned_resume_objects(server, user.user_id)
@@ -1576,7 +2189,17 @@ def create_app(
             await server.delete_objects(RESUME_BUCKET, object_paths[offset : offset + 100])
 
         await server.delete_auth_user(user.user_id, should_soft_delete=False)
-        return {"ok": True}
+        response: dict[str, Any] = {"ok": True}
+        if not remote_browser_cleanup_confirmed:
+            response.update(
+                {
+                    "remote_browser_cleanup_confirmed": False,
+                    "browserbase_dashboard_url": PROVIDER_CREDENTIAL_LINKS[
+                        "browserbase"
+                    ]["project_url"],
+                }
+            )
+        return response
 
     @application.post("/api/v1/resumes/register", status_code=201, tags=["resumes"])
     async def register_resume(
@@ -1692,8 +2315,7 @@ def create_app(
     ) -> dict[str, Any]:
         """Return reviewed profile suggestions without mutating the user's profile."""
 
-        if not groq_key or len(groq_key) > 512:
-            raise ApiError(400, "groq_key_required", "Save a valid Groq API key first.")
+        groq_key = await resolve_groq_key(groq_key, user)
         client = store_service.user(user.access_token)
         resume = await _required_row(client, "resumes", user, resume_id)
         resume_text = resume.get("parsed_text")
@@ -1732,13 +2354,353 @@ def create_app(
         )
         return {"ok": True}
 
+    @application.get("/api/v1/provider-credentials", tags=["connections"])
+    async def list_provider_credentials(
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        """Return tenant-safe credential state; never return encrypted or plaintext values."""
+
+        rows: list[dict[str, Any]] = []
+        if runtime_settings.provider_credential_store_ready:
+            rows = await store_service.secret().fetch_many(
+                "user_provider_credentials",
+                columns=(
+                    "provider,verification_status,verification_code,verified_at,"
+                    "created_at,updated_at"
+                ),
+                filters={"user_id": str(user.user_id)},
+                limit=len(STORED_PROVIDER_IDS),
+            )
+        by_provider = {
+            row.get("provider"): row
+            for row in rows
+            if row.get("provider") in STORED_PROVIDER_IDS
+        }
+        items: list[dict[str, Any]] = []
+        for provider_value in STORED_PROVIDER_IDS:
+            provider = _provider_id(provider_value)
+            row = by_provider.get(provider)
+            key_hint: str | None = None
+            project_id_hint: str | None = None
+            requires_reconfiguration = False
+            if row is not None:
+                try:
+                    stored = await load_user_provider_credential(
+                        user.user_id, provider, required=True
+                    )
+                    assert stored is not None
+                    key_hint = _credential_hint(stored.api_key)
+                    project_id_hint = _identifier_hint(stored.project_id)
+                except ApiError as exc:
+                    if exc.code.endswith("_reconfiguration_required"):
+                        requires_reconfiguration = True
+                    else:
+                        raise
+            items.append(
+                {
+                    "provider": provider,
+                    "configured": row is not None,
+                    "verification_status": (
+                        row.get("verification_status") if row is not None else "missing"
+                    ),
+                    "verification_code": (
+                        row.get("verification_code") if row is not None else None
+                    ),
+                    "verified_at": row.get("verified_at") if row is not None else None,
+                    "updated_at": row.get("updated_at") if row is not None else None,
+                    "key_hint": key_hint,
+                    "project_id_hint": project_id_hint,
+                    "requires_reconfiguration": requires_reconfiguration,
+                    **PROVIDER_CREDENTIAL_LINKS[provider],
+                }
+            )
+        return {
+            "items": items,
+            "count": len(items),
+            "store_available": runtime_settings.provider_credential_store_ready,
+            "platform_browserbase_available": runtime_settings.browserbase_configured,
+        }
+
+    @application.put("/api/v1/provider-credentials/{provider_id}", tags=["connections"])
+    async def save_provider_credential(
+        provider_id: str,
+        body: ProviderCredentialUpsert,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        if not runtime_settings.provider_credential_store_ready:
+            raise ApiError(
+                503,
+                "provider_credential_store_unavailable",
+                "Saved provider credentials are not configured for this deployment.",
+            )
+        provider = _provider_id(provider_id)
+        validated = _validated_provider_body(provider, body)
+        server = store_service.secret()
+        existing = await server.fetch_one(
+            "user_provider_credentials",
+            columns=(
+                "provider,verification_status,verification_code,generation,"
+                "binding_fingerprint"
+            ),
+            filters={"user_id": str(user.user_id), "provider": provider},
+        )
+        verification: dict[str, Any]
+        expected_browserbase_epoch: int | None = None
+        old_browserbase_credentials: BrowserbaseCredentials | None = None
+
+        if provider == "browserbase":
+            expected_browserbase_epoch = await load_browserbase_epoch(user.user_id)
+            if existing is not None or runtime_settings.browserbase_configured:
+                # Capture the old account/project before validating the
+                # replacement. Any stored contexts must be removed with the
+                # credential that created them, never with the candidate key.
+                old_browserbase_credentials = await resolve_browserbase_credentials(
+                    user.user_id, expected_epoch=expected_browserbase_epoch
+                )
+
+        if provider == "groq":
+            try:
+                await store_service.user(user.access_token).rpc(
+                    "reserve_groq_request", {"operation_input": "validate"}
+                )
+            except ApiError as exc:
+                if exc.status_code != 429:
+                    raise
+                verification = {
+                    "valid": False,
+                    "status": "groq_validation_deferred",
+                    "message": "The key was saved. Validate it after the temporary limit clears.",
+                }
+            else:
+                verification = await run_in_threadpool(
+                    validate_groq_key, validated.api_key, runtime_settings.groq_model
+                )
+        elif provider == "hunter":
+            verification = await run_in_threadpool(validate_hunter_key, validated.api_key)
+        else:
+            try:
+                verification = await run_in_threadpool(
+                    BrowserbaseClient(validated.api_key, validated.project_id or "").validate_project
+                )
+            except BrowserbaseError as exc:
+                verification = {
+                    "valid": False,
+                    "status": exc.code,
+                    "message": str(exc),
+                }
+
+            # The Browserbase project ID is itself account configuration.  The
+            # caller already receives a masked hint, so keep only explicitly
+            # safe validation diagnostics even when a test/different adapter
+            # returns additional provider fields.
+            verification = {
+                key: verification[key]
+                for key in (
+                    "valid",
+                    "status",
+                    "message",
+                    "project_name",
+                    "concurrency",
+                    "default_timeout",
+                )
+                if key in verification
+            }
+
+        valid = verification.get("valid") is True
+        raw_code = verification.get("status")
+        verification_code = (
+            raw_code
+            if isinstance(raw_code, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", raw_code)
+            and raw_code != "ready"
+            else None
+        )
+        if valid:
+            verification_status: Literal["verified", "unverified", "invalid"] = "verified"
+        elif provider == "groq" and verification_code == "groq_invalid_key":
+            verification_status = "invalid"
+        elif provider == "hunter" and verification_code == "hunter_invalid_key":
+            verification_status = "invalid"
+        elif provider == "browserbase" and verification_code not in {
+            "browserbase_timeout",
+            "browserbase_unavailable",
+            "browserbase_rate_limited",
+        }:
+            verification_status = "invalid"
+        else:
+            # Rate limits, model permissions, and provider outages must not make a
+            # syntactically valid credential impossible to save for later use.
+            verification_status = "unverified"
+
+        if provider == "browserbase":
+            if verification_status != "verified":
+                raise ApiError(
+                    503 if verification_status == "unverified" else 422,
+                    verification_code or "browserbase_validation_failed",
+                    str(
+                        verification.get("message")
+                        or "Browserbase could not validate that key and project."
+                    ),
+                )
+            # Context IDs are scoped to the project that created them.  Remove all
+            # old remote handles with the captured old client before changing the
+            # project-bound credential. Invalid/outage candidates never reach here.
+            await disconnect_all_managed_browser_connections(
+                user, browserbase_credentials=old_browserbase_credentials
+            )
+        elif (
+            existing is not None
+            and existing.get("verification_status") == "verified"
+            and verification_status != "verified"
+        ):
+            # A bad replacement must not downgrade a key that is already known
+            # to work. First-time transient credentials may still be saved as
+            # unverified so the user can validate later.
+            raise ApiError(
+                503 if verification_status == "unverified" else 422,
+                verification_code or f"{provider}_validation_failed",
+                str(
+                    verification.get("message")
+                    or f"{provider.title()} could not validate the replacement key."
+                ),
+            )
+
+        encrypted = _cipher(runtime_settings).encrypt(
+            _provider_credential_plaintext(provider, validated)
+        )
+        saved = _first(
+            await server.rpc(
+                "save_user_provider_credential",
+                {
+                    "user_id_input": str(user.user_id),
+                    "provider_input": provider,
+                    "credential_ciphertext_input": encrypted,
+                    "verification_status_input": verification_status,
+                    "verification_code_input": verification_code,
+                    "verified_at_input": (
+                        datetime.now(UTC).isoformat() if verification_status == "verified" else None
+                    ),
+                    "binding_fingerprint_input": (
+                        _browserbase_project_fingerprint(validated.project_id or "")
+                        if provider == "browserbase"
+                        else None
+                    ),
+                    "expected_browserbase_epoch_input": expected_browserbase_epoch,
+                },
+            )
+        )
+        if saved is None:
+            raise ApiError(
+                503,
+                "data_store_invalid_response",
+                "The provider credential could not be saved.",
+            )
+        return {
+            "data": {
+                "provider": provider,
+                "configured": True,
+                "verification_status": verification_status,
+                "verification_code": verification_code,
+                "verified_at": saved.get("verified_at"),
+                "updated_at": saved.get("updated_at"),
+                "key_hint": _credential_hint(validated.api_key),
+                "project_id_hint": _identifier_hint(validated.project_id),
+                "requires_reconfiguration": False,
+                **PROVIDER_CREDENTIAL_LINKS[provider],
+            },
+            "verification": verification,
+        }
+
+    @application.delete(
+        "/api/v1/provider-credentials/{provider_id}", tags=["connections"]
+    )
+    async def delete_provider_credential(
+        provider_id: str,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, bool]:
+        if not runtime_settings.provider_credential_store_ready:
+            raise ApiError(
+                503,
+                "provider_credential_store_unavailable",
+                "Saved provider credentials are not configured for this deployment.",
+            )
+        provider = _provider_id(provider_id)
+        server = store_service.secret()
+        existing = await server.fetch_one(
+            "user_provider_credentials",
+            columns="provider,verification_status,generation,binding_fingerprint",
+            filters={"user_id": str(user.user_id), "provider": provider},
+        )
+        expected_browserbase_epoch: int | None = None
+        if provider == "browserbase":
+            if existing is None:
+                return {"ok": True}
+            expected_browserbase_epoch = await load_browserbase_epoch(user.user_id)
+            old_credentials = await resolve_browserbase_credentials(
+                user.user_id, expected_epoch=expected_browserbase_epoch
+            )
+            await disconnect_all_managed_browser_connections(
+                user, browserbase_credentials=old_credentials
+            )
+        deleted = await server.rpc(
+            "delete_user_provider_credential",
+            {
+                "user_id_input": str(user.user_id),
+                "provider_input": provider,
+                "expected_browserbase_epoch_input": expected_browserbase_epoch,
+            },
+        )
+        if deleted is not True:
+            raise ApiError(
+                503,
+                "data_store_invalid_response",
+                "The provider credential could not be deleted.",
+            )
+        return {"ok": True}
+
+    @application.post(
+        "/api/v1/provider-credentials/browserbase/abandon",
+        tags=["connections"],
+    )
+    async def abandon_browserbase_resources_locally(
+        body: BrowserbaseLocalAbandonRequest,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        """Explicitly abandon handles only when remote cleanup is impossible."""
+
+        if not runtime_settings.provider_credential_store_ready:
+            raise ApiError(
+                503,
+                "provider_credential_store_unavailable",
+                "Saved provider credentials are not configured for this deployment.",
+            )
+        abandoned = await store_service.secret().rpc(
+            "abandon_browserbase_resources",
+            {
+                "user_id_input": str(user.user_id),
+                "confirmation_input": body.confirmation,
+            },
+        )
+        if abandoned is not True:
+            raise ApiError(
+                503,
+                "data_store_invalid_response",
+                "Browserbase resources could not be abandoned locally.",
+            )
+        return {
+            "ok": True,
+            "remote_cleanup_confirmed": False,
+            "browserbase_dashboard_url": PROVIDER_CREDENTIAL_LINKS["browserbase"][
+                "project_url"
+            ],
+        }
+
     @application.post("/api/v1/groq/validate", tags=["groq"])
     async def validate_groq(
         groq_key: str | None = Header(default=None, alias="X-Groq-Api-Key"),
         user: AuthUser = Depends(current_user),
     ) -> dict[str, Any]:
-        if not groq_key or len(groq_key) > 512:
-            raise ApiError(400, "groq_key_required", "Enter a valid Groq API key.")
+        groq_key = await resolve_groq_key(groq_key, user)
         await store_service.user(user.access_token).rpc(
             "reserve_groq_request", {"operation_input": "validate"}
         )
@@ -1751,9 +2713,7 @@ def create_app(
         hunter_key: str | None = Header(default=None, alias="X-Hunter-Api-Key"),
         user: AuthUser = Depends(current_user),
     ) -> dict[str, Any]:
-        del user
-        if not hunter_key or len(hunter_key) > 512:
-            raise ApiError(400, "hunter_missing_key", "Enter a valid Hunter API key.")
+        hunter_key = await resolve_hunter_key(hunter_key, user)
         return await run_in_threadpool(validate_hunter_key, hunter_key)
 
     @application.get("/api/v1/jobs", tags=["jobs"])
@@ -1842,8 +2802,7 @@ def create_app(
         hunter_key: str | None = Header(default=None, alias="X-Hunter-Api-Key"),
         user: AuthUser = Depends(current_user),
     ) -> dict[str, Any]:
-        if not hunter_key or len(hunter_key) > 512:
-            raise ApiError(400, "hunter_missing_key", "Save a valid Hunter API key first.")
+        hunter_key = await resolve_hunter_key(hunter_key, user)
         job = await _required_row(
             store_service.user(user.access_token), "jobs", user, job_id
         )
@@ -1925,8 +2884,7 @@ def create_app(
         groq_key: str | None = Header(default=None, alias="X-Groq-Api-Key"),
         user: AuthUser = Depends(current_user),
     ) -> dict[str, Any]:
-        if not groq_key or len(groq_key) > 512:
-            raise ApiError(400, "groq_key_required", "Enter a valid Groq API key.")
+        groq_key = await resolve_groq_key(groq_key, user)
         client = store_service.user(user.access_token)
         await client.rpc("reserve_groq_request", {"operation_input": "generate"})
         writer = store_service.secret()
@@ -2299,7 +3257,11 @@ def create_app(
                     "source": "profile",
                 }
             }
-        if not groq_key or len(groq_key) > 512:
+        try:
+            groq_key = await resolve_groq_key(groq_key, user)
+        except ApiError as exc:
+            if exc.code != "groq_key_required":
+                raise
             # Deterministic profile facts remain useful without AI. Unknown/open
             # questions stay blank for the user instead of blocking known fields.
             return {
@@ -2908,7 +3870,7 @@ def create_app(
         catalog = provider_catalog(
             runtime_settings.allowed_browser_providers,
             google_configured=runtime_settings.gmail_connection_available,
-            browserbase_configured=runtime_settings.browserbase_configured,
+            browserbase_configured=runtime_settings.managed_browser_available,
         )
         merged = [item | {"connection": by_provider.get(item["id"])} for item in catalog]
         return _items(merged)
@@ -3342,7 +4304,7 @@ def create_app(
             provider_id,
             runtime_settings.allowed_browser_providers,
             google_configured=runtime_settings.google_configured,
-            browserbase_configured=runtime_settings.browserbase_configured,
+            browserbase_configured=runtime_settings.managed_browser_available,
         )
         if (
             capability is None
@@ -3350,7 +4312,7 @@ def create_app(
             or not browser_provider_allowed(
                 provider_id, runtime_settings.allowed_browser_providers
             )
-            or not runtime_settings.browserbase_configured
+            or not runtime_settings.managed_browser_available
         ):
             raise ApiError(
                 409,
@@ -3359,9 +4321,10 @@ def create_app(
             )
         server = store_service.secret()
         cipher = _cipher(runtime_settings)
-        browser = BrowserbaseClient(
-            runtime_settings.browserbase_api_key, runtime_settings.browserbase_project_id
-        )
+        # Move the database lifecycle to `connecting` before decrypting a key or
+        # touching Browserbase.  Credential save/delete and application enqueue
+        # use the same account lock and reject this lifecycle, closing the
+        # resolve-before-start rotation race.
         lifecycle = _browser_lifecycle_snapshot(
             await server.rpc(
                 "begin_browser_start",
@@ -3372,29 +4335,36 @@ def create_app(
         generation = lifecycle["generation"]
         connection_id = lifecycle["connection_id"]
         reuse_context = lifecycle["reuse_context"]
-        try:
-            context_id = cipher.decrypt_optional(lifecycle["context_ciphertext"])
-            prior_session_id = cipher.decrypt_optional(lifecycle["session_ciphertext"])
-        except TokenCipherError as exc:
-            raise ApiError(
-                409,
-                "browser_context_invalid",
-                "The saved browser login cannot be opened. Disconnect it first.",
-            ) from exc
-
-        replacing_existing_context = bool(context_id and not reuse_context)
+        credentials: BrowserbaseCredentials | None = None
+        browser: BrowserbaseClient | None = None
+        context_id: str | None = None
+        prior_session_id: str | None = None
+        replacing_existing_context = False
         created_context = False
         session_id: str | None = None
         session_ciphertext: str | None = None
         context_ciphertext: str | None = None
-        initial_cleanup_complete = False
+        remote_cleanup_complete = True
         try:
+            credentials = await resolve_browserbase_credentials(
+                user.user_id, expected_epoch=lifecycle["credential_epoch"]
+            )
+            assert_active_browserbase_binding(credentials, lifecycle)
+            if lifecycle["context_ciphertext"] or lifecycle["session_ciphertext"]:
+                assert_browserbase_binding(credentials, lifecycle)
+            browser = BrowserbaseClient(credentials.api_key, credentials.project_id)
+            context_id = cipher.decrypt_optional(lifecycle["context_ciphertext"])
+            prior_session_id = cipher.decrypt_optional(lifecycle["session_ciphertext"])
+            replacing_existing_context = bool(context_id and not reuse_context)
             if prior_session_id:
+                remote_cleanup_complete = False
                 await run_in_threadpool(browser.release_session, prior_session_id)
+                remote_cleanup_complete = True
             if replacing_existing_context and context_id:
+                remote_cleanup_complete = False
                 await run_in_threadpool(browser.delete_context, context_id)
                 context_id = None
-            initial_cleanup_complete = True
+                remote_cleanup_complete = True
 
             if context_id is None:
                 context_id = (await run_in_threadpool(browser.create_context))["id"]
@@ -3402,13 +4372,17 @@ def create_app(
             context_ciphertext = cipher.encrypt(context_id)
             connection = _first(
                 await server.rpc(
-                    "save_browser_connection_context",
+                    "save_browser_connection_context_bound",
                     {
                         "user_id_input": str(user.user_id),
                         "provider_input": provider_id,
                         "expected_generation_input": generation,
                         "display_name_input": capability["label"],
                         "context_ciphertext_input": context_ciphertext,
+                        "credential_source_input": credentials.source,
+                        "credential_generation_input": credentials.generation,
+                        "credential_epoch_input": credentials.epoch,
+                        "project_fingerprint_input": credentials.project_fingerprint,
                     },
                 )
             )
@@ -3428,7 +4402,7 @@ def create_app(
                 browser.create_session,
                 context_id,
                 keep_alive=False,
-                timeout_seconds=900,
+                timeout_seconds=MANAGED_BROWSER_LOGIN_TIMEOUT_SECONDS,
                 user_metadata={"provider": provider_id},
             )
             session_id = session["id"]
@@ -3469,13 +4443,12 @@ def create_app(
                     "The data service returned an invalid browser lifecycle response.",
                 )
         except (ApiError, BrowserbaseError, TokenCipherError) as exc:
-            remote_cleanup_complete = initial_cleanup_complete
-            if session_id:
+            if session_id and browser is not None:
                 try:
                     await run_in_threadpool(browser.release_session, session_id)
                 except BrowserbaseError:
                     remote_cleanup_complete = False
-            if created_context and context_id:
+            if created_context and context_id and browser is not None:
                 try:
                     await run_in_threadpool(browser.delete_context, context_id)
                 except BrowserbaseError:
@@ -3553,10 +4526,9 @@ def create_app(
             session_id = cipher.decrypt(session_ciphertext)
         except TokenCipherError as exc:
             raise ApiError(409, "browser_context_missing", "Start the provider login again.") from exc
-        browser = BrowserbaseClient(
-            runtime_settings.browserbase_api_key,
-            runtime_settings.browserbase_project_id,
-        )
+        credentials = await resolve_browserbase_credentials(user.user_id)
+        assert_browserbase_binding(credentials, secret_row)
+        browser = BrowserbaseClient(credentials.api_key, credentials.project_id)
         try:
             session = await run_in_threadpool(browser.get_session, session_id)
         except BrowserbaseError as exc:
@@ -3629,56 +4601,7 @@ def create_app(
         provider_id = provider_id.strip().lower()
         if provider_id == "gmail":
             return await disconnect_gmail(user)
-        if provider_id not in MANAGED_BROWSER_LIFECYCLE_PROVIDERS:
-            raise ApiError(
-                409,
-                "provider_connection_unavailable",
-                "This provider does not support a managed-browser connection.",
-            )
-        server = store_service.secret()
-        lifecycle = _browser_lifecycle_snapshot(
-            await server.rpc(
-                "begin_browser_disconnect",
-                {"user_id_input": str(user.user_id), "provider_input": provider_id},
-            )
-        )
-        context_ciphertext = lifecycle["context_ciphertext"]
-        session_ciphertext = lifecycle["session_ciphertext"]
-        if context_ciphertext or session_ciphertext:
-            try:
-                cipher = _cipher(runtime_settings)
-                context_id = cipher.decrypt_optional(context_ciphertext)
-                session_id = cipher.decrypt_optional(session_ciphertext)
-                browser = BrowserbaseClient(
-                    runtime_settings.browserbase_api_key,
-                    runtime_settings.browserbase_project_id,
-                )
-                if session_id:
-                    await run_in_threadpool(browser.release_session, session_id)
-                if context_id:
-                    await run_in_threadpool(browser.delete_context, context_id)
-            except (ApiError, BrowserbaseError, TokenCipherError) as exc:
-                raise ApiError(
-                    503,
-                    "provider_disconnect_failed",
-                    "The remote browser context could not be removed. Try again.",
-                ) from exc
-        finished = await server.rpc(
-            "finish_browser_disconnect",
-            {
-                "user_id_input": str(user.user_id),
-                "provider_input": provider_id,
-                "expected_generation_input": lifecycle["generation"],
-                "expected_connection_id_input": lifecycle["connection_id"],
-            },
-        )
-        if finished is not True:
-            raise ApiError(
-                503,
-                "data_store_invalid_response",
-                "The data service returned an invalid browser lifecycle response.",
-            )
-        return {"ok": True}
+        return await disconnect_managed_browser_connection(provider_id, user)
 
     @application.post(
         "/api/v1/automation-jobs", status_code=status.HTTP_202_ACCEPTED, tags=["automation"]
@@ -3708,7 +4631,7 @@ def create_app(
                 body.provider,
                 runtime_settings.allowed_browser_providers,
                 google_configured=runtime_settings.google_configured,
-                browserbase_configured=runtime_settings.browserbase_configured,
+                browserbase_configured=runtime_settings.managed_browser_available,
             )
             if capability is None:
                 raise ApiError(422, "provider_unknown", "Choose a supported provider.")

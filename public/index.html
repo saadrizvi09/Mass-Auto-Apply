@@ -13,8 +13,8 @@
       content="default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co; frame-src https://challenges.cloudflare.com; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
     />
     <title>AutoApply Cloud — Your job search, thoughtfully organized</title>
-    <link rel="stylesheet" href="/styles.css?v=20260815.1" />
-    <script type="module" src="/app.js?v=20260815.1"></script>
+    <link rel="stylesheet" href="/styles.css?v=20260815.3" />
+    <script type="module" src="/app.js?v=20260815.3"></script>
   </head>
   <body>
     <a id="skip-link" class="skip-link" href="#public-main">Skip to main content</a>
@@ -287,7 +287,7 @@
             <li>
               <span class="step-number">03</span>
               <h3>Shape the message</h3>
-              <p>Use your browser-stored Groq key to create a truthful draft, then edit every word.</p>
+              <p>Use your account-synced Groq credential to create a truthful draft, then edit every word.</p>
             </li>
             <li>
               <span class="step-number">04</span>
@@ -542,7 +542,7 @@
               <div>
                 <p class="eyebrow">Start with your evidence</p>
                 <h2 id="profile-foundation-heading">Build your profile from one PDF.</h2>
-                <p>Save your Groq key first, then upload a résumé to extract factual details and recommend suitable roles. Review every suggestion below before saving.</p>
+                <p>Connect Groq once in Connections, then upload a résumé to extract factual details and recommend suitable roles. Review every suggestion below before saving.</p>
               </div>
               <span class="status-pill status-info">Private setup</span>
             </div>
@@ -550,43 +550,40 @@
             <div class="profile-source-grid">
               <section class="profile-source-card groq-panel" aria-labelledby="groq-heading">
                 <div class="profile-source-heading">
-                  <span class="profile-source-step" aria-hidden="true">1</span>
-                  <div><p class="eyebrow">Connect AI</p><h3 id="groq-heading">Add your Groq key</h3></div>
-                  <span id="groq-status-pill" class="status-pill status-neutral">Not saved</span>
+                  <span class="profile-source-step" aria-hidden="true">AI</span>
+                  <div><p class="eyebrow">Account credential</p><h3 id="groq-heading">Add or replace your Groq key</h3></div>
+                  <span id="groq-status-pill" class="status-pill status-neutral">Checking</span>
                 </div>
-                <p>Your key stays in this browser and is sent to AutoApply only when you validate it, analyze your résumé, or generate a draft.</p>
+                <p>Groq powers résumé extraction, role matching, and grounded drafts. Your encrypted account credential follows you after sign-in and is never returned to this browser.</p>
                 <div id="groq-saved-summary" class="secret-summary" hidden>
                   <span aria-hidden="true">●●●●</span><code id="groq-masked-key"></code>
                 </div>
-                <form id="groq-form" class="stack-form" autocomplete="off">
+                <form id="groq-form" class="stack-form" data-provider-credential="groq" autocomplete="off">
                   <div class="field">
                     <label for="groq-key">Groq API key</label>
-                    <div class="input-action">
-                      <input id="groq-key" name="groq_key" type="password" maxlength="512" spellcheck="false" autocomplete="off" placeholder="gsk_…" />
-                      <button id="toggle-groq-visibility" class="icon-button" type="button" aria-label="Show API key">◉</button>
-                    </div>
+                    <input id="groq-key" name="api_key" type="password" maxlength="512" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="Paste a new or replacement gsk_… key" required />
                   </div>
                   <div class="button-row">
-                    <button class="button button-primary button-small" type="submit">Save in browser</button>
-                    <button id="validate-groq" class="button button-ghost button-small" type="button">Validate</button>
-                    <button id="delete-groq" class="button button-danger-quiet button-small" type="button">Delete</button>
+                    <button id="validate-groq" class="button button-primary button-small" type="submit">Save &amp; validate</button>
+                    <button id="delete-groq" class="button button-danger-quiet button-small" type="button">Delete saved key</button>
+                    <button id="manage-groq-credential" class="button button-ghost button-small" type="button">Open credential vault</button>
                   </div>
                 </form>
                 <p id="groq-message" class="form-message" role="status"></p>
                 <p class="muted">No key yet? <a class="text-link" href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer">Create one in Groq Console <span aria-hidden="true">↗</span></a></p>
                 <details class="disclosure">
                   <summary>Where the key is stored</summary>
-                  <p>Anyone with access to this browser profile can potentially retrieve this key. AutoApply does not sync it across devices or store it in Supabase. Delete it before using a shared computer.</p>
+                  <p>The key is encrypted in your private account credential vault. AutoApply returns only a masked hint and verification time—not the secret itself.</p>
                 </details>
               </section>
 
               <section class="profile-source-card profile-resume-card" aria-labelledby="resume-heading">
                 <div class="profile-source-heading">
-                  <span class="profile-source-step" aria-hidden="true">2</span>
+                  <span class="profile-source-step" aria-hidden="true">1</span>
                   <div><p class="eyebrow">Add your evidence</p><h3 id="resume-heading">Upload your résumé</h3></div>
                   <span class="status-pill status-neutral">PDF · 6 MB max</span>
                 </div>
-                <p>The PDF uploads directly to your private Supabase Storage folder. With a Groq key saved, parsing also extracts profile facts and suitable roles.</p>
+                <p>The PDF uploads directly to your private Supabase Storage folder. With Groq connected, parsing also extracts profile facts and suitable roles.</p>
                 <form id="resume-upload-form" class="upload-zone profile-upload-zone">
                   <input id="resume-file" class="file-input" name="resume" type="file" accept="application/pdf,.pdf" />
                   <label for="resume-file">
@@ -987,27 +984,31 @@
             <div class="mass-email-key-intro">
               <span class="hunter-access-stamp" aria-hidden="true">H</span>
               <div>
-                <p class="eyebrow">Start here · Contact finder</p>
-                <h2 id="hunter-access-heading">Add your Hunter key</h2>
-                <p>Save and validate your key before searching recruiter contacts. The key stays in this browser and is sent only for validation or a contact search you start.</p>
+                <p class="eyebrow">Account credential · Contact finder</p>
+                <h2 id="hunter-access-heading">Add or replace your Hunter key</h2>
+                <p>Your encrypted Hunter credential is shared across your signed-in devices and used only for validation or a contact search you start.</p>
               </div>
-              <span id="hunter-key-status" class="status-pill status-neutral" role="status" aria-live="polite">Key not saved</span>
+              <span id="hunter-key-status" class="status-pill status-neutral" role="status" aria-live="polite">Checking</span>
             </div>
-
-            <form id="hunter-setup-form" class="hunter-setup-form hunter-setup-top" autocomplete="off">
-              <div class="field">
-                <label for="hunter-api-key">Hunter API key</label>
-                <input id="hunter-api-key" name="hunter_api_key" type="password" maxlength="512" spellcheck="false" autocomplete="off" placeholder="Enter your Hunter key" />
-                <small>Need a key? <a class="text-link" href="https://hunter.io/api-keys" target="_blank" rel="noopener noreferrer">Open Hunter API keys <span aria-hidden="true">↗</span></a></small>
+            <div class="hunter-setup-form hunter-setup-top">
+              <div id="hunter-saved-summary" class="secret-summary" hidden>
+                <span aria-hidden="true">●●●●</span><code id="hunter-masked-key"></code>
               </div>
-              <div class="hunter-key-actions">
-                <button class="button button-primary button-small" type="submit">Save in browser</button>
-                <button id="hunter-validate" class="button button-ghost button-small" type="button">Validate</button>
-                <button id="hunter-delete" class="button button-danger-quiet button-small" type="button">Delete</button>
-              </div>
-              <div class="hunter-quota-row"><span>Hunter search allowance</span><strong id="hunter-quota" aria-live="polite">Not checked</strong></div>
+              <form id="hunter-setup-form" class="stack-form" data-provider-credential="hunter" autocomplete="off">
+                <div class="field">
+                  <label for="hunter-api-key">Hunter API key</label>
+                  <input id="hunter-api-key" name="api_key" type="password" maxlength="512" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="Paste a new or replacement Hunter key" required />
+                </div>
+                <div class="hunter-key-actions">
+                  <button id="hunter-validate" class="button button-primary button-small" type="submit">Save &amp; validate</button>
+                  <button id="hunter-delete" class="button button-danger-quiet button-small" type="button">Delete saved key</button>
+                  <button id="manage-hunter-credential" class="button button-ghost button-small" type="button">Open credential vault</button>
+                  <a class="button button-ghost button-small" href="https://hunter.io/api-keys" target="_blank" rel="noopener noreferrer">Get a Hunter key <span aria-hidden="true">↗</span></a>
+                </div>
+              </form>
+              <div class="hunter-quota-row"><span>Hunter search allowance</span><strong id="hunter-quota" aria-live="polite">Checking account credential</strong></div>
               <p id="hunter-key-message" class="form-message hunter-key-message" role="status" aria-live="polite"></p>
-            </form>
+            </div>
           </section>
 
           <section class="outreach-hero" aria-labelledby="outreach-hero-heading">
@@ -1279,6 +1280,119 @@
             </div>
             <button id="gmail-revocation-acknowledge" class="button button-ghost button-small" type="button">I removed access in Google</button>
           </div>
+
+          <section id="provider-credential-vault" class="panel credential-vault" aria-labelledby="provider-credential-vault-heading">
+            <div class="credential-vault-heading">
+              <div>
+                <p class="eyebrow">Bring your own keys</p>
+                <h2 id="provider-credential-vault-heading">Your service credential vault</h2>
+                <p>Keys are validated before saving, encrypted for your account, and never displayed again. They persist across logins and stay available to queued workers after this tab closes.</p>
+              </div>
+              <span id="credential-vault-status" class="status-pill status-neutral" role="status" aria-live="polite">Checking credentials</span>
+            </div>
+            <div id="credential-vault-message" class="notice credential-vault-message" role="status" aria-live="polite" hidden></div>
+
+            <div class="credential-card-grid">
+              <article id="credential-card-groq" class="credential-card" data-credential-provider="groq">
+                <div class="credential-card-heading">
+                  <span class="credential-provider-mark is-groq" aria-hidden="true">GQ</span>
+                  <div><p class="eyebrow">AI workspace</p><h3>Groq</h3></div>
+                  <span id="credential-groq-status" class="status-pill status-neutral">Not connected</span>
+                </div>
+                <p>Résumé extraction, fit planning, form answers, and grounded cold-email drafts.</p>
+                <div id="credential-groq-summary" class="credential-summary" hidden>
+                  <code id="credential-groq-key-hint">••••</code>
+                  <small id="credential-groq-verified-at">Validated</small>
+                  <div class="button-row">
+                    <button class="button button-ghost button-small" type="button" data-credential-edit="groq">Replace</button>
+                    <button class="button button-danger-quiet button-small" type="button" data-credential-delete="groq">Delete</button>
+                  </div>
+                </div>
+                <form id="credential-form-groq" class="credential-form stack-form" data-provider-credential="groq" autocomplete="off">
+                  <div class="field">
+                    <label for="credential-groq-api-key">Groq API key</label>
+                    <input id="credential-groq-api-key" name="api_key" type="password" maxlength="512" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="gsk_…" required />
+                  </div>
+                  <div class="button-row">
+                    <button class="button button-primary button-small" type="submit">Save &amp; validate</button>
+                    <button class="button button-ghost button-small" type="button" data-credential-cancel="groq" hidden>Cancel</button>
+                  </div>
+                </form>
+                <a class="credential-provider-link" href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer">Create a free Groq key <span aria-hidden="true">↗</span></a>
+                <p id="credential-groq-message" class="form-message" role="status"></p>
+              </article>
+
+              <article id="credential-card-hunter" class="credential-card" data-credential-provider="hunter">
+                <div class="credential-card-heading">
+                  <span class="credential-provider-mark is-hunter" aria-hidden="true">H</span>
+                  <div><p class="eyebrow">Contact discovery</p><h3>Hunter</h3></div>
+                  <span id="credential-hunter-status" class="status-pill status-neutral">Not connected</span>
+                </div>
+                <p>Public recruiting and HR contact searches for companies you explicitly select.</p>
+                <div id="credential-hunter-summary" class="credential-summary" hidden>
+                  <code id="credential-hunter-key-hint">••••</code>
+                  <small id="credential-hunter-verified-at">Validated</small>
+                  <small id="credential-hunter-quota">Search allowance available after validation</small>
+                  <div class="button-row">
+                    <button class="button button-ghost button-small" type="button" data-credential-edit="hunter">Replace</button>
+                    <button class="button button-danger-quiet button-small" type="button" data-credential-delete="hunter">Delete</button>
+                  </div>
+                </div>
+                <form id="credential-form-hunter" class="credential-form stack-form" data-provider-credential="hunter" autocomplete="off">
+                  <div class="field">
+                    <label for="credential-hunter-api-key">Hunter API key</label>
+                    <input id="credential-hunter-api-key" name="api_key" type="password" maxlength="512" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="Paste your Hunter key" required />
+                  </div>
+                  <div class="button-row">
+                    <button class="button button-primary button-small" type="submit">Save &amp; validate</button>
+                    <button class="button button-ghost button-small" type="button" data-credential-cancel="hunter" hidden>Cancel</button>
+                  </div>
+                </form>
+                <a class="credential-provider-link" href="https://hunter.io/api-keys" target="_blank" rel="noopener noreferrer">Create a free Hunter key <span aria-hidden="true">↗</span></a>
+                <p id="credential-hunter-message" class="form-message" role="status"></p>
+              </article>
+
+              <article id="credential-card-browserbase" class="credential-card is-browserbase" data-credential-provider="browserbase">
+                <div class="credential-card-heading">
+                  <span class="credential-provider-mark is-browserbase" aria-hidden="true">B</span>
+                  <div><p class="eyebrow">Managed browser</p><h3>Browserbase</h3></div>
+                  <span id="credential-browserbase-status" class="status-pill status-neutral">Not connected</span>
+                </div>
+                <p>Isolated browser sessions for reviewed forms and supported application workflows. Usage is charged to your Browserbase account.</p>
+                <div id="credential-browserbase-summary" class="credential-summary" hidden>
+                  <code id="credential-browserbase-key-hint">••••</code>
+                  <strong id="credential-browserbase-project">Project connected</strong>
+                  <small id="credential-browserbase-verified-at">Validated</small>
+                  <div class="button-row">
+                    <button class="button button-ghost button-small" type="button" data-credential-edit="browserbase">Replace</button>
+                    <button class="button button-danger-quiet button-small" type="button" data-credential-delete="browserbase">Delete</button>
+                  </div>
+                </div>
+                <form id="credential-form-browserbase" class="credential-form stack-form" data-provider-credential="browserbase" autocomplete="off">
+                  <div class="field">
+                    <label for="credential-browserbase-api-key">Browserbase API key</label>
+                    <input id="credential-browserbase-api-key" name="api_key" type="password" maxlength="512" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="Paste your Browserbase key" required />
+                  </div>
+                  <div class="field">
+                    <label for="credential-browserbase-project-id">Browserbase Project ID</label>
+                    <input id="credential-browserbase-project-id" name="project_id" type="text" maxlength="160" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Find this beside your API key in Overview" required />
+                  </div>
+                  <div class="button-row">
+                    <button class="button button-primary button-small" type="submit">Save &amp; validate</button>
+                    <button class="button button-ghost button-small" type="button" data-credential-cancel="browserbase" hidden>Cancel</button>
+                  </div>
+                </form>
+                <div class="credential-link-row">
+                  <a class="credential-provider-link" href="https://www.browserbase.com/sign-up" target="_blank" rel="noopener noreferrer">Create a free Browserbase account <span aria-hidden="true">↗</span></a>
+                  <a class="credential-provider-link" href="https://www.browserbase.com/settings" target="_blank" rel="noopener noreferrer">Copy API key <span aria-hidden="true">↗</span></a>
+                  <a class="credential-provider-link" href="https://www.browserbase.com/overview" target="_blank" rel="noopener noreferrer">Copy Project ID <span aria-hidden="true">↗</span></a>
+                  <a class="credential-provider-link is-muted" href="https://docs.browserbase.com/welcome/getting-started" target="_blank" rel="noopener noreferrer">Setup guide <span aria-hidden="true">↗</span></a>
+                </div>
+                <p id="credential-browserbase-message" class="form-message" role="status"></p>
+              </article>
+            </div>
+          </section>
+
           <div id="connection-list" class="connection-grid" aria-live="polite"></div>
 
           <section id="gmail-oauth-setup" class="panel gmail-oauth-setup" aria-labelledby="gmail-oauth-heading">
@@ -1458,7 +1572,7 @@
 
             <section class="panel span-3 data-boundary">
               <div><p class="eyebrow">Your data boundary</p><h2>Connections and stored data remain under your control.</h2></div>
-              <p>Disconnect individual providers from the Connections page, remove your browser-stored Groq key from Profile, or permanently delete the entire workspace below.</p>
+              <p>Disconnect providers and remove encrypted service credentials from Connections, or permanently delete the entire workspace below.</p>
             </section>
 
             <section class="panel span-3 danger-zone" aria-labelledby="delete-account-heading">
@@ -1467,8 +1581,9 @@
                 <h2 id="delete-account-heading">Permanently delete this account</h2>
                 <p>
                   This removes your profile, résumés, jobs, application history, saved connections,
-                  and account. AutoApply will also remove this account’s Groq key from this browser
-                  and sign you out. This cannot be undone.
+                  encrypted provider credentials, and account. AutoApply will also remove older
+                  browser-only Groq or Hunter copies for this account and sign you out. This cannot
+                  be undone.
                 </p>
               </div>
               <form id="account-delete-form" class="stack-form danger-zone-form" autocomplete="off">
