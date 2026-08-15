@@ -1147,6 +1147,139 @@ def test_submit_queues_only_the_approved_owned_revision() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("outcome", "resolved_status", "retry_created"),
+    [
+        ("submitted", "submitted", False),
+        ("not_submitted", "prefilled", True),
+        # An idempotent replay can return a retry revision that has since been
+        # submitted. The original resolution is still not_submitted because
+        # the returned immutable revision has a different id.
+        ("not_submitted", "submitted", True),
+    ],
+)
+def test_uncertain_form_submission_resolution_uses_tenant_rpc(
+    outcome: str, resolved_status: str, retry_created: bool
+) -> None:
+    revision_id = str(uuid4())
+    application_id = str(uuid4())
+    schema_hash = "9" * 64
+    resolved_id = revision_id if outcome == "submitted" else str(uuid4())
+    store = FakeStore(
+        {
+            "application_form_revisions": [
+                {
+                    "id": revision_id,
+                    "user_id": str(USER_ID),
+                    "application_id": application_id,
+                    "revision": 4,
+                    "schema_hash": schema_hash,
+                    "status": "approved" if outcome == "submitted" else "needs_attention",
+                    "submission_result": (
+                        None
+                        if outcome == "submitted"
+                        else {"submission_state": "uncertain"}
+                    ),
+                }
+            ]
+        },
+        rpc_results={
+            "resolve_application_form_submission": [
+                {
+                    "id": resolved_id,
+                    "user_id": str(USER_ID),
+                    "application_id": application_id,
+                    "revision": 4 if outcome == "submitted" else 5,
+                    "schema_hash": schema_hash,
+                    "status": resolved_status,
+                }
+            ]
+        },
+    )
+
+    response = TestClient(
+        create_app(settings=configured_settings(), auth=FakeAuth(), store=store)
+    ).post(
+        f"/api/v1/application-form-revisions/{revision_id}/resolve-submission",
+        json={
+            "outcome": outcome,
+            "expected_revision": 4,
+            "schema_hash": schema_hash,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["status"] == resolved_status
+    assert response.json()["resolution"] == {
+        "outcome": outcome,
+        "retry_created": retry_created,
+        "rescan_required": retry_created,
+    }
+    assert store.rpc_calls[-1] == (
+        "resolve_application_form_submission",
+        {
+            "revision_id_input": revision_id,
+            "expected_revision_input": 4,
+            "expected_schema_hash_input": schema_hash,
+            "outcome_input": outcome,
+        },
+    )
+    assert store.received_token == "verified-user-jwt"
+
+
+def test_form_submission_resolution_rejects_unowned_or_nonattention_revision() -> None:
+    unowned_revision_id = str(uuid4())
+    store = FakeStore(
+        {
+            "application_form_revisions": [
+                {
+                    "id": unowned_revision_id,
+                    "user_id": str(OTHER_USER_ID),
+                    "revision": 1,
+                    "schema_hash": "a" * 64,
+                    "status": "needs_attention",
+                }
+            ]
+        }
+    )
+    client = TestClient(
+        create_app(settings=configured_settings(), auth=FakeAuth(), store=store)
+    )
+
+    unowned = client.post(
+        f"/api/v1/application-form-revisions/{unowned_revision_id}/resolve-submission",
+        json={
+            "outcome": "submitted",
+            "expected_revision": 1,
+            "schema_hash": "a" * 64,
+        },
+    )
+    assert unowned.status_code == 404, unowned.text
+    assert store.rpc_calls == []
+
+    owned_revision_id = str(uuid4())
+    store.client.tables["application_form_revisions"].append(
+        {
+            "id": owned_revision_id,
+            "user_id": str(USER_ID),
+            "revision": 2,
+            "schema_hash": "b" * 64,
+            "status": "scanned",
+        }
+    )
+    settled = client.post(
+        f"/api/v1/application-form-revisions/{owned_revision_id}/resolve-submission",
+        json={
+            "outcome": "not_submitted",
+            "expected_revision": 2,
+            "schema_hash": "b" * 64,
+        },
+    )
+    assert settled.status_code == 409, settled.text
+    assert settled.json()["error"]["code"] == "form_submission_not_uncertain"
+    assert store.rpc_calls == []
+
+
 def test_google_forms_allows_exact_approved_prefill_and_submit() -> None:
     application_id = str(uuid4())
     revision_id = str(uuid4())

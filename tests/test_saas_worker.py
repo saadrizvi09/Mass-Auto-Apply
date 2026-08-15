@@ -480,7 +480,9 @@ def test_supabase_queue_store_uses_stable_rpc_contracts() -> None:
     assert repository.closed is True
 
 
-@pytest.mark.parametrize("submission_state", ["uncertain", "confirmed"])
+@pytest.mark.parametrize(
+    "submission_state", ["not_attempted", "uncertain", "confirmed"]
+)
 def test_submit_attention_atomically_fences_revision_and_completes_job(
     submission_state: str,
 ) -> None:

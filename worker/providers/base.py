@@ -1301,6 +1301,10 @@ class ProviderAdapter:
     submit_selectors: tuple[str, ...]
     confirmation_path_patterns: tuple[str, ...]
     confirmation_text: tuple[str, ...]
+    # Provider-owned validation copy that proves the final action was rejected
+    # before a response/application was accepted. Keep this empty unless the
+    # provider's contract is unambiguous (Google Forms is all-or-nothing).
+    rejection_text: tuple[str, ...] = ()
     form_selectors: tuple[str, ...] = ("form",)
     login_redirect_hosts: frozenset[str] = frozenset()
     # A single union selector keeps DOM de-duplication in Playwright.  It is used
@@ -1708,6 +1712,15 @@ class ProviderAdapter:
         except Exception:
             return False
         return any(marker.casefold() in body for marker in self.confirmation_text)
+
+    async def rejected(self, page: Any) -> bool:
+        if not self.rejection_text:
+            return False
+        try:
+            body = (await page.locator("body").inner_text(timeout=2_000)).casefold()
+        except Exception:
+            return False
+        return any(marker.casefold() in body for marker in self.rejection_text)
 
 
 __all__ = [

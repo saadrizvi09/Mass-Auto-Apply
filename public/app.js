@@ -3605,6 +3605,12 @@ async function scanJobApplication(job, provider, button) {
   return withBusy(button, "Preparing form…", async () => {
     try {
       const identity = identitySnapshot();
+      const existingApplication = state.formApplications.find(
+        (item) => item.job_id === job.id && item.channel === "ats",
+      );
+      const baselineRevisionId = existingApplication?.id
+        ? latestFormRevision(existingApplication.id)?.id || null
+        : null;
       const payload = await apiRequest(`/jobs/${encodeURIComponent(job.id)}/application/scan`, {
         method: "POST",
         body: { idempotency_key: discoveryRunKey("scan"), form_revision_id: null },
@@ -3628,7 +3634,11 @@ async function scanJobApplication(job, provider, button) {
         ? state.formApplications.find((item) => item.id === applicationId)
         : state.formApplications.find((item) => item.job_id === job.id && item.channel === "ats");
       if (!application?.id) throw new AppError("The form scan started, but its review desk could not be opened.", "form_application_missing");
-      await openFormApplicationReview(application.id, { monitorJobId: automationJobId, identity });
+      await openFormApplicationReview(application.id, {
+        monitorJobId: automationJobId,
+        baselineRevisionId,
+        identity,
+      });
       toast(`${humanize(provider)} scan started. Form Pilot will show the questions and grounded suggestions automatically.`, "success");
       return true;
     } catch (error) {
@@ -3815,7 +3825,12 @@ function activeFormScanJob(applicationId) {
 
 async function openFormApplicationReview(
   id,
-  { monitorJobId = null, identity = identitySnapshot(), scroll = true } = {},
+  {
+    monitorJobId = null,
+    baselineRevisionId = undefined,
+    identity = identitySnapshot(),
+    scroll = true,
+  } = {},
 ) {
   if (!id) return false;
   const application = formApplicationById(id);
@@ -3824,6 +3839,9 @@ async function openFormApplicationReview(
   populateFormApplicationReview(application);
   switchView("form_pilot");
   const trackedJobId = monitorJobId || activeFormScanJob(id)?.id || null;
+  const trackedBaselineRevisionId = baselineRevisionId === undefined
+    ? latestFormRevision(id)?.id || null
+    : baselineRevisionId;
   try {
     await loadApplicationFormRevisions(id, false, !trackedJobId, identity);
   } catch (error) {
@@ -3831,7 +3849,7 @@ async function openFormApplicationReview(
     setFormMessage("form-revision-message", errorMessage(error, "The captured form revision could not be loaded."), "error");
   }
   if (trackedJobId) {
-    monitorFormScan(trackedJobId, id, identity).catch((error) => {
+    monitorFormScan(trackedJobId, id, identity, trackedBaselineRevisionId).catch((error) => {
       if (!isIdentityChanged(error)) {
         setFormMessage("form-revision-message", errorMessage(error, "The live form scan status could not be refreshed."), "error");
       }
@@ -3955,7 +3973,8 @@ function revisionQuestions(revision) {
 
 function latestFormRevision(applicationId) {
   const revisions = state.formRevisions[applicationId] || [];
-  return [...revisions].sort((a, b) => Number(b.revision || 0) - Number(a.revision || 0))[0] || null;
+  const ordered = [...revisions].sort((a, b) => Number(b.revision || 0) - Number(a.revision || 0));
+  return ordered.find((revision) => formRevisionSubmissionIsVerified(revision)) || ordered[0] || null;
 }
 
 function waitForFormWorkflowPoll() {
@@ -4100,7 +4119,7 @@ function rememberAutomationJob(job) {
   if (index >= 0) state.automationJobs[index] = job;
   else state.automationJobs.unshift(job);
   if (job.kind === "application_submit") {
-    const revisionId = job.payload?.form_revision_id || job.result?.form_revision_id;
+    const revisionId = job.form_revision_id || job.payload?.form_revision_id || job.result?.form_revision_id;
     if (revisionId) state.formSubmissionJobs.set(revisionId, job);
   }
 }
@@ -4140,7 +4159,12 @@ async function monitorFormWorkflowJob(jobId, identity = identitySnapshot(), onUp
   }
 }
 
-async function monitorFormScan(jobId, applicationId, identity = identitySnapshot()) {
+async function monitorFormScan(
+  jobId,
+  applicationId,
+  identity = identitySnapshot(),
+  baselineRevisionId = latestFormRevision(applicationId)?.id || null,
+) {
   showFormWorkflowProgress({
     title: "Capturing the visible form",
     detail: "The worker is opening this Google Form and recording its current questions.",
@@ -4179,7 +4203,18 @@ async function monitorFormScan(jobId, applicationId, identity = identitySnapshot
   ]);
   await loadApplicationFormRevisions(applicationId, true, true, identity);
   const revision = latestFormRevision(applicationId);
-  if (revision) {
+  const scanJob = outcome.job || {};
+  const scanStatus = String(scanJob.status || "").toLowerCase();
+  const scanRevisionId = scanJob.progress?.scan_revision_id
+    || scanJob.result?.scan_revision_id
+    || scanJob.result?.form_revision_id
+    || null;
+  const capturedThisRun = Boolean(
+    scanStatus === "succeeded"
+      && revision?.id
+      && (scanRevisionId ? revision.id === scanRevisionId : revision.id !== baselineRevisionId),
+  );
+  if (capturedThisRun) {
     showFormWorkflowProgress({
       title: "Questions captured",
       detail: getGroqKey()
@@ -4194,15 +4229,19 @@ async function monitorFormScan(jobId, applicationId, identity = identitySnapshot
     }, 1_800);
     return revision;
   }
-  const job = outcome.job || {};
   showFormWorkflowProgress({
     title: "The form needs attention",
-    detail: `${formJobDetail(job, "The worker could not capture a reviewable form revision.")} Nothing was submitted.`,
-    value: humanize(job.status || "stopped"),
+    detail: `${formJobDetail(scanJob, "The worker could not capture a new reviewable form revision.")} Nothing was submitted.`,
+    value: humanize(scanJob.status || "stopped"),
     percent: 100,
     tone: "error",
   });
-  setFormMessage("form-revision-message", `${formJobDetail(job, "The form could not be prepared.")} Nothing was submitted.`, "error");
+  setFormScanRetry(applicationId, true);
+  setFormMessage(
+    "form-revision-message",
+    `${formJobDetail(scanJob, "The form could not be prepared.")} No new revision was created and nothing was submitted.`,
+    "error",
+  );
   return null;
 }
 
@@ -4277,13 +4316,35 @@ function formQuestionLabel(question, index) {
 
 function formSubmissionJobForRevision(revision, applicationId = state.selectedFormApplicationId) {
   if (!revision?.id) return null;
+  if (formRevisionSubmissionIsVerified(revision)) {
+    return {
+      status: "succeeded",
+      result: revision.submission_result,
+      application_id: applicationId,
+      payload: { form_revision_id: revision.id },
+    };
+  }
   const tracked = state.formSubmissionJobs.get(revision.id);
   if (tracked?.id || tracked?.status) return tracked;
-  return state.automationJobs.find((job) => {
+  const historical = state.automationJobs.find((job) => {
     if (job.kind !== "application_submit" || job.application_id !== applicationId) return false;
-    const queuedRevisionId = job.payload?.form_revision_id || job.result?.form_revision_id || null;
-    return !queuedRevisionId || queuedRevisionId === revision.id;
-  }) || null;
+    const queuedRevisionId = job.form_revision_id
+      || job.payload?.form_revision_id
+      || job.result?.form_revision_id
+      || null;
+    const applicationRevisions = state.formRevisions[applicationId] || [];
+    return queuedRevisionId === revision.id || (!queuedRevisionId && applicationRevisions.length === 1);
+  });
+  if (historical) return historical;
+  if (revision.submission_result?.submission_state) {
+    return {
+      status: revision.status === "submitted" ? "succeeded" : "needs_attention",
+      result: revision.submission_result,
+      application_id: applicationId,
+      payload: { form_revision_id: revision.id },
+    };
+  }
+  return null;
 }
 
 function setFormSubmitRoute(stage = "review", tone = "active") {
@@ -4383,6 +4444,48 @@ function formSubmissionIsVerified(job) {
   );
 }
 
+function formRevisionSubmissionIsVerified(revision) {
+  const result = revision?.submission_result;
+  return Boolean(
+    revision?.status === "submitted"
+      && result?.submission_state === "confirmed",
+  );
+}
+
+function hideFormSubmissionRecovery() {
+  const panel = byId("form-submission-recovery");
+  if (!panel) return;
+  panel.hidden = true;
+  const original = byId("form-open-original");
+  original.hidden = true;
+  original.removeAttribute("href");
+  for (const id of ["form-mark-submitted", "form-prepare-submission-retry"]) {
+    const button = byId(id);
+    button.disabled = false;
+    button.dataset.revisionId = "";
+  }
+}
+
+function showFormSubmissionRecovery(revision, result = {}) {
+  const panel = byId("form-submission-recovery");
+  if (!panel || !revision?.id) return;
+  panel.hidden = false;
+  setText(
+    "form-submission-recovery-detail",
+    "The provider did not return a clear confirmation. Keep this sealed revision unchanged while you check the original form, your inbox, or the provider's response page.",
+  );
+  const originalUrl = safeHttpUrl(revision.form_url || result.form_url);
+  const original = byId("form-open-original");
+  original.hidden = !originalUrl;
+  if (originalUrl) original.href = originalUrl;
+  else original.removeAttribute("href");
+  for (const id of ["form-mark-submitted", "form-prepare-submission-retry"]) {
+    const button = byId(id);
+    button.disabled = false;
+    button.dataset.revisionId = revision.id;
+  }
+}
+
 function renderFormSubmissionJob(revision, job) {
   if (!revision || !job) return false;
   const button = byId("submit-form-revision");
@@ -4396,6 +4499,8 @@ function renderFormSubmissionJob(revision, job) {
     : [];
   liveLink.hidden = true;
   liveLink.removeAttribute("href");
+  hideFormSubmissionRecovery();
+  setFormScanRetry(state.selectedFormApplicationId, false);
   button.disabled = true;
 
   if (status === "queued") {
@@ -4422,11 +4527,15 @@ function renderFormSubmissionJob(revision, job) {
     showFormWorkflowProgress({ title: "Submitting in the secure browser", detail, value: "Running", percent: 72 });
     return true;
   }
-  if (formSubmissionIsVerified(job)) {
+  if (formSubmissionIsVerified(job) || formRevisionSubmissionIsVerified(revision)) {
+    const verifiedByUser = formRevisionSubmissionIsVerified(revision)
+      && ["user", "user_resolution"].includes(revision.submission_result?.verification_source);
     button.textContent = "Submitted · verified";
     updateFormSubmitTicket({
-      heading: "Provider confirmation verified",
-      detail: "The provider displayed a new confirmation and AutoApply recorded this application. No further action is needed.",
+      heading: verifiedByUser ? "Submission recorded after your verification" : "Provider confirmation verified",
+      detail: verifiedByUser
+        ? "You verified that the provider received this application. AutoApply recorded that outcome and permanently closed this one-time revision."
+        : "The provider displayed a new confirmation and AutoApply recorded this application. No further action is needed.",
       status: "Verified success",
       statusTone: "status-success",
       stage: "verify",
@@ -4463,6 +4572,10 @@ function renderFormSubmissionJob(revision, job) {
     liveLink.href = fallbackUrl;
     liveLink.hidden = false;
   }
+  if (uncertain) showFormSubmissionRecovery(revision, result);
+  else if (result.submission_state === "not_attempted") {
+    setFormScanRetry(state.selectedFormApplicationId, true);
+  }
   return true;
 }
 
@@ -4475,6 +4588,7 @@ function refreshFormSubmitPreflight({ markFields = false } = {}) {
     renderFormSubmissionJob(revision, submissionJob);
     return null;
   }
+  hideFormSubmissionRecovery();
   const report = formRevisionPreflight(revision, { markFields });
   const capability = capabilityForProvider(revision.provider);
   const canSubmit = capability?.can_auto_apply === true;
@@ -4506,6 +4620,7 @@ function renderFormRevision(revision) {
   const preflight = byId("form-submit-preflight");
   liveLink.hidden = true;
   liveLink.removeAttribute("href");
+  hideFormSubmissionRecovery();
   if (!revision) {
     preflight.hidden = true;
     renderFormScanPlaceholder(byId("form-application-id")?.value || state.selectedFormApplicationId || "");
@@ -4563,6 +4678,87 @@ function renderFormRevision(revision) {
         ? "Profile facts and Groq suggestions are applied automatically once per captured revision. Review every answer before approving and submitting."
         : "Saved Profile facts are applied automatically. Add a Groq key in Profile for open-ended answers, then review the completed form.",
   );
+}
+
+async function resolveFormSubmissionOutcome(outcome, button) {
+  const applicationId = byId("form-application-id").value;
+  const revision = latestFormRevision(applicationId);
+  if (!revision?.id || button?.dataset.revisionId !== revision.id) {
+    toast("This form changed while you were reviewing it. Refresh the review desk before resolving the outcome.", "error");
+    return;
+  }
+  const submissionJob = formSubmissionJobForRevision(revision, applicationId);
+  const submissionState = submissionJob?.result?.submission_state
+    || revision.submission_result?.submission_state;
+  if (submissionState !== "uncertain") {
+    toast("This submission no longer has an uncertain outcome. The review desk will refresh now.", "info");
+    const identity = identitySnapshot();
+    await Promise.all([
+      loadFormApplications(true, identity),
+      loadAutomationJobs(true, identity),
+    ]);
+    await loadApplicationFormRevisions(applicationId, true, false, identity);
+    return;
+  }
+
+  const submitted = outcome === "submitted";
+  if (!await confirmAction({
+    eyebrow: "Resolve the provider outcome",
+    title: submitted ? "Record this form as submitted?" : "Capture the current form for a safe retry?",
+    message: submitted
+      ? "Use this only after you verify that the provider received the application. AutoApply will record it as submitted and will not send the sealed revision again."
+      : "Use this only after you verify that the provider did not receive the application. AutoApply will preserve this sealed attempt, then capture the provider's current fields for a new review. Nothing is submitted now.",
+    confirmLabel: submitted ? "Mark as submitted" : "Capture current form",
+    cancelLabel: "Keep outcome unresolved",
+    tone: "caution",
+    ticketLabel: submitted ? "Verified by you" : "New revision",
+    symbol: submitted ? "✓" : "↻",
+  })) return;
+
+  const identity = identitySnapshot();
+  await withBusy(button, submitted ? "Recording…" : "Preparing…", async () => {
+    try {
+      const resolutionPayload = await apiRequest(`/application-form-revisions/${encodeURIComponent(revision.id)}/resolve-submission`, {
+        method: "POST",
+        body: {
+          outcome,
+          expected_revision: Number(revision.revision),
+          schema_hash: revision.schema_hash,
+        },
+        identity,
+      });
+      assertCurrentIdentity(identity);
+      state.formSubmissionJobs.delete(revision.id);
+      await Promise.all([
+        loadFormApplications(true, identity),
+        loadAutomationJobs(true, identity),
+      ]);
+      await loadApplicationFormRevisions(applicationId, true, !submitted, identity);
+      assertCurrentIdentity(identity);
+      if (submitted) {
+        toast("The verified provider outcome is recorded. This sealed revision will not be submitted again.", "success", "Marked as submitted");
+      } else {
+        const resolution = resolutionPayload?.resolution || {};
+        const application = formApplicationById(applicationId);
+        const job = application ? jobForApplication(application) : null;
+        if (resolution.rescan_required !== false && job?.id) {
+          toast("The old attempt is preserved. Form Pilot is now capturing the provider's current fields; nothing has been submitted.", "success", "Fresh scan starting");
+          window.setTimeout(() => {
+            scanJobApplication(job, providerForJob(job) || revision.provider || "google_forms", button);
+          }, 0);
+        } else {
+          toast("A fresh unapproved revision is ready. Review every answer before creating a new one-time submission.", "success", "Retry prepared");
+          requestAnimationFrame(() => byId("form-revision-answers")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+        }
+      }
+    } catch (error) {
+      if (isIdentityChanged(error)) return;
+      const message = errorMessage(error, "The submission outcome could not be resolved.");
+      setFormMessage("form-revision-message", message, "error");
+      toast(message, "error", "Outcome still unresolved", 9_000);
+      renderFormSubmissionJob(revision, submissionJob);
+    }
+  });
 }
 
 function formRevisionAnswers() {
@@ -6086,6 +6282,8 @@ function bindWorkspaceEvents() {
   byId("send-application").addEventListener("click", (event) => sendApplication(event.currentTarget));
   byId("clear-application").addEventListener("click", () => clearApplicationEditor(true));
   byId("submit-form-revision").addEventListener("click", (event) => approveAndSubmitFormRevision(event.currentTarget));
+  byId("form-mark-submitted").addEventListener("click", (event) => resolveFormSubmissionOutcome("submitted", event.currentTarget));
+  byId("form-prepare-submission-retry").addEventListener("click", (event) => resolveFormSubmissionOutcome("not_submitted", event.currentTarget));
   for (const eventName of ["input", "change"]) {
     byId("form-revision-answers").addEventListener(eventName, () => {
       const current = latestFormRevision(byId("form-application-id").value);

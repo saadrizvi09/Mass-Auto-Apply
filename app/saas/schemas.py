@@ -410,6 +410,14 @@ class ApplicationFormApprovalRequest(StrictModel):
     answers: dict[str, Any] = Field(default_factory=dict)
 
 
+class ApplicationFormSubmissionResolutionRequest(StrictModel):
+    """A user's explicit resolution of an uncertain provider submission."""
+
+    outcome: Literal["submitted", "not_submitted"]
+    expected_revision: int = Field(ge=1)
+    schema_hash: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+
+
 class ApplicationStageRequest(StrictModel):
     idempotency_key: str = Field(
         min_length=8, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$"

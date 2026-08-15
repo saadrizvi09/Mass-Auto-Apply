@@ -17,6 +17,7 @@ ADAPTER = ProviderAdapter(
     submit_selectors=('div[role="button"]:has-text("Submit")',),
     confirmation_path_patterns=(r"/forms/.*/formResponse$",),
     confirmation_text=("your response has been recorded", "response submitted"),
+    rejection_text=("this is a required question",),
     form_selectors=('form[action*="formResponse"]', "form"),
     login_redirect_hosts=frozenset({"accounts.google.com"}),
     # Google Forms URLs already open the first form page. Deliberately do not

@@ -271,6 +271,36 @@ _SAFE_DATABASE_ERRORS: dict[str, tuple[int, str, str]] = {
         "form_revision_limit_reached",
         "This application has reached its captured-form revision limit.",
     ),
+    "form_submission_resolution_invalid": (
+        422,
+        "form_submission_resolution_invalid",
+        "Choose a valid outcome for this uncertain form submission.",
+    ),
+    "form_submission_resolution_stale": (
+        409,
+        "form_submission_resolution_stale",
+        "This form changed while its submission outcome was being resolved. Refresh and review it again.",
+    ),
+    "form_submission_not_uncertain": (
+        409,
+        "form_submission_not_uncertain",
+        "This form does not have an uncertain submission to resolve.",
+    ),
+    "form_submission_resolution_conflict": (
+        409,
+        "form_submission_resolution_conflict",
+        "This submission was already resolved with a different outcome.",
+    ),
+    "form_submission_resolution_required": (
+        409,
+        "form_submission_resolution_required",
+        "Verify the uncertain submission outcome before preparing this form again.",
+    ),
+    "form_submit_attempt_exists": (
+        409,
+        "form_submit_attempt_exists",
+        "This approved form revision already has a submission attempt. Resolve its outcome before retrying.",
+    ),
     "provider_connection_required": (
         409,
         "provider_connection_required",

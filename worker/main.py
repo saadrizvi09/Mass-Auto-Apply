@@ -127,7 +127,7 @@ class SupabaseQueueStore:
         if (
             terminal_status == "needs_attention"
             and result.get("phase") == "submit"
-            and submission_state in {"uncertain", "confirmed"}
+            and submission_state in {"not_attempted", "uncertain", "confirmed"}
         ):
             # A provider click may already have happened. Persist the immutable
             # form-revision fence and close the queue lease in one transaction;

@@ -68,6 +68,7 @@ from app.saas.resume import ResumeParseError, extract_pdf_text, profile_suggesti
 from app.saas.schemas import (
     AccountDeletionRequest,
     ApplicationFormApprovalRequest,
+    ApplicationFormSubmissionResolutionRequest,
     ApplicationStageRequest,
     ApproveApplicationRequest,
     ApplicationCreate,
@@ -2370,6 +2371,85 @@ def create_app(
         if updated is None:
             raise ApiError(409, "form_revision_changed", "The captured form changed. Review it again.")
         return _data(updated)
+
+    @application.post(
+        "/api/v1/application-form-revisions/{revision_id}/resolve-submission",
+        tags=["applications"],
+    )
+    async def resolve_application_form_submission(
+        revision_id: UUID,
+        body: ApplicationFormSubmissionResolutionRequest,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        """Resolve an uncertain form submit without ever reopening its snapshot."""
+
+        client = store_service.user(user.access_token)
+        revision = await _required_row(
+            client, "application_form_revisions", user, revision_id
+        )
+        try:
+            revision_number = int(revision.get("revision") or 0)
+        except (TypeError, ValueError):
+            revision_number = 0
+        if revision_number != body.expected_revision:
+            raise ApiError(
+                409,
+                "form_revision_changed",
+                "The captured form changed. Review the latest revision.",
+            )
+        if revision.get("schema_hash") != body.schema_hash:
+            raise ApiError(
+                409,
+                "form_schema_changed",
+                "The form schema changed. Review the latest revision.",
+            )
+        if revision.get("status") not in {
+            "approved",
+            "needs_attention",
+            "submitted",
+            "superseded",
+        }:
+            raise ApiError(
+                409,
+                "form_submission_not_uncertain",
+                "This form submission no longer needs an outcome decision.",
+            )
+
+        resolved = _first(
+            await client.rpc(
+                "resolve_application_form_submission",
+                {
+                    "revision_id_input": str(revision_id),
+                    "expected_revision_input": body.expected_revision,
+                    "expected_schema_hash_input": body.schema_hash,
+                    "outcome_input": body.outcome,
+                },
+            )
+        )
+        if resolved is None:
+            raise ApiError(
+                409,
+                "form_submission_resolution_stale",
+                "The form state changed while resolving the submission. Refresh and review it again.",
+            )
+        # A not-submitted resolution returns its fresh retry revision. That
+        # retry may itself be submitted by the time an idempotent HTTP request
+        # is replayed, so its *status* cannot describe the original decision.
+        # Revision identity is stable: only a submitted/provider-confirmed
+        # resolution returns the requested immutable revision itself.
+        actual_outcome = (
+            "submitted"
+            if str(resolved.get("id") or "") == str(revision_id)
+            else "not_submitted"
+        )
+        return {
+            "data": resolved,
+            "resolution": {
+                "outcome": actual_outcome,
+                "retry_created": actual_outcome == "not_submitted",
+                "rescan_required": actual_outcome == "not_submitted",
+            },
+        }
 
     async def queue_application_revision_stage(
         revision_id: UUID,

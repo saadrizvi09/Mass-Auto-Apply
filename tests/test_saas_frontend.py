@@ -274,6 +274,10 @@ def test_discovery_and_exact_form_review_are_wired_into_workspace() -> None:
         "form-submit-preflight-detail",
         "form-submit-missing-list",
         "submit-form-revision",
+        "form-submission-recovery",
+        "form-open-original",
+        "form-mark-submitted",
+        "form-prepare-submission-retry",
     ):
         assert f'id="{identifier}"' in INDEX_HTML
     assert 'body instanceof FormData' in APP_JS
@@ -583,8 +587,8 @@ def test_groq_validation_displays_the_provider_status_instead_of_a_generic_error
 
 
 def test_local_frontend_assets_are_versioned_to_avoid_stale_validation_code() -> None:
-    assert 'href="/styles.css?v=20260814.2"' in INDEX_HTML
-    assert 'src="/app.js?v=20260814.2"' in INDEX_HTML
+    assert 'href="/styles.css?v=20260814.4"' in INDEX_HTML
+    assert 'src="/app.js?v=20260814.4"' in INDEX_HTML
 
 
 def test_ziprecruiter_is_not_presented_in_hosted_frontend() -> None:
@@ -631,6 +635,36 @@ def test_form_pilot_auto_suggests_and_submits_one_reviewed_revision_in_backgroun
     assert ".form-submit-preflight" in STYLES_CSS
     assert ".form-submit-route" in STYLES_CSS
     assert ".form-answer-row.has-preflight-error" in STYLES_CSS
+
+
+def test_uncertain_form_submission_has_an_explicit_non_duplicate_recovery_path() -> None:
+    assert 'result.submission_state === "uncertain"' in APP_JS
+    assert "showFormSubmissionRecovery(revision, result)" in APP_JS
+    assert 'safeHttpUrl(revision.form_url || result.form_url)' in APP_JS
+    assert 'resolveFormSubmissionOutcome("submitted"' in APP_JS
+    assert 'resolveFormSubmissionOutcome("not_submitted"' in APP_JS
+    assert '/resolve-submission`' in APP_JS
+    assert "expected_revision: Number(revision.revision)" in APP_JS
+    assert "schema_hash: revision.schema_hash" in APP_JS
+    assert 'await confirmAction({' in APP_JS
+    assert "window.confirm(" not in APP_JS
+    assert "I verified it was submitted" in INDEX_HTML
+    assert "I verified it was not submitted — prepare retry" in INDEX_HTML
+    assert "No action here submits the form again." in INDEX_HTML
+    assert ".form-submission-recovery" in STYLES_CSS
+    assert 'revision?.status === "submitted"' in APP_JS
+    assert 'result?.submission_state === "confirmed"' in APP_JS
+    assert "Submission recorded after your verification" in APP_JS
+    assert "resolution.rescan_required !== false" in APP_JS
+    assert "Fresh scan starting" in APP_JS
+    assert 'result.submission_state === "not_attempted"' in APP_JS
+    assert "setFormScanRetry(state.selectedFormApplicationId, true)" in APP_JS
+    assert "baselineRevisionId" in APP_JS
+    assert 'scanStatus === "succeeded"' in APP_JS
+    assert "scanJob.progress?.scan_revision_id" in APP_JS
+    assert "revision.id !== baselineRevisionId" in APP_JS
+    assert "job.form_revision_id || job.payload?.form_revision_id" in APP_JS
+    assert "applicationRevisions.length === 1" in APP_JS
 
 
 def test_captured_google_listboxes_render_as_exact_reviewable_options() -> None:

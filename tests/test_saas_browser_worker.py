@@ -2186,6 +2186,37 @@ def test_google_forms_unconfirmed_click_is_terminal_and_keeps_live_view() -> Non
     assert browser.closed is False
 
 
+def test_google_forms_visible_required_error_is_safe_to_prepare_again() -> None:
+    page = FakePage(
+        _google_task("scan", None).target_url,
+        _fields(),
+        submit_count=1,
+        confirmed_body="Application form\nThis is a required question",
+    )
+    schema = _runtime_schema(page, "google_forms")
+    task = _google_task(
+        "submit",
+        schema.schema_hash,
+        answers={"Email address": "candidate@example.com"},
+    )
+    browserbase = FakeBrowserbase()
+    browser = FakeBrowser(page)
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(FakeChromium(browser)),
+    )
+
+    execution = asyncio.run(runtime.execute(task, resume_path=None))
+
+    assert execution.result.status == "needs_attention"
+    assert execution.result.code == "provider_validation_failed"
+    assert execution.result.submission_state == "not_attempted"
+    assert page.submit_controls[0].clicks == 1
+    assert execution.details()["live_view_url"].startswith("https://")
+    assert browserbase.released == []
+    assert browser.closed is False
+
+
 def test_google_forms_live_view_failure_never_retries_an_uncertain_click() -> None:
     class FailingLiveViewBrowserbase(FakeBrowserbase):
         def get_session_live_view(self, _session_id: str) -> dict[str, str]:

@@ -278,6 +278,22 @@ def test_store_maps_known_database_errors_and_redacts_unknown_messages() -> None
         ("provider_connection_required", 409, "provider_connection_required"),
         ("application_already_submitted", 409, "application_already_submitted"),
         ("form_revision_limit_reached", 429, "form_revision_limit_reached"),
+        (
+            "form_submission_resolution_stale",
+            409,
+            "form_submission_resolution_stale",
+        ),
+        (
+            "form_submission_resolution_conflict",
+            409,
+            "form_submission_resolution_conflict",
+        ),
+        (
+            "form_submission_resolution_required",
+            409,
+            "form_submission_resolution_required",
+        ),
+        ("form_submit_attempt_exists", 409, "form_submit_attempt_exists"),
     ],
 )
 def test_store_maps_managed_application_races_to_actionable_errors(

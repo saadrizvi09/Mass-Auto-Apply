@@ -82,6 +82,7 @@ _SUBMIT_LIVE_VIEW_CODES = frozenset(
         "submission_click_unconfirmed",
         "provider_redirect_blocked_after_submit",
         "security_checkpoint_after_submit",
+        "provider_validation_failed",
         "submission_unconfirmed",
     }
 )
@@ -903,6 +904,16 @@ class BrowserRuntime:
                 schema=schema,
                 filled_count=filled_count,
                 submission_state="uncertain",
+                current_url=current_url,
+            )
+        if await adapter.rejected(page):
+            return self._attention(
+                task,
+                "provider_validation_failed",
+                "Google did not accept the response because one or more visible fields still require a valid answer. Prepare the current form again before submitting.",
+                schema=schema,
+                filled_count=filled_count,
+                submission_state="not_attempted",
                 current_url=current_url,
             )
         confirmed = await adapter.confirmed(page)

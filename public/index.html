@@ -13,8 +13,8 @@
       content="default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co; frame-src https://challenges.cloudflare.com; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
     />
     <title>AutoApply Cloud — Your job search, thoughtfully organized</title>
-    <link rel="stylesheet" href="/styles.css?v=20260814.2" />
-    <script type="module" src="/app.js?v=20260814.2"></script>
+    <link rel="stylesheet" href="/styles.css?v=20260814.4" />
+    <script type="module" src="/app.js?v=20260814.4"></script>
   </head>
   <body>
     <a id="skip-link" class="skip-link" href="#public-main">Skip to main content</a>
@@ -928,6 +928,19 @@
                   <div class="progress-track" aria-hidden="true"><span id="form-workflow-progress-bar"></span></div>
                 </div>
               </div>
+              <section id="form-submission-recovery" class="form-submission-recovery" aria-labelledby="form-submission-recovery-heading" hidden>
+                <div class="form-submission-recovery-copy">
+                  <p class="eyebrow">Resolve one uncertain outcome</p>
+                  <h4 id="form-submission-recovery-heading">Check the original form before choosing</h4>
+                  <p id="form-submission-recovery-detail">The approved answers stay sealed while you verify whether the provider received them.</p>
+                </div>
+                <div class="form-submission-recovery-actions" aria-label="Resolve submission outcome">
+                  <a id="form-open-original" class="button button-ghost" href="#" target="_blank" rel="noopener noreferrer">Open original form</a>
+                  <button id="form-mark-submitted" class="button button-primary" type="button">I verified it was submitted</button>
+                  <button id="form-prepare-submission-retry" class="button button-ghost" type="button">I verified it was not submitted — prepare retry</button>
+                </div>
+                <p class="form-submission-recovery-note"><strong>No action here submits the form again.</strong> A retry creates a new review revision with a new one-time submission key.</p>
+              </section>
               <div id="form-revision-answers" class="form-answer-list"></div>
               <section id="form-submit-preflight" class="form-submit-preflight" aria-labelledby="form-submit-preflight-heading" aria-live="polite" hidden>
                 <div class="form-submit-preflight-heading">
