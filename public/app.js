@@ -106,6 +106,7 @@ const state = {
   formSuggestionCache: new Map(),
   formSubmissionJobs: new Map(),
   formWorkflowMonitors: new Map(),
+  formRecoveryScanApplicationIds: new Set(),
   pendingJobImportFile: null,
   resumeSuggestions: null,
   pendingResumeFile: null,
@@ -406,6 +407,7 @@ function clearPrivateState() {
   state.formSuggestionCache = new Map();
   state.formSubmissionJobs = new Map();
   state.formWorkflowMonitors = new Map();
+  state.formRecoveryScanApplicationIds = new Set();
   state.pendingJobImportFile = null;
   state.resumeSuggestions = null;
   state.pendingResumeFile = null;
@@ -3619,6 +3621,7 @@ async function scanJobApplication(job, provider, button) {
       const data = unwrapData(payload) || {};
       const applicationId = data.application?.id || data.application_id || null;
       const automationJobId = data.automation_job?.id || null;
+      if (data.automation_job?.id) rememberAutomationJob(data.automation_job);
       if (data.application?.id && data.application.channel === "ats") {
         state.formApplications = [
           data.application,
@@ -3821,6 +3824,16 @@ function activeFormScanJob(applicationId) {
   return formScanJobs(applicationId).find(
     (job) => ["queued", "running"].includes(String(job.status || "").toLowerCase()),
   ) || null;
+}
+
+function formPreparationIsActive(applicationId) {
+  return Boolean(
+    applicationId
+      && (
+        state.formRecoveryScanApplicationIds.has(applicationId)
+        || activeFormScanJob(applicationId)
+      ),
+  );
 }
 
 async function openFormApplicationReview(
@@ -4165,15 +4178,18 @@ async function monitorFormScan(
   identity = identitySnapshot(),
   baselineRevisionId = latestFormRevision(applicationId)?.id || null,
 ) {
-  showFormWorkflowProgress({
-    title: "Capturing the visible form",
-    detail: "The worker is opening this Google Form and recording its current questions.",
-    value: "Queued",
-    percent: 12,
-  });
+  if (state.selectedFormApplicationId === applicationId) {
+    showFormWorkflowProgress({
+      title: "Capturing the visible form",
+      detail: "The worker is opening this Google Form and recording its current questions.",
+      value: "Queued",
+      percent: 12,
+    });
+  }
   const outcome = await monitorFormWorkflowJob(jobId, identity, (job) => {
+    if (state.selectedFormApplicationId !== applicationId) return;
     const running = job.status === "running";
-    if (state.selectedFormApplicationId === applicationId && !latestFormRevision(applicationId)) {
+    if (!latestFormRevision(applicationId)) {
       renderFormRevision(null);
       return;
     }
@@ -4186,14 +4202,17 @@ async function monitorFormScan(
   });
   assertCurrentIdentity(identity);
   if (outcome.timedOut) {
-    showFormWorkflowProgress({
-      title: "Preparation is continuing in Activity",
-      detail: "This is taking longer than five minutes. The durable job is still safe; Form Pilot will not submit or automatically retry anything.",
-      value: "Still running",
-      percent: 72,
-      tone: "error",
-    });
-    setFormMessage("form-revision-message", "Preparation is still running. Check Activity for the latest worker status; no form was submitted.", "error");
+    if (state.selectedFormApplicationId === applicationId) {
+      showFormWorkflowProgress({
+        title: "Preparation is continuing in Activity",
+        detail: "This is taking longer than five minutes. The durable job is still safe; Form Pilot will not submit or automatically retry anything.",
+        value: "Still running",
+        percent: 72,
+        tone: "error",
+      });
+      setFormMessage("form-revision-message", "Preparation is still running. Check Activity for the latest worker status; no form was submitted.", "error");
+      refreshFormSubmitPreflight();
+    }
     return null;
   }
   await Promise.all([
@@ -4215,33 +4234,39 @@ async function monitorFormScan(
       && (scanRevisionId ? revision.id === scanRevisionId : revision.id !== baselineRevisionId),
   );
   if (capturedThisRun) {
-    showFormWorkflowProgress({
-      title: "Questions captured",
-      detail: getGroqKey()
-        ? "Form Pilot is now preparing résumé-grounded suggestions for your review."
-        : "Review the captured fields below and complete any missing answers manually.",
-      value: "Ready",
-      percent: 100,
-      tone: "complete",
-    });
+    if (state.selectedFormApplicationId === applicationId) {
+      showFormWorkflowProgress({
+        title: "Questions captured",
+        detail: getGroqKey()
+          ? "Form Pilot is now preparing résumé-grounded suggestions for your review."
+          : "Review the captured fields below and complete any missing answers manually.",
+        value: "Ready",
+        percent: 100,
+        tone: "complete",
+      });
+      refreshFormSubmitPreflight();
+    }
     window.setTimeout(() => {
       if (state.selectedFormApplicationId === applicationId && !state.formWorkflowMonitors.size) hideFormWorkflowProgress();
     }, 1_800);
     return revision;
   }
-  showFormWorkflowProgress({
-    title: "The form needs attention",
-    detail: `${formJobDetail(scanJob, "The worker could not capture a new reviewable form revision.")} Nothing was submitted.`,
-    value: humanize(scanJob.status || "stopped"),
-    percent: 100,
-    tone: "error",
-  });
-  setFormScanRetry(applicationId, true);
-  setFormMessage(
-    "form-revision-message",
-    `${formJobDetail(scanJob, "The form could not be prepared.")} No new revision was created and nothing was submitted.`,
-    "error",
-  );
+  if (state.selectedFormApplicationId === applicationId) {
+    showFormWorkflowProgress({
+      title: "The form needs attention",
+      detail: `${formJobDetail(scanJob, "The worker could not capture a new reviewable form revision.")} Nothing was submitted.`,
+      value: humanize(scanJob.status || "stopped"),
+      percent: 100,
+      tone: "error",
+    });
+    setFormScanRetry(applicationId, true);
+    setFormMessage(
+      "form-revision-message",
+      `${formJobDetail(scanJob, "The form could not be prepared.")} No new revision was created and nothing was submitted.`,
+      "error",
+    );
+    refreshFormSubmitPreflight();
+  }
   return null;
 }
 
@@ -4486,8 +4511,23 @@ function showFormSubmissionRecovery(revision, result = {}) {
   }
 }
 
-function renderFormSubmissionJob(revision, job) {
-  if (!revision || !job) return false;
+function formRevisionIsCurrent(revision, applicationId = state.selectedFormApplicationId) {
+  return Boolean(
+    revision?.id
+      && applicationId
+      && state.selectedFormApplicationId === applicationId
+      && state.selectedFormRevisionId === revision.id
+      && latestFormRevision(applicationId)?.id === revision.id,
+  );
+}
+
+function renderFormSubmissionJob(revision, job, applicationId = state.selectedFormApplicationId) {
+  if (
+    !revision
+      || !job
+      || !formRevisionIsCurrent(revision, applicationId)
+      || formPreparationIsActive(applicationId)
+  ) return false;
   const button = byId("submit-form-revision");
   const liveLink = byId("form-live-review-link");
   const status = String(job.status || "queued").toLowerCase();
@@ -4583,6 +4623,23 @@ function refreshFormSubmitPreflight({ markFields = false } = {}) {
   const applicationId = byId("form-application-id").value;
   const revision = latestFormRevision(applicationId);
   if (!revision?.id) return null;
+  if (formPreparationIsActive(applicationId)) {
+    const scanJob = activeFormScanJob(applicationId);
+    const running = String(scanJob?.status || "").toLowerCase() === "running";
+    const button = byId("submit-form-revision");
+    hideFormSubmissionRecovery();
+    button.textContent = running ? "Capturing current form…" : "Waiting for current form…";
+    button.disabled = true;
+    button.title = "Approval stays locked until Form Pilot finishes capturing the provider's current fields.";
+    updateFormSubmitTicket({
+      heading: "Refreshing the provider fields",
+      detail: "Approval is paused until Form Pilot finishes capturing the current form. Nothing can be submitted during this refresh.",
+      status: running ? "Capturing" : "Queued",
+      statusTone: "status-info",
+      stage: "review",
+    });
+    return { locked: true, reason: "form_scan_active", scanJob };
+  }
   const submissionJob = formSubmissionJobForRevision(revision, applicationId);
   if (submissionJob) {
     renderFormSubmissionJob(revision, submissionJob);
@@ -4729,11 +4786,15 @@ async function resolveFormSubmissionOutcome(outcome, button) {
       });
       assertCurrentIdentity(identity);
       state.formSubmissionJobs.delete(revision.id);
+      if (!submitted) state.formRecoveryScanApplicationIds.add(applicationId);
       await Promise.all([
         loadFormApplications(true, identity),
         loadAutomationJobs(true, identity),
       ]);
-      await loadApplicationFormRevisions(applicationId, true, !submitted, identity);
+      // A not-submitted resolution creates a safe fallback revision before the
+      // current provider fields are captured. Keep that fallback locked and do
+      // not auto-suggest it: it must never look ready during the rescan gap.
+      await loadApplicationFormRevisions(applicationId, true, false, identity);
       assertCurrentIdentity(identity);
       if (submitted) {
         toast("The verified provider outcome is recorded. This sealed revision will not be submitted again.", "success", "Marked as submitted");
@@ -4743,10 +4804,14 @@ async function resolveFormSubmissionOutcome(outcome, button) {
         const job = application ? jobForApplication(application) : null;
         if (resolution.rescan_required !== false && job?.id) {
           toast("The old attempt is preserved. Form Pilot is now capturing the provider's current fields; nothing has been submitted.", "success", "Fresh scan starting");
-          window.setTimeout(() => {
-            scanJobApplication(job, providerForJob(job) || revision.provider || "google_forms", button);
-          }, 0);
+          // The recovery button is already busy, so queue the scan without a
+          // nested busy wrapper and await the handoff. This removes the window
+          // where the fallback revision used to be interactive.
+          await scanJobApplication(job, providerForJob(job) || revision.provider || "google_forms", null);
         } else {
+          state.formRecoveryScanApplicationIds.delete(applicationId);
+          refreshFormSubmitPreflight();
+          await maybeSuggestFormAnswers(applicationId, latestFormRevision(applicationId));
           toast("A fresh unapproved revision is ready. Review every answer before creating a new one-time submission.", "success", "Retry prepared");
           requestAnimationFrame(() => byId("form-revision-answers")?.scrollIntoView({ behavior: "smooth", block: "start" }));
         }
@@ -4757,6 +4822,11 @@ async function resolveFormSubmissionOutcome(outcome, button) {
       setFormMessage("form-revision-message", message, "error");
       toast(message, "error", "Outcome still unresolved", 9_000);
       renderFormSubmissionJob(revision, submissionJob);
+    } finally {
+      if (!submitted) {
+        state.formRecoveryScanApplicationIds.delete(applicationId);
+        if (state.selectedFormApplicationId === applicationId) refreshFormSubmitPreflight();
+      }
     }
   });
 }
@@ -4897,6 +4967,11 @@ async function approveAndSubmitFormRevision(button) {
   const applicationId = byId("form-application-id").value;
   let revision = latestFormRevision(applicationId);
   if (!revision?.id) return;
+  if (formPreparationIsActive(applicationId)) {
+    refreshFormSubmitPreflight();
+    toast("Form Pilot is still capturing the provider's current fields. Review and submission unlock when that refresh finishes.", "info", "Current form is still loading");
+    return;
+  }
   const preflight = formRevisionPreflight(revision, { markFields: true });
   if (!preflight.ready) {
     updateFormSubmitTicket({
@@ -4961,9 +5036,21 @@ async function approveAndSubmitFormRevision(button) {
         await loadApplicationFormRevisions(applicationId, true, false, identity);
         assertCurrentIdentity(identity);
         revision = latestFormRevision(applicationId);
+        if (formPreparationIsActive(applicationId)) {
+          throw new AppError(
+            "The provider form is being refreshed. Nothing was queued; review the newly captured fields when they appear.",
+            "form_scan_active",
+          );
+        }
         if (!revision?.id || !(revision.approved_at || revision.status === "approved")) {
           throw new AppError("The reviewed answers could not be sealed. Refresh the form and try again.", "form_revision_not_approved");
         }
+      }
+      if (formPreparationIsActive(applicationId) || !formRevisionIsCurrent(revision, applicationId)) {
+        throw new AppError(
+          "The provider form changed while this revision was being prepared. Nothing was queued; review the current fields first.",
+          "form_revision_changed",
+        );
       }
       updateFormSubmitTicket({
         heading: "Queueing one background submission",
@@ -4993,20 +5080,22 @@ async function approveAndSubmitFormRevision(button) {
       if (outcome.timedOut) {
         const latest = outcome.job || queued;
         state.formSubmissionJobs.set(revision.id, latest);
-        updateFormSubmitTicket({
-          heading: "Submission is still running",
-          detail: "The durable worker job is continuing in Activity. No duplicate retry has been created; check this same submission before taking another action.",
-          status: "Still running",
-          statusTone: "status-info",
-          stage: latest.status === "running" ? "submit" : "queue",
-        });
-        showFormWorkflowProgress({
-          title: "Submission is still running",
-          detail: "The same durable job remains active in Activity. Form Pilot will not create a duplicate submission.",
-          value: "Check Activity",
-          percent: latest.status === "running" ? 76 : 38,
-        });
-        setFormMessage("form-revision-message", "This submission is still running in Activity. Do not submit the form again.");
+        if (formRevisionIsCurrent(revision, applicationId)) {
+          updateFormSubmitTicket({
+            heading: "Submission is still running",
+            detail: "The durable worker job is continuing in Activity. No duplicate retry has been created; check this same submission before taking another action.",
+            status: "Still running",
+            statusTone: "status-info",
+            stage: latest.status === "running" ? "submit" : "queue",
+          });
+          showFormWorkflowProgress({
+            title: "Submission is still running",
+            detail: "The same durable job remains active in Activity. Form Pilot will not create a duplicate submission.",
+            value: "Check Activity",
+            percent: latest.status === "running" ? 76 : 38,
+          });
+          setFormMessage("form-revision-message", "This submission is still running in Activity. Do not submit the form again.");
+        }
         return;
       }
       const completed = outcome.job || queued;
@@ -5016,13 +5105,16 @@ async function approveAndSubmitFormRevision(button) {
         loadAutomationJobs(true, identity),
         loadFormApplications(true, identity),
       ]);
-      if (formSubmissionIsVerified(completed)) {
-        toast("The provider confirmation was verified and this form was submitted once.", "success", "Application submitted");
-      } else {
-        toast("The provider did not return a verified success. Review the attention details before taking another action.", "error", "Submission needs attention", 9_000);
+      if (formRevisionIsCurrent(revision, applicationId)) {
+        if (formSubmissionIsVerified(completed)) {
+          toast("The provider confirmation was verified and this form was submitted once.", "success", "Application submitted");
+        } else {
+          toast("The provider did not return a verified success. Review the attention details before taking another action.", "error", "Submission needs attention", 9_000);
+        }
       }
     } catch (error) {
       if (isIdentityChanged(error)) return;
+      if (!formRevisionIsCurrent(revision, applicationId)) return;
       const message = errorMessage(error, "This form could not be approved and queued.");
       showFormWorkflowProgress({
         title: "Submission was not queued",

@@ -289,7 +289,8 @@ def test_discovery_and_exact_form_review_are_wired_into_workspace() -> None:
     assert 'applicationStatus.textContent = running ? "Preparing form" : "Preparation queued"' in APP_JS
     assert 'status.textContent = succeededWithoutRevision ? "No questions captured"' in APP_JS
     assert 'applicationStatus.textContent = "Preparation needs attention"' in APP_JS
-    assert 'state.selectedFormApplicationId === applicationId && !latestFormRevision(applicationId)' in APP_JS
+    assert 'if (state.selectedFormApplicationId !== applicationId) return;' in APP_JS
+    assert 'if (!latestFormRevision(applicationId))' in APP_JS
     assert 'setFormScanRetry(applicationId, true)' in APP_JS
     assert 'byId("retry-form-scan").addEventListener("click"' in APP_JS
     assert 'if (selectedFormApplicationId && !selectedRevision) renderFormRevision(null)' in APP_JS
@@ -587,8 +588,8 @@ def test_groq_validation_displays_the_provider_status_instead_of_a_generic_error
 
 
 def test_local_frontend_assets_are_versioned_to_avoid_stale_validation_code() -> None:
-    assert 'href="/styles.css?v=20260814.4"' in INDEX_HTML
-    assert 'src="/app.js?v=20260814.4"' in INDEX_HTML
+    assert 'href="/styles.css?v=20260815.1"' in INDEX_HTML
+    assert 'src="/app.js?v=20260815.1"' in INDEX_HTML
 
 
 def test_ziprecruiter_is_not_presented_in_hosted_frontend() -> None:
@@ -665,6 +666,60 @@ def test_uncertain_form_submission_has_an_explicit_non_duplicate_recovery_path()
     assert "revision.id !== baselineRevisionId" in APP_JS
     assert "job.form_revision_id || job.payload?.form_revision_id" in APP_JS
     assert "applicationRevisions.length === 1" in APP_JS
+
+
+def test_form_recovery_rescan_keeps_the_fallback_revision_locked() -> None:
+    assert "formRecoveryScanApplicationIds: new Set()" in APP_JS
+    assert "function formPreparationIsActive(applicationId)" in APP_JS
+    assert "state.formRecoveryScanApplicationIds.has(applicationId)" in APP_JS
+
+    preflight = APP_JS.split("function refreshFormSubmitPreflight", 1)[1].split(
+        "function renderFormRevision", 1
+    )[0]
+    assert "if (formPreparationIsActive(applicationId))" in preflight
+    assert 'button.textContent = running ? "Capturing current form…" : "Waiting for current form…"' in preflight
+    assert "button.disabled = true" in preflight
+    assert "Nothing can be submitted during this refresh." in preflight
+
+    recovery = APP_JS.split("async function resolveFormSubmissionOutcome", 1)[1].split(
+        "function formRevisionAnswers", 1
+    )[0]
+    assert "state.formRecoveryScanApplicationIds.add(applicationId)" in recovery
+    assert "loadApplicationFormRevisions(applicationId, true, false, identity)" in recovery
+    assert "await scanJobApplication(job, providerForJob(job) || revision.provider || \"google_forms\", null)" in recovery
+    assert "window.setTimeout" not in recovery
+    assert recovery.index("state.formRecoveryScanApplicationIds.add(applicationId)") < recovery.rindex(
+        "loadApplicationFormRevisions(applicationId, true, false, identity)"
+    )
+
+    submit = APP_JS.split("async function approveAndSubmitFormRevision", 1)[1].split(
+        "function updateApplicationCharacterCount", 1
+    )[0]
+    assert submit.count("formPreparationIsActive(applicationId)") >= 3
+    assert "Current form is still loading" in submit
+    assert "Nothing was queued; review the newly captured fields" in submit
+
+
+def test_old_form_submission_monitor_cannot_overwrite_a_new_revision() -> None:
+    assert "function formRevisionIsCurrent(revision, applicationId = state.selectedFormApplicationId)" in APP_JS
+    current_guard = APP_JS.split("function formRevisionIsCurrent", 1)[1].split(
+        "function renderFormSubmissionJob", 1
+    )[0]
+    assert "state.selectedFormApplicationId === applicationId" in current_guard
+    assert "state.selectedFormRevisionId === revision.id" in current_guard
+    assert "latestFormRevision(applicationId)?.id === revision.id" in current_guard
+
+    renderer = APP_JS.split("function renderFormSubmissionJob", 1)[1].split(
+        "function refreshFormSubmitPreflight", 1
+    )[0]
+    assert "!formRevisionIsCurrent(revision, applicationId)" in renderer
+    assert "formPreparationIsActive(applicationId)" in renderer
+
+    submit = APP_JS.split("async function approveAndSubmitFormRevision", 1)[1].split(
+        "function updateApplicationCharacterCount", 1
+    )[0]
+    assert "if (formRevisionIsCurrent(revision, applicationId))" in submit
+    assert "if (!formRevisionIsCurrent(revision, applicationId)) return;" in submit
 
 
 def test_captured_google_listboxes_render_as_exact_reviewable_options() -> None:
