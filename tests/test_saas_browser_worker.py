@@ -1978,7 +1978,7 @@ def test_runtime_connects_playwright_over_trusted_cdp_and_releases_scan_session(
         ("wss://connect.browserbase.com?sessionId=one&token=secret", 30_000)
     ]
     assert browserbase.created == [("context-1", False)]
-    assert browserbase.timeouts == [300]
+    assert browserbase.timeouts == [120]
     assert browserbase.released == ["session-one"]
     assert browser.closed is True
     assert page.unroute_behaviors == ["ignoreErrors"]
@@ -2007,7 +2007,7 @@ def test_public_form_runtime_uses_ephemeral_browserbase_session() -> None:
 
     assert execution.result.code == "application_form_scanned"
     assert browserbase.ephemeral == [False]
-    assert browserbase.timeouts == [300]
+    assert browserbase.timeouts == [120]
     assert browserbase.created == []
 
 
@@ -2036,7 +2036,7 @@ def test_prefill_keeps_bounded_live_review_session_without_exposing_cdp_url() ->
     assert details["live_view_url"].startswith("https://")
     assert "connect.browserbase.com" not in repr(details)
     assert browserbase.created == [("context-1", True)]
-    assert browserbase.timeouts == [300]
+    assert browserbase.timeouts == [120]
     assert browserbase.released == []
     assert browser.closed is False
 

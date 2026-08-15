@@ -45,11 +45,11 @@ MANAGED_JOB_KINDS: tuple[str, ...] = (
 )
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RESUME_BYTES = 6 * 1024 * 1024
-# This Browserbase project currently has a five-minute default even though the
-# Free plan advertises sessions up to fifteen minutes. Matching the lower
-# project setting keeps every task bounded and leaves a predictable Live View
-# window for reviewed prefills.
-_BROWSER_SESSION_TIMEOUT_SECONDS = 300
+# Keep metered browser tasks short while leaving enough headroom for the
+# roughly one-minute Google Forms submission path. Browserbase ends completed
+# sessions on disconnect, so this is a stall ceiling rather than a minimum run
+# time.
+_BROWSER_SESSION_TIMEOUT_SECONDS = 120
 _GOOGLE_FORM_RENDER_TIMEOUT_MS = 8_000
 _GOOGLE_FORM_CONTROL_SELECTOR = (
     'form input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]),'
