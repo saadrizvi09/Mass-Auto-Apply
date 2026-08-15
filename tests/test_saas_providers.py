@@ -6,7 +6,12 @@ from email.parser import BytesParser
 import pytest
 
 from app.saas.gmail import GoogleProviderError, build_gmail_mime
-from app.saas.providers import browser_provider_allowed, get_provider, provider_catalog
+from app.saas.providers import (
+    browser_provider_allowed,
+    canonical_yc_job_url,
+    get_provider,
+    provider_catalog,
+)
 
 
 def test_linkedin_cannot_be_enabled_by_allowlist() -> None:
@@ -52,7 +57,7 @@ def test_only_configured_and_allowlisted_managed_browser_is_available() -> None:
     assert "ziprecruiter" not in by_id
 
 
-def test_connection_only_providers_never_claim_form_automation() -> None:
+def test_yc_exact_job_automation_is_distinct_from_connection_only_providers() -> None:
     catalog = provider_catalog(
         "yc,cutshort,instahyre,wellfound,google_forms",
         google_configured=False,
@@ -60,7 +65,17 @@ def test_connection_only_providers_never_claim_form_automation() -> None:
     )
     by_id = {item["id"]: item for item in catalog}
 
-    for provider_id in ("yc", "cutshort", "instahyre"):
+    yc = by_id["yc"]
+    assert yc["available"] is True
+    assert yc["can_connect"] is True
+    assert yc["can_scan"] is True
+    assert yc["can_prefill"] is True
+    assert yc["can_auto_apply"] is True
+    assert yc["connection_required"] is True
+    assert "exact YC job-detail URL" in yc["reason"]
+    assert "scraping and discovery remain unavailable" in yc["reason"]
+
+    for provider_id in ("cutshort", "instahyre"):
         capability = by_id[provider_id]
         assert capability["available"] is True
         assert capability["can_connect"] is True
@@ -93,6 +108,44 @@ def test_google_forms_optional_login_is_not_exposed_until_browserbase_is_ready()
     assert google_forms["available"] is False
     assert google_forms["can_connect"] is False
     assert google_forms["connection_required"] is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "https://ycombinator.com/companies/acme/jobs/12345-founding-engineer?utm_source=test#apply",
+            "https://www.ycombinator.com/companies/acme/jobs/12345-founding-engineer",
+        ),
+    ],
+)
+def test_canonical_yc_job_url_accepts_only_exact_detail_shapes(
+    raw: str, expected: str
+) -> None:
+    assert canonical_yc_job_url(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.ycombinator.com/jobs",
+        "https://www.ycombinator.com/companies/acme",
+        "https://www.ycombinator.com/companies/acme/jobs/1234-engineer",
+        "https://www.ycombinator.com/companies/acme_inc/jobs/12345-engineer",
+        "https://account.ycombinator.com/apply/123",
+        "https://www.workatastartup.com/jobs",
+        "https://www.workatastartup.com/jobs/12345",
+        "https://www.workatastartup.com/companies/acme/jobs/12345-engineer",
+        "https://www.workatastartup.com/jobs/123/extra",
+        "http://www.ycombinator.com/companies/acme/jobs/123",
+        "https://user@example.com/companies/acme/jobs/12345-engineer",
+        "https://www.ycombinator.com:444/companies/acme/jobs/12345-engineer",
+    ],
+)
+def test_canonical_yc_job_url_rejects_collections_accounts_and_ambiguous_urls(
+    url: str,
+) -> None:
+    assert canonical_yc_job_url(url) is None
 
 
 def test_explicit_company_form_is_review_gated_without_a_saved_login() -> None:

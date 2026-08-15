@@ -49,7 +49,7 @@ credentials/data in the working directory. Deploy from a clean Git checkout and 
    ```
 
    Verify migrations were applied in filename order through
-   `202608150002_user_provider_credentials.sql`. Do not stop at
+   `202608150003_yc_exact_job_automation.sql`. Do not stop at
    `202608130001_google_forms_manual_submit.sql`: it is the temporary fail-closed
    prohibition. The required forward migration `202608130002_google_forms_approved_submit.sql`
    removes that prohibition and installs the exact-approved/required-answer submit gate;
@@ -282,7 +282,8 @@ Browserbase key/project pair. The value must be identical in the API and all wor
 
 For an existing deployment, apply
 `202608150002_user_provider_credentials.sql` before deploying code that resolves stored
-credentials. Confirm the new table has RLS enabled, no browser grants/policies, and a
+credentials, then apply `202608150003_yc_exact_job_automation.sql` before deploying the
+YC exact-job UI/API/worker. Confirm the credential table has RLS enabled, no browser grants/policies, and a
 service-role grant. Deploy API and worker with the same encryption key before the new
 frontend. On the first authenticated load, the frontend performs a one-time import of
 that user's namespaced legacy Groq/Hunter browser values through the normal validated
@@ -426,8 +427,15 @@ ALLOWED_BROWSER_PROVIDERS=google_forms,greenhouse
 ```
 
 This enables only one-page Google Forms and Greenhouse. Add `lever`, `ashby`, or
-`wellfound` one at a time after a successful controlled canary. A YC adapter exists but
-must remain out until its controlled signed-in tenant-aware canary passes. The exact-host
+`wellfound` one at a time after a successful controlled canary. YC has a finished exact
+saved-job scan/review/sealed-submit state machine, but must remain out until its
+controlled signed-in tenant-aware canary passes. After that canary, use:
+
+```text
+ALLOWED_BROWSER_PROVIDERS=google_forms,greenhouse,yc
+```
+
+The exact-host
 generic `company_form` adapter is internal/gated and is not a public catalog or allowlist
 entry. Leave `cutshort` and `instahyre` out until tenant-aware multi-step application
 state machines have been implemented and live-validated. Multi-page or branching Google
@@ -678,8 +686,22 @@ replace this controlled signed-in live canary; keep Google picker upload launch-
 until the current provider markup passes it.
 Enable Lever, Ashby, or Wellfound one at a time after reviewing
 its current terms and testing scan, immutable approval, submit-control uniqueness,
-confirmation evidence, cancellation/idempotency, and disclosure. Keep the implemented
-YC and exact-host company-form adapters gated until controlled end-to-end canaries pass;
+confirmation evidence, cancellation/idempotency, and disclosure. YC has a finished
+exact-job state machine but remains gated until its controlled signed-in canary proves:
+
+- only an exact current public YC job-detail URL is accepted;
+- search/listing/account/generic/unsupported targets fail before session creation;
+- the owning tenant's persistent Browserbase BYOK context is reused for YC sign-in;
+- Playwright in the separate continuous worker scans the visible fields, uses an
+  immutable résumé/Groq-grounded review, performs one sealed submit, and requires a
+  fresh provider confirmation; and
+- uncertain confirmation, changed schema, login/MFA/CAPTCHA, or an ambiguous control
+  fails closed without a blind retry.
+
+After that canary, add `yc` to the allowlist. Its optional query/remote/limit preferences
+must remain display/matching-only and must never fetch, scrape, discover, or bulk-apply.
+Vercel must not launch Chromium or run the worker. Keep the exact-host company-form
+adapter gated until its controlled end-to-end canary passes;
 do not enable Cutshort or Instahyre until their tenant-aware multi-step application
 handlers exist and pass the same gate.
 Users enter passwords and MFA directly in Browserbase Live View; do not ask them to send

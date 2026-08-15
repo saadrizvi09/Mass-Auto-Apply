@@ -725,8 +725,8 @@ def test_legacy_browser_keys_migrate_once_and_are_removed_only_after_server_save
 
 
 def test_local_frontend_assets_are_versioned_to_avoid_stale_validation_code() -> None:
-    assert 'href="/styles.css?v=20260815.3"' in INDEX_HTML
-    assert 'src="/app.js?v=20260815.3"' in INDEX_HTML
+    assert 'href="/styles.css?v=20260815.4"' in INDEX_HTML
+    assert 'src="/app.js?v=20260815.4"' in INDEX_HTML
 
 
 def test_ziprecruiter_is_not_presented_in_hosted_frontend() -> None:
@@ -908,3 +908,65 @@ def test_form_pilot_merges_server_profile_answers_without_an_extra_resume_input(
     assert 'id="suggest-form-answers"' not in form_pilot_view
     assert "Regenerate with Groq" not in form_pilot_view
     assert 'byId("suggest-form-answers").addEventListener' not in APP_JS
+
+
+def test_yc_exact_job_desk_uses_connection_review_and_one_submit_flow() -> None:
+    jobs_view = INDEX_HTML.split('id="view-jobs"', 1)[1].split(
+        'id="view-applications"', 1
+    )[0]
+    for identifier in (
+        "yc-application-desk",
+        "yc-connection-status",
+        "yc-connect",
+        "yc-complete-login",
+        "yc-job-form",
+        "yc-job-url",
+        "yc-job-title",
+        "yc-job-company",
+        "yc-job-description",
+        "yc-preferences-form",
+        "yc-preference-query",
+        "yc-preference-remote",
+        "yc-route-save",
+        "yc-route-review",
+        "yc-route-submit",
+    ):
+        assert f'id="{identifier}"' in jobs_view
+    assert 'id="yc-preference-limit"' not in jobs_view
+    assert "Bring one exact YC job to a reviewed application." in jobs_view
+    assert "No bulk scraping" in jobs_view
+    assert "Submit once" in jobs_view
+    assert "They do not search, crawl, scrape, or submit YC applications in bulk." in jobs_view
+    assert 'apiRequest("/providers/yc/preferences"' in APP_JS
+    assert 'method: "PATCH"' in APP_JS
+    assert 'body: { query: query || null, remote_only: remoteOnly, limit: 10 }' in APP_JS
+    assert 'source: "yc_exact"' in APP_JS
+    assert 'intake: "exact_user_saved"' in APP_JS
+    assert 'parts[0] === "companies"' in APP_JS
+    assert 'parts[2] === "jobs"' in APP_JS
+    assert 'url.protocol !== "https:" || url.port || url.username || url.password' in APP_JS
+    assert 'url.search = ""' in APP_JS
+    assert 'url.hash = ""' in APP_JS
+    assert "currentJobSlug" in APP_JS
+    assert "legacyJobSlug" not in APP_JS
+    assert '"workatastartup.com"' not in APP_JS
+    assert "findSavedYcJob" in APP_JS
+    assert "This exact YC job is already saved" in APP_JS
+    assert 'setBusyLabel(button, "Reasserting exact YC target…")' in APP_JS
+    assert 'body: { apply_url: jobIdentity.url }' in APP_JS
+    assert "Its strict target was revalidated" in APP_JS
+    assert "Existing YC job and prepared application found" in APP_JS
+    assert "applyYcIntakeDefaults" in APP_JS
+    assert 'preferences.remote_only === true ? "Remote" : ""' in APP_JS
+    assert 'startBrowserConnection("yc"' in APP_JS
+    assert 'completeBrowserConnection("yc"' in APP_JS
+    assert 'scanJobApplication(savedJob, "yc", button)' in APP_JS
+    assert 'text: existingFormApplication ? "Review application"' in APP_JS
+    assert 'id="form-application-target-url"' in INDEX_HTML
+    assert 'id="form-application-target-link"' in INDEX_HTML
+    assert 'targetLink.href = exactTarget' in APP_JS
+    assert "renderYcRouteProgress" in APP_JS
+    assert ".yc-application-route li.is-current" in STYLES_CSS
+    assert ".yc-application-route li.needs-attention" in STYLES_CSS
+    assert ".yc-application-desk" in STYLES_CSS
+    assert ".yc-application-route" in STYLES_CSS

@@ -63,7 +63,12 @@ from app.saas.hunter import (
     validate_hunter_key,
 )
 from app.saas.matching import enrich_jobs_with_fit, recommended_roles
-from app.saas.providers import browser_provider_allowed, get_provider, provider_catalog
+from app.saas.providers import (
+    browser_provider_allowed,
+    canonical_yc_job_url,
+    get_provider,
+    provider_catalog,
+)
 from app.saas.resume import ResumeParseError, extract_pdf_text, profile_suggestions
 from app.saas.schemas import (
     AccountDeletionRequest,
@@ -91,6 +96,7 @@ from app.saas.schemas import (
     ResumeRegister,
     SendApplicationRequest,
     UserSettingsUpdate,
+    YcApplicationPreferencesUpdate,
     normalized_http_url,
 )
 from app.saas.store import StoreClient, SupabaseStore
@@ -123,6 +129,7 @@ COMPANY_FORM_METADATA_KEYS = frozenset(
         "company_form_target_url",
     }
 )
+YC_TARGET_METADATA_KEYS = frozenset({"yc_job_target_url"})
 PERSISTENT_CONTEXT_REQUIRED_PROVIDERS = frozenset(
     {"yc", "wellfound", "cutshort", "instahyre"}
 )
@@ -361,6 +368,24 @@ def _company_form_metadata(
                 "application_provider": "company_form",
                 "company_form_host": target["host"],
                 "company_form_target_url": target["target_url"],
+            }
+        )
+    return metadata
+
+
+def _yc_target_metadata(value: Any, target_url: str | None) -> dict[str, Any]:
+    """Remove client-spoofable YC authority and add the server-derived target."""
+
+    metadata = dict(value) if isinstance(value, Mapping) else {}
+    for key in YC_TARGET_METADATA_KEYS:
+        metadata.pop(key, None)
+    if metadata.get("application_provider") == "yc":
+        metadata.pop("application_provider", None)
+    if target_url is not None:
+        metadata.update(
+            {
+                "application_provider": "yc",
+                "yc_job_target_url": target_url,
             }
         )
     return metadata
@@ -1430,6 +1455,52 @@ def create_app(
             returning=False,
         )
 
+    async def load_yc_job_binding(
+        user: AuthUser, job: Mapping[str, Any]
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Resolve the service-owned authority for one explicitly saved YC job."""
+
+        job_id = job.get("id")
+        source_url = job.get("apply_url")
+        target_url = canonical_yc_job_url(source_url)
+        if not job_id or target_url is None or source_url != target_url:
+            return None
+        binding = await store_service.secret().fetch_one(
+            "yc_application_targets",
+            filters={"job_id": str(job_id), "user_id": str(user.user_id)},
+        )
+        if binding is None or binding.get("target_url") != target_url:
+            return None
+        return target_url, binding
+
+    async def save_yc_job_binding(
+        user: AuthUser, job: Mapping[str, Any], target_url: str
+    ) -> None:
+        job_id = job.get("id")
+        if not job_id or canonical_yc_job_url(target_url) != target_url:
+            raise ApiError(
+                503,
+                "data_store_invalid_response",
+                "The exact YC job could not be bound.",
+            )
+        await store_service.secret().upsert(
+            "yc_application_targets",
+            {
+                "job_id": str(job_id),
+                "user_id": str(user.user_id),
+                "target_url": target_url,
+            },
+            on_conflict="job_id",
+            returning=False,
+        )
+
+    async def delete_yc_job_binding(user: AuthUser, job_id: UUID | str) -> None:
+        await store_service.secret().delete(
+            "yc_application_targets",
+            filters={"job_id": str(job_id), "user_id": str(user.user_id)},
+            returning=False,
+        )
+
     async def require_managed_connection(
         provider: str,
         user: AuthUser,
@@ -1499,6 +1570,83 @@ def create_app(
             browserbase_configured=runtime_settings.managed_browser_available,
         )
         return _items(catalog)
+
+    def yc_preferences_response(row: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "user_id": str(row.get("user_id") or ""),
+            "provider": "yc",
+            "query": row.get("query") if isinstance(row.get("query"), str) else None,
+            "remote_only": bool(row.get("remote_only", False)),
+            "limit": int(row.get("result_limit") or 10),
+            **(
+                {"created_at": row["created_at"]}
+                if row.get("created_at") is not None
+                else {}
+            ),
+            **(
+                {"updated_at": row["updated_at"]}
+                if row.get("updated_at") is not None
+                else {}
+            ),
+        }
+
+    @application.get("/api/v1/providers/yc/preferences", tags=["applications"])
+    async def get_yc_application_preferences(
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        client = store_service.user(user.access_token)
+        row = await client.fetch_one(
+            "provider_application_preferences",
+            filters={"user_id": str(user.user_id), "provider": "yc"},
+        )
+        if row is None:
+            row = _first(
+                await client.upsert(
+                    "provider_application_preferences",
+                    {
+                        "user_id": str(user.user_id),
+                        "provider": "yc",
+                        "remote_only": False,
+                        "result_limit": 10,
+                    },
+                    on_conflict="user_id,provider",
+                )
+            )
+        if row is None:
+            raise ApiError(
+                503,
+                "data_store_invalid_response",
+                "YC application preferences could not be loaded.",
+            )
+        return _data(yc_preferences_response(row))
+
+    @application.patch("/api/v1/providers/yc/preferences", tags=["applications"])
+    async def patch_yc_application_preferences(
+        body: YcApplicationPreferencesUpdate,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        changes = _model_changes(body)
+        if "limit" in changes:
+            changes["result_limit"] = changes.pop("limit")
+        client = store_service.user(user.access_token)
+        row = _first(
+            await client.upsert(
+                "provider_application_preferences",
+                {
+                    "user_id": str(user.user_id),
+                    "provider": "yc",
+                    **changes,
+                },
+                on_conflict="user_id,provider",
+            )
+        )
+        if row is None:
+            raise ApiError(
+                503,
+                "data_store_invalid_response",
+                "YC application preferences could not be saved.",
+            )
+        return _data(yc_preferences_response(row))
 
     @application.get("/api/v1/discovery/sources", tags=["discovery"])
     async def discovery_sources(
@@ -2769,17 +2917,21 @@ def create_app(
     ) -> dict[str, Any]:
         values = body.model_dump(mode="json")
         company_target: dict[str, str] | None = None
+        yc_target_url = canonical_yc_job_url(body.apply_url)
         # Generic company forms are automation-eligible only after an authenticated
         # user explicitly saves the URL. Discovery/import paths never create this
         # marker and fixed providers retain their immutable detection rules.
-        if body.apply_url and detect_provider(body.apply_url) is None:
+        if yc_target_url is not None:
+            values["apply_url"] = yc_target_url
+        elif body.apply_url and detect_provider(body.apply_url) is None:
             company_target = public_company_form_target(body.apply_url)
-        values["metadata"] = _company_form_metadata(
-            values.get("metadata"), company_target
+        values["metadata"] = _yc_target_metadata(
+            _company_form_metadata(values.get("metadata"), company_target),
+            yc_target_url,
         )
         values |= {
             "user_id": str(user.user_id),
-            "normalized_url": normalized_http_url(body.apply_url),
+            "normalized_url": normalized_http_url(values.get("apply_url")),
             "status": "saved",
         }
         row = _first(await store_service.user(user.access_token).insert("jobs", values))
@@ -2789,6 +2941,8 @@ def create_app(
             await save_company_form_binding(
                 user, row, body.apply_url, company_target
             )
+        if yc_target_url is not None:
+            await save_yc_job_binding(user, row, yc_target_url)
         return _data(row)
 
     @application.get("/api/v1/jobs/{job_id}", tags=["jobs"])
@@ -2839,19 +2993,32 @@ def create_app(
         existing = await _required_row(client, "jobs", user, job_id)
         values = _model_changes(body)
         company_target: dict[str, str] | None = None
+        yc_target_url: str | None = None
         if "apply_url" in values:
-            values["normalized_url"] = normalized_http_url(values["apply_url"])
             apply_url = values["apply_url"]
-            if apply_url and detect_provider(apply_url) is None:
+            yc_target_url = canonical_yc_job_url(apply_url)
+            if yc_target_url is not None:
+                values["apply_url"] = yc_target_url
+                apply_url = yc_target_url
+            elif apply_url and detect_provider(apply_url) is None:
                 company_target = public_company_form_target(apply_url)
-            values["metadata"] = _company_form_metadata(
-                values.get("metadata", existing.get("metadata")), company_target
+            values["normalized_url"] = normalized_http_url(apply_url)
+            values["metadata"] = _yc_target_metadata(
+                _company_form_metadata(
+                    values.get("metadata", existing.get("metadata")), company_target
+                ),
+                yc_target_url,
             )
         elif "metadata" in values:
             existing_binding = await load_company_form_binding(user, existing)
             trusted_target = existing_binding[0] if existing_binding is not None else None
-            values["metadata"] = _company_form_metadata(
-                values.get("metadata"), trusted_target
+            existing_yc_binding = await load_yc_job_binding(user, existing)
+            trusted_yc_target = (
+                existing_yc_binding[0] if existing_yc_binding is not None else None
+            )
+            values["metadata"] = _yc_target_metadata(
+                _company_form_metadata(values.get("metadata"), trusted_target),
+                trusted_yc_target,
             )
         if values.get("status") == "archived":
             values["archived_at"] = _iso(_now())
@@ -2869,6 +3036,10 @@ def create_app(
                 await save_company_form_binding(user, row, apply_url, company_target)
             else:
                 await delete_company_form_binding(user, job_id)
+            if yc_target_url is not None:
+                await save_yc_job_binding(user, row, yc_target_url)
+            else:
+                await delete_yc_job_binding(user, job_id)
         return _data(row)
 
     @application.delete("/api/v1/jobs/{job_id}", tags=["jobs"])
@@ -2964,6 +3135,18 @@ def create_app(
         job = await _required_row(client, "jobs", user, job_id)
         provider = detect_provider(job.get("apply_url"))
         company_binding: tuple[dict[str, str], dict[str, Any]] | None = None
+        yc_binding: tuple[str, dict[str, Any]] | None = None
+        yc_target_url = canonical_yc_job_url(job.get("apply_url"))
+        if yc_target_url is not None:
+            provider = "yc"
+        if provider == "yc":
+            yc_binding = await load_yc_job_binding(user, job)
+            if yc_binding is None:
+                raise ApiError(
+                    409,
+                    "yc_exact_job_url_required",
+                    "Save or update this exact YC job-detail URL before scanning it. YC search and listing pages are not supported.",
+                )
         if provider is None:
             company_binding = await load_company_form_binding(user, job)
             if company_binding is not None:
@@ -3018,6 +3201,14 @@ def create_app(
                     "company_form_target_url": company_target["target_url"],
                 }
             )
+        elif provider == "yc":
+            if yc_binding is None:
+                raise ApiError(
+                    409,
+                    "yc_exact_job_url_required",
+                    "Save or update this exact YC job-detail URL before scanning it.",
+                )
+            scan_payload["yc_job_target_url"] = yc_binding[0]
         queued = await enqueue_job(
             user=user,
             kind="application_scan",
@@ -3439,6 +3630,7 @@ def create_app(
         if not approval_is_exact:
             raise ApiError(409, "form_revision_not_approved", "Approve this exact form revision first.")
         provider = str(revision.get("provider") or "").lower()
+        yc_target_url: str | None = None
         if provider == "company_form":
             form_target = public_company_form_target(revision.get("form_url"))
             if form_target is None:
@@ -3480,6 +3672,36 @@ def create_app(
                     "company_form_target_changed",
                     "The saved company form host changed. Scan and review it again.",
                 )
+        elif provider == "yc":
+            application_id = revision.get("application_id")
+            if not application_id:
+                raise ApiError(
+                    409,
+                    "form_revision_invalid",
+                    "The YC form revision is not linked to an application.",
+                )
+            application_row = await _required_row(
+                client, "applications", user, application_id
+            )
+            application_job_id = application_row.get("job_id")
+            if (
+                not application_job_id
+                or str(revision.get("job_id") or "") != str(application_job_id)
+            ):
+                raise ApiError(
+                    409,
+                    "form_revision_invalid",
+                    "The YC form revision is not linked to this saved job.",
+                )
+            bound_job = await _required_row(client, "jobs", user, application_job_id)
+            yc_binding = await load_yc_job_binding(user, bound_job)
+            if yc_binding is None:
+                raise ApiError(
+                    409,
+                    "yc_exact_job_url_changed",
+                    "The saved YC job URL changed. Scan and review it again.",
+                )
+            yc_target_url = yc_binding[0]
         submit_preflight: dict[str, Any] | None = None
         if stage == "submit":
             submit_preflight = _required_answer_preflight(revision)
@@ -3506,6 +3728,14 @@ def create_app(
                     "company_form_target_url": form_target["target_url"],
                 }
             )
+        elif provider == "yc":
+            if yc_target_url is None:
+                raise ApiError(
+                    409,
+                    "yc_exact_job_url_changed",
+                    "The saved YC job URL changed. Scan and review it again.",
+                )
+            queue_payload["yc_job_target_url"] = yc_target_url
         if stage == "submit":
             # This is derived only from the already approved immutable snapshot.
             # The worker also resolves that revision through a tenant-bound RPC;

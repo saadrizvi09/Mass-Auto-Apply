@@ -7,8 +7,10 @@ allowlist value can never turn its guest search into Easy Apply automation.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterable
 from typing import Literal, TypedDict
+from urllib.parse import urlsplit, urlunsplit
 
 
 ProviderMode = Literal["oauth", "managed_browser", "partner_required", "manual_only"]
@@ -82,7 +84,11 @@ _REGISTRY: tuple[dict[str, str], ...] = (
         "id": "yc",
         "label": "YC Work at a Startup",
         "mode": "managed_browser",
-        "reason": "Use an isolated signed-in browser for reviewed YC applications.",
+        "reason": (
+            "Save one exact YC job-detail URL, use an isolated signed-in browser, "
+            "and approve the captured application revision before one-time submission. "
+            "YC scraping and job discovery are not provided."
+        ),
     },
     {
         "id": "wellfound",
@@ -118,11 +124,20 @@ _REGISTRY: tuple[dict[str, str], ...] = (
 
 # These adapters have a bounded, review-gated path from one provider URL to one
 # application form.  An allowlist enables a deployment only; it must never turn
-# a connection-only adapter into a public automation claim.  YC, Cutshort, and
-# Instahyre deliberately remain outside this set until their authenticated,
-# multi-step state machines have passed controlled provider canaries.
+# a connection-only adapter into a public automation claim. YC is admitted only
+# through one explicitly saved, exact job-detail URL; it is not a discovery or
+# scraping capability. Cutshort and Instahyre remain connection-only until their
+# authenticated, multi-step state machines pass controlled provider canaries.
 HOSTED_FORM_AUTOMATION_PROVIDERS = frozenset(
-    {"company_form", "google_forms", "greenhouse", "lever", "ashby", "wellfound"}
+    {
+        "company_form",
+        "google_forms",
+        "greenhouse",
+        "lever",
+        "ashby",
+        "yc",
+        "wellfound",
+    }
 )
 # Kept as a compatibility export for workers deployed independently from the
 # control plane.  No current hosted-form provider is forced into manual-submit
@@ -139,6 +154,48 @@ OPTIONAL_SAVED_BROWSER_CONTEXT_PROVIDERS = frozenset({"google_forms"})
 CONNECTABLE_BROWSER_CONTEXT_PROVIDERS = (
     SAVED_BROWSER_CONTEXT_PROVIDERS | OPTIONAL_SAVED_BROWSER_CONTEXT_PROVIDERS
 )
+
+_YC_CURRENT_JOB_PATH = re.compile(
+    r"^/companies/[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?/jobs/"
+    r"[a-z0-9]{5,64}(?:-[a-z0-9]+)*/?$",
+    re.IGNORECASE,
+)
+
+
+def canonical_yc_job_url(value: object) -> str | None:
+    """Return one canonical YC job-detail URL, never a search/account URL.
+
+    Production launch accepts only the current ``ycombinator.com`` company job
+    shape. Query strings and fragments are discarded rather than becoming part
+    of the browser authority; credentials, ports, extra path segments,
+    collection pages, Work at a Startup entry URLs, and
+    ``account.ycombinator.com`` are rejected.
+    """
+
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw or len(raw) > 2_048 or any(ord(character) < 32 for character in raw):
+        return None
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or (port is not None and port != 443)
+        or host not in {"ycombinator.com", "www.ycombinator.com"}
+    ):
+        return None
+    if _YC_CURRENT_JOB_PATH.fullmatch(parsed.path) is None:
+        return None
+    return urlunsplit(
+        ("https", "www.ycombinator.com", parsed.path.rstrip("/"), "", "")
+    )
 
 
 def _normalise_allowlist(value: str | Iterable[str] | None) -> frozenset[str]:
@@ -261,6 +318,13 @@ def provider_catalog(
                     "a form requires a signed-in file upload; every captured revision "
                     "still requires explicit review."
                 )
+            elif provider_id == "yc":
+                reason = (
+                    "Save one exact YC job-detail URL and connect an isolated YC "
+                    "browser session. Scan, prefill, and one-time submit are available "
+                    "only for that saved job and its exact approved revision; YC job "
+                    "scraping and discovery remain unavailable."
+                )
             else:
                 reason = (
                     "Managed browser support is enabled; every captured form revision "
@@ -335,6 +399,7 @@ __all__ = [
     "ProviderMode",
     "SAVED_BROWSER_CONTEXT_PROVIDERS",
     "browser_provider_allowed",
+    "canonical_yc_job_url",
     "get_provider",
     "provider_catalog",
 ]

@@ -26,6 +26,10 @@ _ADDRESS_ALIAS_SUFFIXES = (
     ".localtest.me",
     ".lvh.me",
 )
+_RESERVED_PROVIDER_SUFFIXES = (
+    "ycombinator.com",
+    "workatastartup.com",
+)
 
 
 def public_company_form_host(value: str) -> str | None:
@@ -60,6 +64,11 @@ def public_company_form_host(value: str) -> str | None:
         # custom form must be attached to a stable public DNS identity.
         return None
     if host == "localhost" or host.endswith(_NON_PUBLIC_SUFFIXES):
+        return None
+    if any(
+        host == suffix or host.endswith(f".{suffix}")
+        for suffix in _RESERVED_PROVIDER_SUFFIXES
+    ):
         return None
     if host in {suffix.removeprefix(".") for suffix in _ADDRESS_ALIAS_SUFFIXES} or host.endswith(
         _ADDRESS_ALIAS_SUFFIXES

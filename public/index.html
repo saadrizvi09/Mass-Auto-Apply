@@ -13,8 +13,8 @@
       content="default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co; frame-src https://challenges.cloudflare.com; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
     />
     <title>AutoApply Cloud — Your job search, thoughtfully organized</title>
-    <link rel="stylesheet" href="/styles.css?v=20260815.3" />
-    <script type="module" src="/app.js?v=20260815.3"></script>
+    <link rel="stylesheet" href="/styles.css?v=20260815.4" />
+    <script type="module" src="/app.js?v=20260815.4"></script>
   </head>
   <body>
     <a id="skip-link" class="skip-link" href="#public-main">Skip to main content</a>
@@ -814,9 +814,9 @@
             <div class="form-pilot-hero-copy">
               <p class="eyebrow">Referral application router</p>
               <h2 id="form-pilot-hero-heading">Paste a referral alert. Route every application.</h2>
-              <p>Turn one forwarded hiring digest into structured jobs, Google Forms ready for preparation, and email opportunities ready for outreach. A form can leave this desk only after you review its answers and choose the final one-time action.</p>
+              <p>Turn one forwarded hiring digest into structured jobs, prepare Google Forms, and review exact provider applications such as YC. An application can leave this desk only after you review its answers and choose the final one-time action.</p>
             </div>
-            <ol class="form-pilot-route" aria-label="Google Form workflow">
+            <ol class="form-pilot-route" aria-label="Reviewed application workflow">
               <li><span>01</span><strong>Parse leads</strong><small>Digest or form link</small></li>
               <li><span>02</span><strong>Prepare forms</strong><small>Scan + résumé answers</small></li>
               <li><span>03</span><strong>Review &amp; submit</strong><small>One explicit approval</small></li>
@@ -905,15 +905,21 @@
               </div>
               <span id="form-application-status-pill" class="status-pill status-neutral">Choose a prepared form</span>
             </div>
-            <p class="form-intro">Groq fills only answers grounded in your résumé and profile. Review every field here, then use one explicit action to seal this exact revision and queue its background submission. Form Pilot reports only provider-verified success; anything uncertain stops for your attention.</p>
+            <p class="form-intro">Groq fills only answers grounded in your résumé and profile. Review every field from Google Forms or an exact provider application here, then use one explicit action to seal this revision and queue its background submission. Form Pilot reports only provider-verified success; anything uncertain stops for your attention.</p>
             <input id="form-application-id" type="hidden" />
-            <p id="form-application-job-context" class="draft-context">Choose <strong>Prepare form</strong> or <strong>Review prepared form</strong> above to begin.</p>
+            <div class="draft-context form-application-target">
+              <div class="form-application-target-copy">
+                <span id="form-application-job-context">Choose <strong>Prepare form</strong> or <strong>Review prepared form</strong> above to begin.</span>
+                <code id="form-application-target-url" hidden></code>
+              </div>
+              <a id="form-application-target-link" class="button button-ghost button-small" href="#" target="_blank" rel="noopener noreferrer" hidden>Open exact YC job ↗</a>
+            </div>
             <section id="application-form-review" class="form-revision-review" aria-labelledby="application-form-review-heading">
               <div class="form-revision-heading">
                 <div><p class="eyebrow">Captured form revision</p><h3 id="application-form-review-heading">Review application answers</h3></div>
                 <span id="form-revision-status" class="status-pill status-neutral">Not scanned</span>
               </div>
-              <p id="form-revision-context" class="form-intro">Prepare a Google Form to capture its visible questions.</p>
+              <p id="form-revision-context" class="form-intro">Prepare a Google Form or exact provider application to capture its visible questions.</p>
               <div id="form-workflow-progress" class="form-workflow-progress" role="status" aria-live="polite" hidden>
                 <span class="form-workflow-orbit" aria-hidden="true"><span></span></span>
                 <div class="form-workflow-progress-copy">
@@ -1139,6 +1145,74 @@
                 <button id="jobs-open-profile" class="button button-light button-small" type="button">Review</button>
               </article>
             </div>
+          </section>
+
+          <section id="yc-application-desk" class="panel yc-application-desk" aria-labelledby="yc-application-desk-heading">
+            <div class="yc-desk-heading">
+              <div class="yc-desk-title">
+                <span class="yc-provider-mark" aria-hidden="true">Y</span>
+                <div>
+                  <p class="eyebrow">YC startup applications</p>
+                  <h2 id="yc-application-desk-heading">Bring one exact YC job to a reviewed application.</h2>
+                  <p>Sign in to YC inside your isolated browser, save the exact job you chose, then review every captured answer before one approved submission.</p>
+                </div>
+              </div>
+              <span id="yc-connection-status" class="status-pill status-neutral" role="status" aria-live="polite">Checking YC</span>
+            </div>
+
+            <ol class="yc-application-route" aria-label="YC application workflow">
+              <li id="yc-route-connect"><span>01</span><strong>Connect YC</strong><small>Your account + MFA</small></li>
+              <li id="yc-route-save"><span>02</span><strong>Save exact job</strong><small>No bulk scraping</small></li>
+              <li id="yc-route-review"><span>03</span><strong>Review answers</strong><small>Résumé-grounded</small></li>
+              <li id="yc-route-submit"><span>04</span><strong>Submit once</strong><small>Your approval</small></li>
+            </ol>
+
+            <div class="yc-desk-grid">
+              <aside class="yc-connection-card" aria-labelledby="yc-connection-heading">
+                <p class="eyebrow">Isolated account</p>
+                <h3 id="yc-connection-heading">YC login lives in your Browserbase context.</h3>
+                <p id="yc-connection-detail">Checking your YC and Browserbase setup…</p>
+                <div class="button-row">
+                  <button id="yc-connect" class="button button-primary button-small" type="button">Connect YC</button>
+                  <button id="yc-complete-login" class="button button-accent button-small" type="button" hidden>I completed login</button>
+                  <button id="yc-open-connections" class="button button-ghost button-small" type="button">Open Connections</button>
+                </div>
+              </aside>
+
+              <form id="yc-job-form" class="yc-job-form stack-form" autocomplete="off" novalidate>
+                <div class="yc-job-form-heading">
+                  <div><p class="eyebrow">Exact job intake</p><h3>Save and prepare a YC role</h3></div>
+                  <span class="status-pill status-info">Exact job only</span>
+                </div>
+                <div class="field">
+                  <label for="yc-job-url">Exact YC job URL</label>
+                  <input id="yc-job-url" name="apply_url" type="url" inputmode="url" maxlength="2048" required placeholder="https://www.ycombinator.com/companies/company/jobs/job-id-role" />
+                  <small>Use one individual <code>ycombinator.com/companies/…/jobs/…</code> page. Search, company, account, generic application, and legacy Work at a Startup URLs are rejected.</small>
+                </div>
+                <div class="form-grid two-columns">
+                  <div class="field"><label for="yc-job-title">Role title</label><input id="yc-job-title" name="title" maxlength="240" required placeholder="Software Engineer" /></div>
+                  <div class="field"><label for="yc-job-company">Startup</label><input id="yc-job-company" name="company" maxlength="240" required placeholder="Company name" /></div>
+                </div>
+                <div class="field"><label for="yc-job-location">Location <span class="optional-label">optional</span></label><input id="yc-job-location" name="location" maxlength="240" placeholder="Remote or city" /></div>
+                <div class="field">
+                  <label for="yc-job-description">Job description</label>
+                  <textarea id="yc-job-description" name="description" rows="6" minlength="20" maxlength="25000" required placeholder="Paste the role description so fit scoring and answers stay grounded in the real job."></textarea>
+                </div>
+                <button id="yc-save-and-prepare" class="button button-primary" type="submit">Save &amp; prepare application</button>
+                <p id="yc-job-status" class="form-message" role="status" aria-live="polite"></p>
+              </form>
+            </div>
+
+            <details class="yc-preferences-disclosure">
+              <summary><span><strong>Exact-job intake defaults</strong><small>Prefill blank role and location fields without fetching YC pages</small></span><span aria-hidden="true">+</span></summary>
+              <form id="yc-preferences-form" class="yc-preferences-form" autocomplete="off">
+                <div class="field"><label for="yc-preference-query">Default role title</label><input id="yc-preference-query" name="query" maxlength="120" placeholder="AI Engineer" /></div>
+                <label class="check-row"><input id="yc-preference-remote" name="remote_only" type="checkbox" /><span>Prefill blank locations as Remote</span></label>
+                <button class="button button-ghost button-small" type="submit">Save intake defaults</button>
+                <p id="yc-preferences-status" class="form-message" role="status" aria-live="polite"></p>
+              </form>
+              <p class="yc-preferences-note">These defaults only help complete the exact-job form above. They do not search, crawl, scrape, or submit YC applications in bulk.</p>
+            </details>
           </section>
 
           <div class="content-grid jobs-layout">

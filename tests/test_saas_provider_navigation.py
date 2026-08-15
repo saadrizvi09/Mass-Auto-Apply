@@ -164,7 +164,11 @@ class FixturePage:
         return None
 
     def locator(self, selector: str) -> FixtureLocator:
-        if selector == self.adapter.application_entry_selector:
+        if selector == self.adapter.application_entry_selector or (
+            self.adapter.provider == "yc"
+            and "account.ycombinator.com/authenticate" in selector
+            and "signup_job_id" in selector
+        ):
             return FixtureLocator(self.entry_controls)
         if selector in self.adapter.form_selectors:
             roots = (
@@ -211,8 +215,8 @@ PROVIDER_FIXTURES = [
     ),
     (
         "yc",
-        "https://www.workatastartup.com/jobs/1",
-        "https://www.workatastartup.com/jobs/1",
+        "https://www.ycombinator.com/companies/acme/jobs/12345-engineer",
+        "https://www.ycombinator.com/companies/acme/jobs/12345-engineer",
         False,
     ),
     (

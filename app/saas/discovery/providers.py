@@ -43,10 +43,23 @@ _NON_PUBLIC_HOST_SUFFIXES = (
     ".example",
 )
 _ADDRESS_ALIAS_SUFFIXES = (".nip.io", ".sslip.io", ".localtest.me", ".lvh.me")
+_RESERVED_COMPANY_FORM_SUFFIXES = (
+    "ycombinator.com",
+    "workatastartup.com",
+)
 
 
 def _host_is(host: str, *candidates: str) -> bool:
     return host in candidates
+
+
+def _reserved_company_form_host(host: str) -> bool:
+    """Keep YC-owned hosts inside the stricter exact-job provider boundary."""
+
+    return any(
+        host == suffix or host.endswith(f".{suffix}")
+        for suffix in _RESERVED_COMPANY_FORM_SUFFIXES
+    )
 
 
 def detect_provider(url: object) -> str | None:
@@ -128,6 +141,8 @@ def public_company_form_target(url: object) -> dict[str, str] | None:
     else:
         return None
     if host == "localhost" or host.endswith(_NON_PUBLIC_HOST_SUFFIXES):
+        return None
+    if _reserved_company_form_host(host):
         return None
     if host in {suffix.removeprefix(".") for suffix in _ADDRESS_ALIAS_SUFFIXES} or host.endswith(
         _ADDRESS_ALIAS_SUFFIXES

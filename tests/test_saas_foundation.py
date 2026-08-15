@@ -65,16 +65,16 @@ def test_gmail_readiness_distinguishes_platform_and_user_managed_oauth() -> None
     assert "server-secret" not in str(settings.public_config())
 
 
-def test_connection_only_allowlist_does_not_enable_application_review_flag() -> None:
+def test_only_exact_job_or_form_automation_enables_application_review_flag() -> None:
     connection_only = Settings(
         browserbase_api_key="browserbase-key",
         browserbase_project_id="project",
-        allowed_browser_providers=("yc", "cutshort", "instahyre"),
+        allowed_browser_providers=("cutshort", "instahyre"),
     )
-    with_form_flow = Settings(
+    with_exact_yc_flow = Settings(
         browserbase_api_key="browserbase-key",
         browserbase_project_id="project",
-        allowed_browser_providers=("greenhouse", "yc"),
+        allowed_browser_providers=("yc",),
     )
 
     assert connection_only.public_config()["feature_flags"]["managed_browser"] is True
@@ -83,7 +83,9 @@ def test_connection_only_allowlist_does_not_enable_application_review_flag() -> 
         is False
     )
     assert (
-        with_form_flow.public_config()["feature_flags"]["managed_application_review"]
+        with_exact_yc_flow.public_config()["feature_flags"][
+            "managed_application_review"
+        ]
         is True
     )
 

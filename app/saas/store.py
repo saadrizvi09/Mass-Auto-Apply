@@ -65,6 +65,41 @@ _SAFE_DATABASE_ERRORS: dict[str, tuple[int, str, str]] = {
         "provider_automation_unavailable",
         "This provider supports a manual handoff only.",
     ),
+    "yc_exact_job_url_required": (
+        409,
+        "yc_exact_job_url_required",
+        "Save one exact YC job-detail URL before starting the application.",
+    ),
+    "yc_exact_job_url_changed": (
+        409,
+        "yc_exact_job_url_changed",
+        "The saved YC job URL changed. Scan and review it again.",
+    ),
+    "yc_application_identity_required": (
+        409,
+        "yc_application_identity_required",
+        "Scan this exact YC job before preparing or submitting its application.",
+    ),
+    "yc_application_identity_changed": (
+        409,
+        "yc_application_identity_changed",
+        "YC resolved a different application for this job. Rebind the exact job and scan it again.",
+    ),
+    "yc_application_identity_invalid": (
+        409,
+        "yc_application_identity_invalid",
+        "YC did not resolve a trusted application identity for this exact job.",
+    ),
+    "yc_application_identity_untrusted": (
+        409,
+        "yc_application_identity_untrusted",
+        "The YC application identity must be established by a fresh job scan.",
+    ),
+    "yc_application_identity_immutable": (
+        409,
+        "yc_application_identity_immutable",
+        "The YC application identity is sealed. Rebind the exact job before scanning again.",
+    ),
     "browser_start_rate_limited": (
         429,
         "browser_start_rate_limited",

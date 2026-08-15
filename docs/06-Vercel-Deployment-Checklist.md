@@ -136,7 +136,7 @@ supabase db lint --linked --level warning
 ```
 
 - [ ] Confirm every migration through
-      `202608150002_user_provider_credentials.sql` was applied in filename order.
+      `202608150003_yc_exact_job_automation.sql` was applied in filename order.
 - [ ] Confirm `user_provider_credentials` has RLS enabled, no browser policy or
       `public`/`anon`/`authenticated` grant, and only `service_role` access. Its allowed
       providers must be exactly `groq`, `hunter`, and `browserbase`.
@@ -159,6 +159,15 @@ supabase db lint --linked --level warning
       `202608130005_profile_form_answer_sync.sql` are installed. The latter's refresh
       RPC must remain service-role-only and must refuse active, submitted, or uncertain
       application attempts.
+- [ ] Confirm `202608150003_yc_exact_job_automation.sql` rejects non-job YC targets,
+      binds every YC target/revision/job to one tenant-owned exact current public URL,
+      keeps YC preferences tenant-only and non-executable, and allows only
+      `application_scan`, `application_prefill`, and `application_submit` provider work.
+      Confirm it also removes old generic company-form bindings for every YC-owned root
+      or subdomain and prevents those hosts from being rebound through `company_form`.
+- [ ] Confirm `202608150004_profile_form_answer_count_lint.sql` is installed and the
+      linked Supabase schema linter no longer reports `jsonb_object_length(jsonb)` in
+      `refresh_application_form_profile_answers_for_user`.
 - [ ] Confirm `202608140001_form_submit_attention_snapshot.sql` installed the
       service-role-only `complete_application_form_submit_attention` RPC. An uncertain
       or provider-confirmed click must atomically persist a durable form-revision fence
@@ -536,11 +545,17 @@ monitor worker lifecycle, claimed-job, completion, and warning entries instead.
   ALLOWED_BROWSER_PROVIDERS=google_forms,greenhouse
   ```
 
-- [ ] Canary every other provider independently before adding it. YC has an adapter but
-      remains launch-gated pending a controlled signed-in end-to-end canary. The generic
-      exact-host `company_form` adapter is internal/gated and is not a public provider
-      catalog or allowlist entry. Do not advertise or enable either from code presence
-      alone.
+- [ ] Canary every other provider independently before adding it. YC has a finished
+      exact saved-job state machine but remains launch-gated pending a controlled
+      signed-in end-to-end canary. After it passes, add it explicitly:
+
+  ```dotenv
+  ALLOWED_BROWSER_PROVIDERS=google_forms,greenhouse,yc
+  ```
+
+- [ ] Keep the generic exact-host `company_form` adapter internal/gated. It is not a
+      public provider catalog or allowlist entry; do not advertise or enable it from
+      code presence alone.
 - [ ] Before enabling Google Forms résumé upload, connect one isolated test Google
       Browserbase context and run a non-submitting file-upload canary. It must find
       exactly one explicit résumé/CV `Add file` question, keep the picker on an exact
@@ -562,6 +577,11 @@ Telegram/RSS results against those terms. LinkedIn guest discovery remains unoff
 bounded, credential-free, and unrelated to Easy Apply. Managed-browser scan,
 approval-bound submission, verified confirmation, and any needs-attention Live View do
 require Browserbase.
+
+Vercel hosts only the bounded API/UI and queue endpoints. It must never launch Chromium,
+connect Playwright to Browserbase, or run the queue poller. A separate persistent worker
+uses Playwright over Browserbase CDP with the claimed tenant's BYOK credential and
+isolated provider context.
 
 Browserbase account setup:
 
@@ -631,6 +651,22 @@ References: [Browserbase pricing](https://www.browserbase.com/pricing) and
 - [ ] The worker retains Telegram/RSS matches using the résumé-derived Groq terms;
       LinkedIn guest results remain bounded/unofficial and expose no login or Easy Apply
       behavior.
+- [ ] Saving a YC target accepts only an exact current public YC job-detail URL and
+      rejects YC search pages, company listings, account pages, generic application
+      URLs, and unsupported historical shapes before any Browserbase session exists.
+- [ ] `GET/PATCH /api/v1/providers/yc/preferences` isolates each tenant's optional
+      query/remote/limit values. Reading or changing them performs no YC request and
+      never fetches, scrapes, discovers, queues provider work, or enables bulk apply.
+- [ ] In the signed-in YC canary, the worker resolves the claimed tenant's Browserbase
+      BYOK pair, reuses only that tenant's persistent YC context, and connects Playwright
+      over CDP outside Vercel. A second tenant cannot observe or lease that context.
+- [ ] The YC scan opens only the saved exact job, captures its visible job-bound fields,
+      and produces an immutable résumé/Groq-grounded revision for explicit review. The
+      sealed revision authorizes one unique submit activation and success appears only
+      after a fresh YC confirmation.
+- [ ] For YC, login/MFA/CAPTCHA, an unknown required field, changed job/schema,
+      ambiguous submit control, timeout, or uncertain confirmation fails closed as
+      `needs_attention` without a blind retry or a claim that the application succeeded.
 - [ ] In **Form Pilot**, `GET /api/v1/discovery/google-forms` returns only the signed-in
       tenant's deduplicated inbox. Loading it performs no scan; the user explicitly
       chooses **Prepare form**. Poll the returned scan job until the immutable revision
@@ -721,16 +757,19 @@ Recommended order:
 1. Rotate credentials and save the encryption key.
 2. Commit/review the deployment branch and legal pages.
 3. Apply/lint Supabase migrations through
-   `202608150002_user_provider_credentials.sql`; verify its no-browser-access contract
-   before deploying provider-credential code.
+   `202608150003_yc_exact_job_automation.sql`; verify the provider-credential
+   no-browser-access contract and YC exact-target/service-role guards before deploying
+   the corresponding API/worker code.
 4. Configure Supabase Site URL, redirects, Google provider, SMTP, and Turnstile.
 5. Configure Google identity and Gmail clients.
 6. Deploy the stable staging Vercel build.
 7. Deploy and validate the continuous worker on a persistent host outside Vercel.
-8. Run two-user, OAuth/Gmail, queue, and exact-approved Google Forms smoke tests.
+8. Run two-user, OAuth/Gmail, queue, exact-approved Google Forms, and signed-in YC
+   exact-job smoke tests.
 9. Promote/deploy production.
-10. Keep browser provider allowlists empty until capacity and canaries pass; YC and the
-    custom company-form adapter remain gated even though implementation code exists.
+10. Keep browser provider allowlists empty until capacity and canaries pass. Add `yc`
+    only after its signed-in exact-job canary; the custom company-form adapter remains
+    gated even though implementation code exists.
 
 If cutover fails:
 

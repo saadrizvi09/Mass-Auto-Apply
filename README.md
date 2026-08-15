@@ -27,7 +27,7 @@ is never imported by the Vercel application.
 | Applications | Form Pilot owns Google Form scan, answer review, and one explicit **Approve & submit in background** action. The worker submits only the exact approved revision and reports success only after fresh provider confirmation; Browserbase Live View appears only when a run needs attention. Mass Cold Email separately handles only email drafts, exact approval, sequential Gmail sending, and status/history. |
 | Gmail | Google Web OAuth with `openid email profile gmail.send`; platform-managed by default, with an advanced per-user Web OAuth client option; encrypted credentials/tokens and disconnect/revoke |
 | LinkedIn | Bounded unofficial guest-page discovery plus manual handoff; Easy Apply remains excluded unless an official candidate-apply partnership is obtained |
-| Browser application work | One-page Google Forms use scan → exact answer review → explicit approval-bound background submit → verified confirmation. Unknown required fields, login/MFA/CAPTCHA, changed schema, or uncertain confirmation stop as `needs_attention`, with Live View offered only as a fallback. Greenhouse has an aligned managed-browser handler. Lever and Ashby mappings passed read-only live scan canaries but remain disabled pending controlled submit tests; Wellfound still needs its signed-in canary. YC and generic exact-host company-form adapters exist in code but are launch-gated controlled canaries, not public capabilities. Cutshort and Instahyre remain connection-only. |
+| Browser application work | One-page Google Forms use scan → exact answer review → explicit approval-bound background submit → verified confirmation. Unknown required fields, login/MFA/CAPTCHA, changed schema, or uncertain confirmation stop as `needs_attention`, with Live View offered only as a fallback. Greenhouse has an aligned managed-browser handler. Lever and Ashby mappings passed read-only live scan canaries but remain disabled pending controlled submit tests; Wellfound still needs its signed-in canary. YC has a finished exact-job state machine: the user saves one current public YC job URL, signs in through a tenant-isolated persistent Browserbase BYOK context, reviews résumé/Groq-grounded answers, and authorizes one sealed submit whose success must be provider-verified. It remains operator-allowlist gated until its signed-in canary passes. The generic exact-host company-form adapter remains an internal canary. Cutshort and Instahyre remain connection-only. |
 
 LinkedIn guest discovery uses a bounded, throttled, unofficial public endpoint. It can
 stop working if LinkedIn changes or blocks that endpoint, and it never signs a user in
@@ -134,15 +134,43 @@ revision and required-answer preflight, fills only the sealed answers, activates
 provider submit control once, and requires freshly observed confirmation. It does not
 blindly retry an uncertain submit; that outcome becomes `needs_attention`.
 
+### Exact YC job workflow
+
+YC automation starts only from an exact, current public YC job-detail URL saved by the
+user. Search pages, company listings, account pages, generic application URLs, and
+historical/unsupported YC URL shapes are rejected as automation targets. AutoApply does
+not crawl YC, discover YC jobs, or turn saved query, remote, or result-limit preferences
+into provider requests; those optional preferences are organization and matching hints
+only. Every root or subdomain of `ycombinator.com` and `workatastartup.com` is also
+reserved from the generic company-form adapter, so a non-exact YC URL cannot bypass this
+contract through a broader browser workflow.
+
+The user signs in to YC inside a tenant-isolated Browserbase session created with that
+account's Browserbase BYOK credential (or the explicitly configured trusted fallback).
+The opaque persistent context is bound to the same account and provider so later runs
+can reuse the user's cookies without collecting the YC password. A continuously running
+worker outside Vercel connects Playwright to Browserbase, opens only the saved exact job,
+and scans the visible application fields. Vercel serves the API/UI and queue endpoints;
+it does not launch Chromium, control Browserbase, or run this worker.
+
+The captured fields become an immutable review revision. Answers must be grounded in the
+owned profile and résumé, with Groq used only for reviewable suggestions. Approval seals
+that exact job, schema, answers, and résumé selection. The worker may activate one unique
+submit control once and reports success only after a fresh YC confirmation. A changed
+page, missing login, CAPTCHA/MFA, unknown required field, ambiguous control, or uncertain
+confirmation fails closed as `needs_attention`; the worker never guesses or blindly
+retries a potentially completed application.
+
 The managed-browser registry contains exactly `google_forms`, `greenhouse`, `lever`,
 `ashby`, `yc`, `wellfound`, `cutshort`, and `instahyre`, but registry membership does
 not mean that all eight have an end-to-end application handler. Greenhouse and
 one-page Google Forms are aligned; multi-page or branching Google Forms are unsupported.
 Lever and Ashby have fail-closed mappings whose read-only live scans passed on
 2026-08-11, but their submit-confirmation gates still require controlled test postings.
-Wellfound still requires a signed-in canary. A YC adapter and an exact-host public
-company-form adapter exist in the worker, but both remain gated controlled canaries and
-are not enabled public capabilities. Cutshort and Instahyre support an isolated user
+Wellfound still requires a signed-in canary. YC's exact-job state machine is implemented
+but remains allowlist-gated until a controlled signed-in canary validates the current
+provider behavior. The exact-host public company-form adapter remains an internal gated
+canary and is not an enabled public capability. Cutshort and Instahyre support an isolated user
 login/context only; their workers return `needs_attention` until tenant-aware multi-step
 state machines are built and validated. ZipRecruiter is intentionally not part of the
 hosted product. CAPTCHA,
@@ -385,8 +413,14 @@ ALLOWED_BROWSER_PROVIDERS=google_forms,greenhouse
 ```
 
 Add `lever`, `ashby`, or `wellfound` individually only after its controlled canary has
-passed. Although a YC worker adapter exists, leave `yc` out until a controlled signed-in
-canary proves the full tenant-aware flow and current provider behavior. The generic
+passed. Leave `yc` out until a controlled signed-in exact-job canary proves the full
+tenant-aware flow and current provider behavior; after it passes, use:
+
+```text
+ALLOWED_BROWSER_PROVIDERS=google_forms,greenhouse,yc
+```
+
+The generic
 `company_form` adapter is also an internal exact-host canary and is not a public catalog
 or allowlist entry. Leave `cutshort` and `instahyre` out until their tenant-aware
 multi-step state machines exist and pass live staging. `google_forms` covers one-page

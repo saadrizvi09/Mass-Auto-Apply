@@ -30,6 +30,7 @@ from worker.providers.base import (
 )
 from worker.providers.company_form import public_company_form_host
 from worker.providers.base import ProviderResult
+from worker.providers.yc import canonical_yc_form_target, is_exact_yc_job_url
 from worker.handlers import handle_job
 
 
@@ -111,7 +112,10 @@ def test_ephemeral_worker_session_does_not_attach_a_persistent_context() -> None
         ("greenhouse", "https://job-boards.eu.greenhouse.io/acme/jobs/1"),
         ("lever", "https://jobs.lever.co/acme/role/apply"),
         ("ashby", "https://jobs.ashbyhq.com/acme/role/application"),
-        ("yc", "https://www.workatastartup.com/jobs/1"),
+        (
+            "yc",
+            "https://www.ycombinator.com/companies/circleback/jobs/dUH7zjN-software-engineer",
+        ),
         ("wellfound", "https://wellfound.com/jobs/1"),
         ("cutshort", "https://cutshort.io/job/one"),
         ("instahyre", "https://www.instahyre.com/candidate/opportunities/"),
@@ -154,6 +158,21 @@ def test_google_forms_policy_scopes_short_links_without_opening_all_google_docs(
 def test_custom_company_form_rejects_non_public_or_credentialed_targets(
     target_url: str,
 ) -> None:
+    assert public_company_form_host(target_url) is None
+    assert get_adapter("company_form", target_url=target_url) is None
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        "https://www.ycombinator.com/jobs",
+        "https://ycombinator.com/companies/acme",
+        "https://account.ycombinator.com/authenticate",
+        "https://www.workatastartup.com/jobs/12345",
+        "https://subdomain.workatastartup.com/application",
+    ],
+)
+def test_custom_company_form_never_claims_yc_owned_hosts(target_url: str) -> None:
     assert public_company_form_host(target_url) is None
     assert get_adapter("company_form", target_url=target_url) is None
 
@@ -202,10 +221,20 @@ def test_custom_company_form_identity_rejects_oversized_query() -> None:
 
 def test_yc_policy_is_limited_to_exact_job_and_confirmation_paths() -> None:
     adapter = get_adapter("yc")
+    current_job = (
+        "https://www.ycombinator.com/companies/circleback/jobs/"
+        "dUH7zjN-software-engineer"
+    )
 
     assert adapter is not None
-    assert adapter.allows_url("https://www.workatastartup.com/jobs/12345")
-    assert adapter.allows_url(
+    assert is_exact_yc_job_url(current_job)
+    assert adapter.allows_url(current_job)
+    assert not is_exact_yc_job_url("https://www.workatastartup.com/jobs/12345")
+    assert not is_exact_yc_job_url(
+        "https://www.workatastartup.com/companies/acme/jobs/12345-engineer"
+    )
+    assert not adapter.allows_url("https://www.workatastartup.com/jobs/12345")
+    assert not adapter.allows_url(
         "https://www.workatastartup.com/companies/acme/jobs/12345-engineer"
     )
     assert adapter.allows_url(
@@ -214,6 +243,54 @@ def test_yc_policy_is_limited_to_exact_job_and_confirmation_paths() -> None:
     assert not adapter.allows_url("https://www.workatastartup.com/jobs")
     assert not adapter.allows_url("https://www.workatastartup.com/companies/acme")
     assert not adapter.allows_url("https://account.ycombinator.com/authenticate")
+    assert not adapter.allows_url("https://www.ycombinator.com/jobs")
+    assert not adapter.allows_url(
+        "https://www.ycombinator.com/companies/circleback/jobs/dUH7zjN-software-engineer/related"
+    )
+    assert not adapter.allows_url(
+        "https://www.ycombinator.com/companies/circleback/jobs/dUH7zjN-software-engineer?role=all"
+    )
+
+
+def test_yc_account_handoff_is_allowed_only_for_one_numeric_signup_job() -> None:
+    adapter = get_adapter("yc")
+    assert adapter is not None
+    valid = (
+        "https://account.ycombinator.com/authenticate?"
+        "continue=https%3A%2F%2Fwww.workatastartup.com%2Fapplication%3Fsignup_job_id%3D91924"
+        "&defaults%5BsignUpActive%5D=true&defaults%5Bwaas_company%5D=29408"
+    )
+
+    assert adapter.allows_url(valid)
+    assert adapter.allows_url(
+        "https://www.workatastartup.com/application?signup_job_id=91924"
+    )
+    assert not is_exact_yc_job_url(valid)
+    assert not adapter.allows_url(
+        valid.replace("www.workatastartup.com", "attacker.example")
+    )
+    assert not adapter.allows_url(valid + "&continue=https%3A%2F%2Fattacker.example")
+    assert not adapter.allows_url(
+        "https://account.ycombinator.com/authenticate?continue="
+        "https%3A%2F%2Fwww.workatastartup.com%2Fcompanies"
+    )
+
+
+def test_yc_form_identity_preserves_signup_job_id_and_changes_schema_hash() -> None:
+    first = canonical_yc_form_target(
+        "https://www.workatastartup.com/application?signup_job_id=91924"
+    )
+    second = canonical_yc_form_target(
+        "https://www.workatastartup.com/application?signup_job_id=91925"
+    )
+    page = FakePage(first, _yc_fields(), submit_count=1)  # type: ignore[name-defined]
+    raw = asyncio.run(scan_form(page))
+
+    assert first.endswith("?signup_job_id=91924")
+    assert second.endswith("?signup_job_id=91925")
+    assert bind_schema_to_target(raw, first).schema_hash != bind_schema_to_target(
+        raw, second
+    ).schema_hash
 
 
 def test_worker_registry_contains_no_ziprecruiter_adapter() -> None:
@@ -482,6 +559,56 @@ class FakePage:
         return None
 
 
+class CurrentYcJobPage(FakePage):
+    """Current YC job page whose exact Apply link reaches one signed-in form."""
+
+    target = (
+        "https://www.ycombinator.com/companies/circleback/jobs/"
+        "dUH7zjN-software-engineer"
+    )
+    application = "https://www.workatastartup.com/application?signup_job_id=91924"
+    handoff = (
+        "https://account.ycombinator.com/authenticate?"
+        "continue=https%3A%2F%2Fwww.workatastartup.com%2Fapplication%3Fsignup_job_id%3D91924"
+        "&defaults%5BsignUpActive%5D=true&defaults%5Bwaas_company%5D=29408"
+    )
+
+    def __init__(
+        self,
+        fields: list[dict[str, Any]] | None = None,
+        *,
+        checkpoint_count: int = 0,
+        submit_count: int = 1,
+        confirmed_body: str | None = None,
+        confirmed_url: str | None = None,
+    ) -> None:
+        super().__init__(
+            self.target,
+            fields or _yc_fields(),
+            checkpoint_count=checkpoint_count,
+            submit_count=submit_count,
+            confirmed_body=confirmed_body,
+            confirmed_url=confirmed_url,
+        )
+        self.entry_control = FakeControl(attributes={"href": self.handoff})
+        self.visited: list[str] = []
+
+    def locator(self, selector: str) -> FakeLocator:
+        if "account.ycombinator.com/authenticate" in selector:
+            return FakeLocator(
+                [self.entry_control] if self.url == self.target else []
+            )
+        if (
+            "form" in selector.lower() or '[role="dialog"]' in selector.lower()
+        ) and self.url == self.target:
+            return FakeRootCollection([])  # type: ignore[return-value]
+        return super().locator(selector)
+
+    async def goto(self, url: str, **_kwargs: Any) -> None:
+        self.visited.append(url)
+        self.url = self.application if url == self.handoff else url
+
+
 class DelayedGoogleFormPage(FakePage):
     """Model Google's empty HTML shell becoming interactive after page load."""
 
@@ -573,6 +700,23 @@ def _fields() -> list[dict[str, Any]]:
             "option_label": "",
             "accept": "",
         },
+    ]
+
+
+def _yc_fields() -> list[dict[str, Any]]:
+    return [
+        {
+            "dom_index": 0,
+            "key": "application_message",
+            "label": "Message to the founders",
+            "kind": "textarea",
+            "required": True,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": "",
+        }
     ]
 
 
@@ -1996,6 +2140,29 @@ def test_runtime_connects_playwright_over_trusted_cdp_and_releases_scan_session(
     assert page.unroute_behaviors == ["ignoreErrors"]
 
 
+def test_yc_runtime_always_reuses_the_tenant_persistent_browser_context() -> None:
+    page = CurrentYcJobPage()
+    task = _provider_task(
+        "yc", page.target, "scan", None, context_id="tenant-yc-context"
+    )
+    browserbase = FakeBrowserbase()
+    browser = FakeBrowser(page)
+    runtime = BrowserRuntime(
+        browserbase,
+        playwright_factory=lambda: FakePlaywrightManager(
+            FakeChromium(browser)
+        ),
+    )
+
+    execution = asyncio.run(runtime.execute(task, resume_path=None))
+
+    assert execution.result.code == "application_form_scanned"
+    assert browserbase.created == [("tenant-yc-context", False)]
+    assert browserbase.ephemeral == []
+    assert browserbase.timeouts == [90]
+    assert browserbase.released == ["session-one"]
+
+
 def test_public_form_runtime_uses_ephemeral_browserbase_session() -> None:
     page = FakePage(_task("scan", None).target_url, _fields())
     browserbase = FakeBrowserbase()
@@ -2263,10 +2430,22 @@ def test_google_forms_live_view_failure_never_retries_an_uncertain_click() -> No
     assert browser.closed is True
 
 
-def test_invalid_custom_company_target_is_rejected_before_a_metered_session() -> None:
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        "https://127.0.0.1/private-application",
+        "https://www.ycombinator.com/jobs",
+        "https://account.ycombinator.com/authenticate",
+        "https://www.workatastartup.com/jobs/12345",
+        "https://tenant.workatastartup.com/application",
+    ],
+)
+def test_invalid_custom_company_target_is_rejected_before_a_metered_session(
+    target_url: str,
+) -> None:
     task = _provider_task(
         "company_form",
-        "https://127.0.0.1/private-application",
+        target_url,
         "scan",
         None,
     )
@@ -2359,6 +2538,7 @@ def test_custom_company_missing_required_field_pauses_before_click_with_live_vie
     ("confirmed_body", "expected_code", "expected_state"),
     [
         ("Your application was sent", "application_submitted", "confirmed"),
+        ("Message sent", "submission_unconfirmed", "uncertain"),
         ("Application form", "submission_unconfirmed", "uncertain"),
     ],
 )
@@ -2367,20 +2547,20 @@ def test_yc_dialog_submit_uses_exact_approved_answers_and_one_final_click(
     expected_code: str,
     expected_state: str,
 ) -> None:
-    target_url = "https://www.workatastartup.com/jobs/12345"
-    page = FakePage(
-        target_url,
-        _fields(),
+    page = CurrentYcJobPage(
+        _yc_fields(),
         submit_count=1,
         confirmed_body=confirmed_body,
     )
-    schema = _runtime_schema(page, "yc")
+    schema = bind_schema_to_target(
+        asyncio.run(scan_form(page)), page.application
+    )
     task = _provider_task(
         "yc",
-        target_url,
+        page.target,
         "submit",
         schema.schema_hash,
-        answers={"Email address": "candidate@example.com"},
+        answers={"Message to the founders": "I build reliable AI systems."},
         context_id="tenant-yc-context",
     )
     adapter = get_adapter("yc")
@@ -2397,8 +2577,236 @@ def test_yc_dialog_submit_uses_exact_approved_answers_and_one_final_click(
 
     assert result.code == expected_code
     assert result.submission_state == expected_state
-    assert page.controls[0].filled == "candidate@example.com"
+    assert page.controls[0].filled == "I build reliable AI systems."
     assert page.submit_controls[0].clicks == 1
+
+
+def test_current_yc_job_follows_only_the_job_bound_account_handoff_and_scans() -> None:
+    page = CurrentYcJobPage()
+    task = _provider_task("yc", page.target, "scan", None, context_id="tenant-yc")
+    adapter = get_adapter("yc")
+
+    assert adapter is not None
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(page, adapter, task, None)
+    )
+
+    assert result.code == "application_form_scanned"
+    assert result.form_url == page.application
+    assert result.schema is not None
+    assert result.schema.public_fields == [
+        {
+            "key": "application_message",
+            "label": "Message to the founders",
+            "kind": "textarea",
+            "type": "textarea",
+            "required": True,
+            "disabled": False,
+            "prefilled": False,
+            "options": [],
+            "accepts_resume": False,
+        }
+    ]
+    assert page.visited == [page.target, page.handoff]
+    assert page.entry_control.clicks == 0
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        "https://www.ycombinator.com/jobs",
+        "https://www.ycombinator.com/companies/circleback/jobs",
+        "https://account.ycombinator.com/authenticate?continue="
+        "https%3A%2F%2Fwww.workatastartup.com%2Fapplication%3Fsignup_job_id%3D91924",
+        "https://www.workatastartup.com/application?signup_job_id=91924",
+        "https://www.workatastartup.com/jobs/12345",
+        "https://workatastartup.com/jobs/12345/",
+        "https://www.workatastartup.com/companies/acme/jobs/12345-engineer",
+        "https://workatastartup.com/companies/acme/jobs/12345-engineer/",
+        "https://www.ycombinator.com/companies/circleback/jobs/"
+        "dUH7zjN-software-engineer?utm_source=feed",
+    ],
+)
+def test_yc_worker_rejects_every_non_exact_initial_target_before_navigation(
+    target_url: str,
+) -> None:
+    page = FakePage(target_url, _yc_fields(), submit_count=1)
+    task = _provider_task("yc", target_url, "scan", None, context_id="tenant-yc")
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("yc"),  # type: ignore[arg-type]
+            task,
+            None,
+        )
+    )
+
+    assert result.code == "provider_url_forbidden"
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_yc_unknown_visible_fields_fail_closed_before_review_or_submit() -> None:
+    fields = _yc_fields() + [
+        {
+            "dom_index": 1,
+            "key": "unexpected_answer",
+            "label": "Unexpected screening question",
+            "kind": "text",
+            "required": False,
+            "disabled": False,
+            "answered": False,
+            "options": [],
+            "option_label": "",
+            "accept": "",
+        }
+    ]
+    page = CurrentYcJobPage(fields, submit_count=1)
+    task = _provider_task(
+        "yc", page.target, "scan", None, context_id="tenant-yc-context"
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("yc"),  # type: ignore[arg-type]
+            task,
+            None,
+        )
+    )
+
+    assert result.code == "unsupported_application_fields"
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_yc_schema_change_invalidates_the_sealed_revision_before_fill() -> None:
+    original_page = CurrentYcJobPage()
+    original_schema = bind_schema_to_target(
+        asyncio.run(scan_form(original_page)), original_page.application
+    )
+    changed = _yc_fields()
+    changed[0]["label"] = "Updated message to the hiring team"
+    page = CurrentYcJobPage(changed, confirmed_body="Application submitted")
+    task = _provider_task(
+        "yc",
+        page.target,
+        "submit",
+        original_schema.schema_hash,
+        answers={"Message to the founders": "A reviewed message."},
+        context_id="tenant-yc-context",
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("yc"),  # type: ignore[arg-type]
+            task,
+            None,
+        )
+    )
+
+    assert result.code == "form_schema_changed"
+    assert page.controls[0].filled is None
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_yc_submit_requires_one_sealed_approval_before_fill_or_click() -> None:
+    page = CurrentYcJobPage(
+        _yc_fields(),
+        submit_count=1,
+        confirmed_body="Application submitted",
+    )
+    task = _provider_task(
+        "yc",
+        page.target,
+        "submit",
+        None,
+        context_id="tenant-yc-context",
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("yc"),  # type: ignore[arg-type]
+            task,
+            None,
+        )
+    )
+
+    assert result.code == "form_approval_required"
+    assert page.controls[0].filled is None
+    assert page.submit_controls[0].clicks == 0
+
+
+def test_yc_login_and_security_checkpoint_never_fill_or_submit() -> None:
+    target = CurrentYcJobPage.target
+    login_page = FakePage(
+        target,
+        _yc_fields(),
+        redirect_url=(
+            "https://account.ycombinator.com/authenticate?continue="
+            "https%3A%2F%2Fwww.workatastartup.com%2Fapplication%3Fsignup_job_id%3D12345"
+        ),
+        submit_count=1,
+    )
+    checkpoint_page = FakePage(
+        target,
+        _yc_fields(),
+        checkpoint_count=1,
+        submit_count=1,
+    )
+    runtime = BrowserRuntime(UnusedBrowserbase())  # type: ignore[arg-type]
+
+    login_result = asyncio.run(
+        runtime._run_page(
+            login_page,
+            get_adapter("yc"),  # type: ignore[arg-type]
+            _provider_task("yc", target, "scan", None, context_id="tenant-yc"),
+            None,
+        )
+    )
+    checkpoint_result = asyncio.run(
+        runtime._run_page(
+            checkpoint_page,
+            get_adapter("yc"),  # type: ignore[arg-type]
+            _provider_task("yc", target, "submit", "0" * 64, context_id="tenant-yc"),
+            None,
+        )
+    )
+
+    assert login_result.code == "provider_login_required"
+    assert checkpoint_result.code == "security_checkpoint"
+    assert login_page.controls[0].filled is None
+    assert checkpoint_page.controls[0].filled is None
+    assert login_page.submit_controls[0].clicks == 0
+    assert checkpoint_page.submit_controls[0].clicks == 0
+
+
+def test_yc_ambiguous_final_action_fails_closed_without_clicking() -> None:
+    page = CurrentYcJobPage(_yc_fields(), submit_count=2)
+    schema = bind_schema_to_target(
+        asyncio.run(scan_form(page)), page.application
+    )
+    task = _provider_task(
+        "yc",
+        page.target,
+        "submit",
+        schema.schema_hash,
+        answers={"Message to the founders": "A reviewed message."},
+        context_id="tenant-yc",
+    )
+
+    result = asyncio.run(
+        BrowserRuntime(UnusedBrowserbase())._run_page(  # type: ignore[arg-type]
+            page,
+            get_adapter("yc"),  # type: ignore[arg-type]
+            task,
+            None,
+        )
+    )
+
+    assert result.code in {"application_form_not_found", "application_form_ambiguous"}
+    assert [control.clicks for control in page.submit_controls] == [0, 0]
 
 
 class FakeTenantRepository:
@@ -2532,7 +2940,10 @@ def test_custom_company_form_resolves_without_a_saved_login_context() -> None:
     ("provider", "target_url"),
     [
         ("wellfound", "https://wellfound.com/jobs/one"),
-        ("yc", "https://www.workatastartup.com/jobs/12345"),
+        (
+            "yc",
+            "https://www.ycombinator.com/companies/circleback/jobs/dUH7zjN-software-engineer",
+        ),
     ],
 )
 def test_account_provider_still_requires_a_saved_tenant_context(

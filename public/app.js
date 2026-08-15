@@ -37,7 +37,7 @@ const viewCopy = {
   form_pilot: {
     kicker: "Step 3 · Prepare forms",
     title: "Form Pilot",
-    description: "Parse referral alerts, route application methods, and prepare Google Forms for review.",
+    description: "Prepare Google Forms and exact provider applications for review.",
   },
   outreach: {
     kicker: "Step 4 · Reach the right people",
@@ -96,6 +96,7 @@ const state = {
   discoverySources: [],
   googleForms: [],
   googleFormsTotal: 0,
+  ycPreferences: { query: "", remote_only: false, limit: 10 },
   resumeDiscoveryPlan: null,
   discoveryRun: null,
   discoveryMonitorPromise: null,
@@ -1288,6 +1289,7 @@ async function loadWorkspace(identity = identitySnapshot()) {
     loadAutomationJobs(true, identity),
     loadDiscoverySources(true, identity),
     loadGoogleForms(true, identity),
+    loadYcPreferences(true, identity),
   ]);
   if (loadId !== state.workspaceLoadId || !isCurrentIdentity(identity)) return;
   if (state.profile?.account_status === "deleting") {
@@ -2866,6 +2868,7 @@ async function loadJobs(quiet = false, identity = identitySnapshot(), append = f
   renderOutreach();
   renderOverview();
   renderJobIntelligence();
+  renderYcDesk();
   return state.jobs;
 }
 
@@ -2957,6 +2960,362 @@ function filteredJobs() {
   return filtered.sort((left, right) => new Date(right.created_at || 0) - new Date(left.created_at || 0));
 }
 
+function exactYcJobUrl(value) {
+  const normalized = safeHttpUrl(value);
+  if (!normalized) return null;
+  const url = new URL(normalized);
+  const host = url.hostname.toLowerCase();
+  const parts = url.pathname.split("/").filter(Boolean);
+  const companySlug = (part) => /^[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?$/i.test(part || "");
+  const currentJobSlug = (part) => /^[a-z0-9]{5,64}(?:-[a-z0-9]+)*$/i.test(part || "");
+  const current = ["ycombinator.com", "www.ycombinator.com"].includes(host)
+    && parts.length === 4
+    && parts[0] === "companies"
+    && parts[2] === "jobs"
+    && companySlug(parts[1])
+    && currentJobSlug(parts[3]);
+  if (!current || url.protocol !== "https:" || url.port || url.username || url.password) return null;
+  url.protocol = "https:";
+  url.hostname = "www.ycombinator.com";
+  url.pathname = `/${parts.join("/")}`;
+  url.search = "";
+  url.hash = "";
+  return url.href;
+}
+
+function titleCaseSlug(value) {
+  return decodeURIComponent(String(value || ""))
+    .replace(/^[A-Za-z0-9]{5,64}-/, "")
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+    .trim();
+}
+
+function inferYcJobIdentity(rawUrl) {
+  const exact = exactYcJobUrl(rawUrl);
+  if (!exact) return { url: null, company: "", title: "", externalId: null };
+  const parts = new URL(exact).pathname.split("/").filter(Boolean);
+  const companySlug = parts[0] === "companies" ? parts[1] : "";
+  const jobSlug = parts.at(-1) || "";
+  return {
+    url: exact,
+    company: titleCaseSlug(companySlug),
+    title: titleCaseSlug(jobSlug),
+    externalId: jobSlug.slice(0, 255) || null,
+  };
+}
+
+function ycProvider() {
+  return mergedProviders().find(
+    (provider) => String(provider.id || provider.provider || "").toLowerCase() === "yc",
+  ) || null;
+}
+
+function ycConnectionReady() {
+  const provider = ycProvider();
+  return Boolean(provider && ["connected", "active"].includes(connectionStatus(provider)));
+}
+
+function ycJobForExactUrl(targetUrl, jobs = state.jobs) {
+  if (!targetUrl) return null;
+  return jobs.find((job) => exactYcJobUrl(job?.apply_url) === targetUrl) || null;
+}
+
+async function findSavedYcJob(targetUrl, identity = identitySnapshot()) {
+  const loaded = ycJobForExactUrl(targetUrl);
+  if (loaded) return loaded;
+  let offset = 0;
+  while (offset <= 10_000) {
+    const payload = await apiRequest(`/jobs?limit=50&offset=${offset}`, { identity });
+    const page = unwrapItems(payload, ["jobs"]);
+    const found = ycJobForExactUrl(targetUrl, page);
+    if (found) {
+      if (!state.jobs.some((job) => job.id === found.id)) state.jobs.push(found);
+      return found;
+    }
+    if (page.length < 50) break;
+    offset += page.length;
+  }
+  return null;
+}
+
+function applyYcIntakeDefaults(force = false) {
+  const form = byId("yc-job-form");
+  if (!form || (!force && form.contains(document.activeElement))) return;
+  const preferences = state.ycPreferences && typeof state.ycPreferences === "object"
+    ? state.ycPreferences
+    : { query: "", remote_only: false, limit: 10 };
+  const defaults = [
+    [byId("yc-job-title"), String(preferences.query || "").trim()],
+    [byId("yc-job-location"), preferences.remote_only === true ? "Remote" : ""],
+  ];
+  for (const [field, nextDefault] of defaults) {
+    if (!field) continue;
+    const previousDefault = field.dataset.ycIntakeDefault || "";
+    const currentValue = field.value.trim();
+    if (currentValue && currentValue !== previousDefault) {
+      delete field.dataset.ycIntakeDefault;
+      continue;
+    }
+    if (nextDefault) {
+      field.value = nextDefault;
+      field.dataset.ycIntakeDefault = nextDefault;
+    } else if (!currentValue || currentValue === previousDefault) {
+      field.value = "";
+      delete field.dataset.ycIntakeDefault;
+    }
+  }
+}
+
+function setYcRouteStep(id, { complete = false, current = false, attention = false } = {}) {
+  const step = byId(id);
+  if (!step) return;
+  step.classList.toggle("is-ready", complete);
+  step.classList.toggle("is-current", current);
+  step.classList.toggle("needs-attention", attention);
+  if (current) step.setAttribute("aria-current", "step");
+  else step.removeAttribute("aria-current");
+  const heading = step.querySelector("strong")?.textContent || "YC workflow step";
+  step.setAttribute("aria-label", `${heading}: ${complete ? "complete" : attention ? "needs attention" : current ? "current" : "not started"}`);
+}
+
+function renderYcRouteProgress({ connected = ycConnectionReady(), connectionNeedsAttention = false } = {}) {
+  const ycJobs = state.jobs.filter((job) => Boolean(exactYcJobUrl(job?.apply_url)));
+  const jobIds = new Set(ycJobs.map((job) => job.id));
+  const applications = state.formApplications.filter((application) => jobIds.has(application.job_id));
+  const applicationIds = new Set(applications.map((application) => application.id));
+  const revisions = applications.flatMap((application) => state.formRevisions[application.id] || []);
+  const submissionJobs = state.automationJobs.filter(
+    (job) => job.kind === "application_submit" && applicationIds.has(job.application_id),
+  );
+  const saved = ycJobs.length > 0;
+  const captured = applications.length > 0 || revisions.length > 0;
+  const reviewed = revisions.some(
+    (revision) => Boolean(revision.approved_at) || ["approved", "submitted"].includes(String(revision.status || "").toLowerCase()),
+  ) || applications.some((application) => ["approved", "queued", "sent", "applied"].includes(String(application.status || "").toLowerCase()));
+  const submitted = revisions.some(formRevisionSubmissionIsVerified) || submissionJobs.some(formSubmissionIsVerified);
+  const submissionNeedsAttention = submissionJobs.some(
+    (job) => ["failed", "needs_attention"].includes(String(job.status || "").toLowerCase()),
+  );
+
+  setYcRouteStep("yc-route-connect", {
+    complete: connected,
+    current: !connected,
+    attention: !connected && connectionNeedsAttention,
+  });
+  setYcRouteStep("yc-route-save", {
+    complete: saved,
+    current: connected && !saved,
+  });
+  setYcRouteStep("yc-route-review", {
+    complete: reviewed || submitted,
+    current: connected && saved && !reviewed,
+  });
+  setYcRouteStep("yc-route-submit", {
+    complete: submitted,
+    current: connected && saved && captured && reviewed && !submitted,
+    attention: submissionNeedsAttention && !submitted,
+  });
+}
+
+function renderYcDesk() {
+  if (!byId("yc-application-desk")) return;
+  const provider = ycProvider();
+  const status = provider ? connectionStatus(provider) : "unavailable";
+  const connected = ["connected", "active"].includes(status);
+  const pending = status === "pending";
+  const attention = status === "needs_attention";
+  const browserbaseReady = credentialConfigured("browserbase");
+  const capabilityReady = provider?.available !== false && provider?.can_connect !== false;
+  const pill = byId("yc-connection-status");
+  const connect = byId("yc-connect");
+  const complete = byId("yc-complete-login");
+  renderYcRouteProgress({ connected, connectionNeedsAttention: attention });
+  pill.className = `status-pill ${connected ? "status-success" : pending ? "status-info" : attention ? "status-warning" : "status-neutral"}`;
+  pill.textContent = connected ? "YC connected" : pending ? "Login waiting" : attention ? "YC needs attention" : provider ? "YC not connected" : "YC unavailable";
+  connect.hidden = connected || pending;
+  connect.disabled = !capabilityReady || !browserbaseReady;
+  complete.hidden = !pending;
+  setText(
+    "yc-connection-detail",
+    connected
+      ? "Your isolated YC browser context is ready. Saving this exact job can start its review-gated preparation."
+      : pending
+        ? "Finish YC sign-in and MFA in the opened Live View, then return here and mark login complete."
+        : !provider
+          ? "This deployment has not published YC application support yet."
+          : !browserbaseReady
+            ? "Add your Browserbase key and Project ID in Connections before opening YC login."
+            : attention
+              ? "The saved YC browser context needs a fresh login before another application can be prepared."
+              : "Open YC in your isolated browser. Your YC password is entered only on YC's own page.",
+  );
+
+  const preferences = state.ycPreferences && typeof state.ycPreferences === "object"
+    ? state.ycPreferences
+    : { query: "", remote_only: false, limit: 10 };
+  if (!byId("yc-preferences-form")?.contains(document.activeElement)) {
+    byId("yc-preference-query").value = preferences.query || "";
+    byId("yc-preference-remote").checked = preferences.remote_only === true;
+  }
+  applyYcIntakeDefaults();
+}
+
+async function loadYcPreferences(quiet = false, identity = identitySnapshot()) {
+  try {
+    const payload = await apiRequest("/providers/yc/preferences", { identity });
+    const preferences = unwrapData(payload);
+    state.ycPreferences = preferences && typeof preferences === "object"
+      ? preferences
+      : { query: "", remote_only: false, limit: 10 };
+    renderYcDesk();
+    return state.ycPreferences;
+  } catch (error) {
+    state.ycPreferences = { query: "", remote_only: false, limit: 10 };
+    renderYcDesk();
+    if (!quiet) throw error;
+    return state.ycPreferences;
+  }
+}
+
+async function saveYcPreferences(event) {
+  event.preventDefault();
+  const button = event.submitter;
+  const query = byId("yc-preference-query").value.trim();
+  const remoteOnly = byId("yc-preference-remote").checked;
+  setFormMessage("yc-preferences-status");
+  await withBusy(button, "Saving…", async () => {
+    try {
+      const payload = await apiRequest("/providers/yc/preferences", {
+        method: "PATCH",
+        body: { query: query || null, remote_only: remoteOnly, limit: 10 },
+      });
+      state.ycPreferences = unwrapData(payload) || { query, remote_only: remoteOnly, limit: 10 };
+      renderYcDesk();
+      applyYcIntakeDefaults(true);
+      setFormMessage("yc-preferences-status", "YC intake defaults saved. Blank role and location fields were updated; no YC pages were fetched.", "success");
+    } catch (error) {
+      setFormMessage("yc-preferences-status", errorMessage(error, "YC intake defaults could not be saved."), "error");
+    }
+  });
+}
+
+function inferYcFieldsFromUrl() {
+  const identity = inferYcJobIdentity(byId("yc-job-url").value.trim());
+  if (!identity.url) return;
+  if (!byId("yc-job-company").value.trim() && identity.company) byId("yc-job-company").value = identity.company;
+  const title = byId("yc-job-title");
+  if ((!title.value.trim() || title.value.trim() === title.dataset.ycIntakeDefault) && identity.title) {
+    title.value = identity.title;
+    delete title.dataset.ycIntakeDefault;
+  }
+}
+
+async function saveAndPrepareYcJob(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = event.submitter || byId("yc-save-and-prepare");
+  const jobIdentity = inferYcJobIdentity(byId("yc-job-url").value.trim());
+  const title = byId("yc-job-title").value.trim();
+  const company = byId("yc-job-company").value.trim();
+  const location = byId("yc-job-location").value.trim();
+  const description = byId("yc-job-description").value.trim();
+  setFormMessage("yc-job-status");
+  if (!jobIdentity.url) {
+    setFormMessage("yc-job-status", "Paste one exact YC job page—not a YC search, company, account, or application URL.", "error");
+    byId("yc-job-url").focus();
+    return;
+  }
+
+  let savedJob = null;
+  let reusedSavedJob = false;
+  const requestIdentity = identitySnapshot();
+  await withBusy(button, "Checking saved YC jobs…", async () => {
+    try {
+      savedJob = await findSavedYcJob(jobIdentity.url, requestIdentity);
+      if (savedJob?.id) {
+        reusedSavedJob = true;
+        setBusyLabel(button, "Reasserting exact YC target…");
+        const reboundPayload = await apiRequest(`/jobs/${encodeURIComponent(savedJob.id)}`, {
+          method: "PATCH",
+          body: { apply_url: jobIdentity.url },
+        });
+        savedJob = unwrapData(reboundPayload) || savedJob;
+        form.reset();
+        applyYcIntakeDefaults(true);
+        await loadFormApplications(true, requestIdentity);
+        renderJobs();
+        renderYcDesk();
+        setFormMessage("yc-job-status", "This exact YC job is already saved. Its strict target was revalidated and its existing preparation is reopening…", "success");
+        return;
+      }
+      if (!title || !company || description.length < 20) {
+        setFormMessage("yc-job-status", "For a new YC job, add the role, startup, and at least 20 characters of the real job description.", "error");
+        return;
+      }
+      setBusyLabel(button, "Saving YC job…");
+      const payload = await apiRequest("/jobs", {
+        method: "POST",
+        body: {
+          source: "yc_exact",
+          external_id: jobIdentity.externalId,
+          apply_url: jobIdentity.url,
+          title,
+          company,
+          location: location || null,
+          description,
+          contact_email: null,
+          metadata: { application_provider: "yc", intake: "exact_user_saved" },
+        },
+      });
+      savedJob = unwrapData(payload);
+      if (!savedJob?.id) throw new AppError("The YC job was saved without a reviewable identity.", "yc_job_save_incomplete");
+      form.reset();
+      applyYcIntakeDefaults(true);
+      await loadJobs(true, requestIdentity);
+      setFormMessage(
+        "yc-job-status",
+        ycConnectionReady()
+          ? "Exact YC job saved. Opening its application preparation now…"
+          : "Exact YC job saved. Connect YC here, then choose Scan application on the saved job.",
+        "success",
+      );
+    } catch (error) {
+      setFormMessage("yc-job-status", errorMessage(error, "The exact YC job could not be saved."), "error");
+    }
+  });
+  if (!savedJob?.id) return;
+  const existingFormApplication = state.formApplications.find(
+    (application) => application.job_id === savedJob.id && application.channel === "ats",
+  );
+  if (existingFormApplication?.id) {
+    setFormMessage(
+      "yc-job-status",
+      reusedSavedJob
+        ? "Existing YC job and prepared application found. Opening the same review desk—no duplicate was created."
+        : "A prepared application already exists for this YC job. Opening its review desk.",
+      "success",
+    );
+    await openFormApplicationReview(existingFormApplication.id);
+    return;
+  }
+  if (ycConnectionReady() && capabilityForProvider("yc")?.can_scan === true) {
+    await scanJobApplication(savedJob, "yc", button);
+  } else {
+    renderYcDesk();
+    byId("yc-connect")?.focus();
+  }
+}
+
+function openYcConnections() {
+  switchView("connections");
+  window.setTimeout(() => {
+    const card = document.querySelector('[data-provider-card="yc"]');
+    card?.scrollIntoView({ behavior: "smooth", block: "center" });
+    card?.querySelector("button:not(:disabled)")?.focus({ preventScroll: true });
+  }, 250);
+}
+
 function providerForJob(job) {
   const supplied = String(job?.metadata?.application_provider || job?.metadata?.provider || job?.metadata?.ats_provider || job?.metadata?.discovery?.provider || "").toLowerCase();
   const supported = new Set(["company_form", "google_forms", "greenhouse", "lever", "ashby", "yc", "wellfound", "cutshort", "instahyre"]);
@@ -2968,7 +3327,7 @@ function providerForJob(job) {
   if (host === "greenhouse.io" || host.endsWith(".greenhouse.io")) return "greenhouse";
   if (host === "lever.co" || host.endsWith(".lever.co")) return "lever";
   if (host === "ashbyhq.com" || host.endsWith(".ashbyhq.com")) return "ashby";
-  if (host === "workatastartup.com" || host.endsWith(".workatastartup.com")) return "yc";
+  if (exactYcJobUrl(url)) return "yc";
   if (host === "wellfound.com" || host.endsWith(".wellfound.com")) return "wellfound";
   if (host === "cutshort.io" || host.endsWith(".cutshort.io")) return "cutshort";
   if (host === "instahyre.com" || host.endsWith(".instahyre.com")) return "instahyre";
@@ -3037,16 +3396,25 @@ function renderJobs() {
     if (applicationProvider) {
       const capability = capabilityForProvider(applicationProvider);
       const canScan = capability?.can_scan === true;
+      const existingFormApplication = state.formApplications.find(
+        (application) => application.job_id === job.id && application.channel === "ats",
+      ) || null;
       const scan = createElement("button", {
-        className: `button ${canScan ? "button-accent" : "button-ghost"} button-small`,
-        text: canScan ? "Scan application" : "Scan not enabled",
+        className: `button ${existingFormApplication || canScan ? "button-accent" : "button-ghost"} button-small`,
+        text: existingFormApplication ? "Review application" : canScan ? "Scan application" : "Scan not enabled",
         type: "button",
       });
-      scan.disabled = !canScan;
-      scan.title = canScan
-        ? `Capture the current ${humanize(applicationProvider)} form before reviewing answers`
-        : capability?.reason || "Hosted form scanning is not enabled for this provider.";
-      if (canScan) scan.addEventListener("click", () => scanJobApplication(job, applicationProvider, scan));
+      scan.disabled = !existingFormApplication && !canScan;
+      scan.title = existingFormApplication
+        ? `Open the captured ${humanize(applicationProvider)} application and its latest review revision`
+        : canScan
+          ? `Capture the current ${humanize(applicationProvider)} form before reviewing answers`
+          : capability?.reason || "Hosted form scanning is not enabled for this provider.";
+      if (existingFormApplication) {
+        scan.addEventListener("click", () => openFormApplicationReview(existingFormApplication.id));
+      } else if (canScan) {
+        scan.addEventListener("click", () => scanJobApplication(job, applicationProvider, scan));
+      }
       actions.append(scan);
     }
     actions.append(edit);
@@ -3589,6 +3957,7 @@ async function loadFormApplications(quiet = false, identity = identitySnapshot()
     clearFormApplicationReview();
   }
   renderOverview();
+  renderYcDesk();
   return state.formApplications;
 }
 
@@ -3778,9 +4147,24 @@ function populateFormApplicationReview(application) {
       ? `${job.title || "Role"} at ${job.company || "company"}`
       : "Captured application form without a linked saved job",
   );
+  const exactTarget = exactYcJobUrl(job?.apply_url);
+  const targetUrl = byId("form-application-target-url");
+  const targetLink = byId("form-application-target-link");
+  if (exactTarget) {
+    targetUrl.textContent = exactTarget;
+    targetUrl.hidden = false;
+    targetLink.href = exactTarget;
+    targetLink.hidden = false;
+  } else {
+    targetUrl.textContent = "";
+    targetUrl.hidden = true;
+    targetLink.href = "#";
+    targetLink.hidden = true;
+  }
   const pill = byId("form-application-status-pill");
   pill.className = `status-pill ${statusClass(application.status)}`;
   pill.textContent = humanize(application.status || "draft_pending");
+  renderYcDesk();
 }
 
 function clearFormApplicationReview(clearSelection = true) {
@@ -3789,11 +4173,18 @@ function clearFormApplicationReview(clearSelection = true) {
   hideFormWorkflowProgress();
   byId("form-application-id").value = "";
   setText("form-application-job-context", "Choose Prepare form or Review prepared form above to begin.");
+  const targetUrl = byId("form-application-target-url");
+  const targetLink = byId("form-application-target-link");
+  targetUrl.textContent = "";
+  targetUrl.hidden = true;
+  targetLink.href = "#";
+  targetLink.hidden = true;
   const pill = byId("form-application-status-pill");
   pill.className = "status-pill status-neutral";
   pill.textContent = "Choose a prepared form";
   renderFormRevision(null);
   setFormMessage("form-revision-message");
+  renderYcDesk();
 }
 
 function populateApplicationEditor(application) {
@@ -4032,6 +4423,7 @@ function rememberAutomationJob(job) {
     const revisionId = job.form_revision_id || job.payload?.form_revision_id || job.result?.form_revision_id;
     if (revisionId) state.formSubmissionJobs.set(revisionId, job);
   }
+  renderYcDesk();
 }
 
 async function monitorFormWorkflowJob(jobId, identity = identitySnapshot(), onUpdate = null) {
@@ -4078,7 +4470,7 @@ async function monitorFormScan(
   if (state.selectedFormApplicationId === applicationId) {
     showFormWorkflowProgress({
       title: "Capturing the visible form",
-      detail: "The worker is opening this Google Form and recording its current questions.",
+      detail: "The worker is opening this exact provider application and recording its current visible questions.",
       value: "Queued",
       percent: 12,
     });
@@ -4181,6 +4573,7 @@ async function loadApplicationFormRevisions(
   state.selectedFormRevisionId = latest?.id || null;
   renderFormRevision(latest);
   if (latest && autoSuggest) await maybeSuggestFormAnswers(applicationId, latest);
+  renderYcDesk();
   return state.formRevisions[applicationId];
 }
 
@@ -5172,6 +5565,7 @@ async function loadConnections(quiet = false, identity = identitySnapshot()) {
   updateApplicationActionState();
   renderOverview();
   renderOutreach();
+  renderYcDesk();
   return state.connections;
 }
 
@@ -5362,6 +5756,7 @@ function renderProviderCredentials() {
   }
   renderGroqState();
   renderHunterState();
+  renderYcDesk();
 }
 
 function editProviderCredential(provider, { focus = true } = {}) {
@@ -5509,6 +5904,7 @@ function providerIconClass(provider) {
   const id = String(provider.id || provider.provider || "").toLowerCase();
   if (id === "gmail" || id === "google") return "gmail";
   if (id === "linkedin") return "linkedin";
+  if (id === "yc") return "yc";
   if (provider.mode === "public_ats") return "ats";
   return "";
 }
@@ -5685,7 +6081,7 @@ function renderConnections() {
     return;
   }
   const sorted = [...providers].sort((a, b) => {
-    const order = { gmail: 0, linkedin: 1 };
+    const order = { gmail: 0, yc: 1, linkedin: 2 };
     const aid = String(a.id || a.provider || "").toLowerCase();
     const bid = String(b.id || b.provider || "").toLowerCase();
     return (order[aid] ?? 10) - (order[bid] ?? 10) || String(a.label || aid).localeCompare(String(b.label || bid));
@@ -5695,6 +6091,7 @@ function renderConnections() {
     const connection = providerConnection(provider);
     const status = connectionStatus(provider);
     const card = createElement("article", { className: "connection-card" });
+    card.dataset.providerCard = id;
     const icon = createElement("span", { className: `provider-icon ${providerIconClass(provider)}`, text: providerInitial(provider), attrs: { "aria-hidden": "true" } });
     const header = createElement("div", { className: "connection-card-header" }, [
       icon,
@@ -5737,19 +6134,27 @@ function renderConnections() {
       }
     } else if (provider.mode === "managed_browser") {
       if (["connected", "active"].includes(status)) {
-        const disconnect = createElement("button", { className: "button button-danger-quiet button-small", text: "Delete connection", type: "button" });
+        const disconnect = createElement("button", { className: "button button-danger-quiet button-small", text: id === "yc" ? "Disconnect YC" : "Delete connection", type: "button" });
         disconnect.addEventListener("click", () => disconnectProvider(id, disconnect));
         actions.append(disconnect);
-        const check = createElement("button", { className: "button button-ghost button-small", text: "Queue health check", type: "button" });
+        const check = createElement("button", { className: "button button-ghost button-small", text: id === "yc" ? "Check YC session" : "Queue health check", type: "button" });
         check.addEventListener("click", () => queueConnectionCheck(id, check));
         actions.append(check);
+        if (id === "yc") {
+          const use = createElement("button", { className: "button button-primary button-small", text: "Open YC application desk", type: "button" });
+          use.addEventListener("click", () => {
+            switchView("jobs");
+            window.setTimeout(() => byId("yc-application-desk")?.scrollIntoView({ behavior: "smooth", block: "start" }), 200);
+          });
+          actions.append(use);
+        }
       } else if (provider.can_connect === false) {
         const use = createElement("button", { className: "button button-ghost button-small", text: provider.available === false ? "Not enabled" : "No login required", type: "button" });
         use.disabled = provider.available === false;
         use.addEventListener("click", () => switchView("jobs"));
         actions.append(use);
       } else if (status === "pending") {
-        const complete = createElement("button", { className: "button button-primary button-small", text: "I completed login", type: "button" });
+        const complete = createElement("button", { className: "button button-primary button-small", text: id === "yc" ? "I completed YC login" : "I completed login", type: "button" });
         complete.addEventListener("click", () => completeBrowserConnection(id, complete));
         const restart = createElement("button", { className: "button button-ghost button-small", text: "Open a new login view", type: "button" });
         restart.addEventListener("click", () => startBrowserConnection(id, restart));
@@ -5761,7 +6166,7 @@ function renderConnections() {
         disconnect.addEventListener("click", () => disconnectProvider(id, disconnect));
         actions.append(restart, disconnect);
       } else {
-        const connect = createElement("button", { className: "button button-primary button-small", text: "Open secure login", type: "button" });
+        const connect = createElement("button", { className: "button button-primary button-small", text: id === "yc" ? "Connect YC" : "Open secure login", type: "button" });
         connect.disabled = provider.can_connect === false || provider.available === false;
         connect.addEventListener("click", () => startBrowserConnection(id, connect));
         actions.append(connect);
@@ -5917,6 +6322,7 @@ async function startBrowserConnection(provider, button) {
       if (!url) throw new AppError("The managed browser did not return a valid Live View URL.", "live_view_missing");
       if (popup) popup.location.replace(url);
       else openExternal(url);
+      await loadConnections(true);
       toast("Complete login and MFA inside the Live View, then save and close the session here. Automatic provider-login verification is not enabled.", "info", "Secure login opened", 9_000);
     } catch (error) {
       if (popup) popup.close();
@@ -5930,7 +6336,12 @@ async function completeBrowserConnection(provider, button) {
     try {
       await apiRequest(`/connections/${encodeURIComponent(provider)}/browser/complete`, { method: "POST" });
       await loadConnections(true);
-      toast(`${humanize(provider)} browser state was saved for manual use. The provider login remains unverified.`, "info");
+      toast(
+        provider === "yc"
+          ? "YC browser state was saved. Each exact-job preparation still verifies the expected YC route and stops on login, MFA, or unexpected fields."
+          : `${humanize(provider)} browser state was saved for manual use. The provider login remains unverified.`,
+        "info",
+      );
     } catch (error) {
       toast(errorMessage(error, "The provider login could not be confirmed yet."), "error");
     }
@@ -6023,6 +6434,7 @@ async function loadAutomationJobs(quiet = false, identity = identitySnapshot()) 
   if (selectedRevision && selectedSubmission) renderFormSubmissionJob(selectedRevision, selectedSubmission);
   const selectedFormApplicationId = byId("form-application-id")?.value || state.selectedFormApplicationId || "";
   if (selectedFormApplicationId && !selectedRevision) renderFormRevision(null);
+  renderYcDesk();
   return state.automationJobs;
 }
 
@@ -6454,6 +6866,13 @@ function bindWorkspaceEvents() {
 
   byId("job-form").addEventListener("submit", saveJob);
   byId("job-cancel-edit").addEventListener("click", resetJobForm);
+  byId("yc-job-form").addEventListener("submit", saveAndPrepareYcJob);
+  byId("yc-job-url").addEventListener("change", inferYcFieldsFromUrl);
+  byId("yc-job-url").addEventListener("blur", inferYcFieldsFromUrl);
+  byId("yc-preferences-form").addEventListener("submit", saveYcPreferences);
+  byId("yc-connect").addEventListener("click", (event) => startBrowserConnection("yc", event.currentTarget));
+  byId("yc-complete-login").addEventListener("click", (event) => completeBrowserConnection("yc", event.currentTarget));
+  byId("yc-open-connections").addEventListener("click", openYcConnections);
   byId("job-search").addEventListener("input", renderJobs);
   byId("job-status-filter").addEventListener("change", renderJobs);
   byId("job-sort").addEventListener("change", renderJobs);
@@ -6498,7 +6917,7 @@ function bindWorkspaceEvents() {
   byId("form-pilot-review-jump").addEventListener("click", async () => {
     const application = formApplicationById(state.selectedFormApplicationId) || state.formApplications[0] || null;
     if (!application?.id) {
-      toast("Prepare a Google Form first; its captured questions will then appear in the review desk.", "info");
+      toast("Prepare a Google Form or exact provider application first; its captured questions will then appear here.", "info");
       byId("google-form-queue")?.scrollIntoView({ behavior: "smooth", block: "start" });
       return;
     }

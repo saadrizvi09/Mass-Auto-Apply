@@ -179,9 +179,15 @@ Greenhouse has the initial aligned generic application handler. One-page Google 
 use a narrower, user-controlled flow; branching or multi-page Google Forms are
 unsupported. Lever and Ashby have safe mappings with read-only live scan evidence, but
 remain disabled pending controlled submit-confirmation tests. Wellfound still needs a
-signed-in canary. The worker contains a YC adapter and an exact-host generic public
-company-form adapter, but both are launch-gated controlled-canary paths rather than
-enabled public capabilities. Cutshort and Instahyre remain connection-only until
+signed-in canary. YC has a finished exact-job state machine: it accepts only a user-saved
+current public YC job-detail URL, reuses that tenant's isolated persistent Browserbase
+BYOK context for sign-in, scans visible fields through Playwright in the separate worker,
+binds résumé/Groq-grounded answers to an immutable review, performs one sealed submit,
+and requires fresh provider confirmation. Query, remote, and limit preferences never
+authorize a YC request, scrape, discovery run, or bulk application. YC remains
+operator-allowlist gated until its signed-in canary passes. The exact-host generic public
+company-form adapter remains an internal controlled-canary path rather than an enabled
+public capability. Cutshort and Instahyre remain connection-only until
 tenant-aware multi-step state machines are implemented and validated. A generic
 provider handler may split work into three observable jobs:
 
@@ -350,7 +356,7 @@ and [Turnstile CSP](https://developers.cloudflare.com/turnstile/reference/conten
 | One-page Google Forms browser flow | Scan → browser auto-suggest → explicit exact approval-bound background submit → verified confirmation | Browserbase and a continuously deployed worker outside Vercel are required; Live View is only a `needs_attention` fallback |
 | Lever/Ashby browser flow | Read-only live scan passed; full flow remains fail-closed | Do not enable until controlled prefill and submit-confirmation canaries pass |
 | Wellfound browser flow | Safe fail-closed mapping pending signed-in canary | Do not enable until a controlled Browserbase canary passes |
-| YC browser flow | Adapter implemented but controlled-canary gated | Do not advertise or enable until a signed-in tenant-aware end-to-end canary passes |
+| YC browser flow | Finished exact saved-job scan → grounded review → sealed single submit → verified confirmation; no scraping/discovery | Keep operator-allowlist gated until a signed-in tenant-aware exact-job canary passes; run Playwright/Browserbase only in the separate persistent worker, never Vercel |
 | Generic company forms | Exact-host adapter implemented but internal/gated | Not a public catalog or allowlist capability; controlled targets and confirmation canaries are required before enablement |
 | Cutshort/Instahyre browser flow | Connection-only; application worker stops safely | Tenant-aware multi-step state machines and controlled live validation are still required |
 | Multi-page or branching Google Forms | Unsupported | Requires a per-section review/state model before enablement |

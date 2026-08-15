@@ -186,6 +186,11 @@ loaded by the Vercel entrypoint.
 - **DISC-05A:** Public ATS board discovery shall accept at most eight exact hosted
   Greenhouse, Lever, or Ashby URLs, derive fixed official GET endpoints without
   redirects, omit unlisted posts, and save at most 200 normalized jobs per run.
+- **DISC-05B:** YC application automation shall accept only an exact, current public YC
+  job-detail URL explicitly saved by the user. Saved YC query, remote, and limit
+  preferences are organization and matching hints only; they shall never fetch, crawl,
+  scrape, discover, or enqueue provider work, and the product shall expose no YC bulk
+  discovery or bulk-apply path.
 - **DISC-06:** LinkedIn guest-job discovery shall use no login/account cookie, remain
   unofficial, be throttled and bounded by pages/results, and stop on a block, challenge,
   or rate-limit response.
@@ -333,7 +338,8 @@ loaded by the Vercel entrypoint.
   Google Forms as scan plus explicit exact-approved background submit with verified
   confirmation and needs-attention-only Live View; Lever and Ashby as read-only-scan
   validated but pending controlled submit canaries; Wellfound as pending a signed-in
-  canary; YC as adapter-implemented but controlled-canary gated; and Cutshort and
+  canary; YC as a finished exact saved-job scan/review/sealed-submit state machine that
+  remains operator-allowlist gated until its signed-in canary passes; and Cutshort and
   Instahyre as connection-only until tenant-aware multi-step state machines exist. The
   generic exact-host company-form adapter shall remain internal/gated and absent from
   the public catalog. Multi-page or branching Google Forms shall remain unavailable.
@@ -393,6 +399,14 @@ loaded by the Vercel entrypoint.
   View fallback for form-channel applications. It
   shall not move Google Form revisions into **Mass Cold Email**, whose **Review & send**
   subtab is reserved for email drafts.
+- **FORM-12:** A YC application shall remain bound to one exact current public job URL
+  and the owning tenant's isolated persistent Browserbase BYOK context. Playwright in a
+  separate continuously running worker shall scan only visible job-bound fields, create
+  an immutable résumé/Groq-grounded revision for review, and activate one unique submit
+  control only for that sealed revision. Success requires fresh YC confirmation; login,
+  MFA/CAPTCHA, a changed page/schema, an unknown required field, an ambiguous control,
+  or uncertain confirmation shall fail closed without a blind retry. Vercel shall not
+  launch Chromium, control Browserbase, or execute the worker.
 
 ### RUN — durable execution
 

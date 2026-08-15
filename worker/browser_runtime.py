@@ -39,6 +39,11 @@ from worker.providers.base import (
     safe_form_url,
     scan_form,
 )
+from worker.providers.yc import (
+    canonical_yc_form_target,
+    is_exact_yc_job_url,
+    yc_schema_issue,
+)
 
 
 MANAGED_JOB_KINDS: tuple[str, ...] = (
@@ -764,6 +769,12 @@ class BrowserRuntime:
         resume_path: str | None,
         before_submit: Any | None = None,
     ) -> ProviderResult:
+        if task.provider == "yc" and not is_exact_yc_job_url(task.target_url):
+            return self._attention(
+                task,
+                "provider_url_forbidden",
+                "YC automation requires one exact public job-detail URL.",
+            )
         if not adapter.allows_url(task.target_url):
             return self._attention(
                 task,
@@ -873,7 +884,11 @@ class BrowserRuntime:
                 "No unambiguous provider application form was found on this page.",
                 current_url=current_url,
             )
-        canonical_target = canonical_form_target(task.provider, current_url)
+        canonical_target = (
+            canonical_yc_form_target(current_url)
+            if task.provider == "yc"
+            else canonical_form_target(task.provider, current_url)
+        )
         if not canonical_target:
             return self._attention(
                 task,
@@ -892,6 +907,17 @@ class BrowserRuntime:
                 schema=schema,
                 current_url=current_url,
             )
+        if task.provider == "yc":
+            yc_issue = yc_schema_issue(schema)
+            if yc_issue is not None:
+                code, message = yc_issue
+                return self._attention(
+                    task,
+                    code,
+                    message,
+                    schema=schema,
+                    current_url=current_url,
+                )
         upload_issue = await resume_upload_guard_issue(form_root, schema)
         if upload_issue is not None:
             code, message = upload_issue
@@ -1080,7 +1106,7 @@ class BrowserRuntime:
             return self._attention(
                 task,
                 "provider_validation_failed",
-                "Google did not accept the response because one or more visible fields still require a valid answer. Prepare the current form again before submitting.",
+                "The provider did not accept the response because one or more visible fields still require a valid answer. Prepare the current form again before submitting.",
                 schema=schema,
                 filled_count=filled_count,
                 submission_state="not_attempted",
@@ -1139,6 +1165,14 @@ class BrowserRuntime:
                 )
             )
         # Validate before requesting a metered browser session.
+        if task.provider == "yc" and not is_exact_yc_job_url(task.target_url):
+            return BrowserExecution(
+                self._attention(
+                    task,
+                    "provider_url_forbidden",
+                    "YC automation requires one exact public job-detail URL.",
+                )
+            )
         if not adapter.allows_url(task.target_url):
             return BrowserExecution(
                 self._attention(

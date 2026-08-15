@@ -451,6 +451,26 @@ class DiscoveryPreferencesUpdate(StrictModel):
         return clean
 
 
+class YcApplicationPreferencesUpdate(StrictModel):
+    """Optional local matching controls; this contract never starts YC discovery."""
+
+    query: str | None = Field(default=None, max_length=160)
+    remote_only: bool | None = None
+    limit: int | None = Field(default=None, ge=1, le=20)
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        clean = " ".join(value.split())
+        if not clean:
+            return None
+        if any(ord(character) < 32 for character in clean):
+            raise ValueError("YC matching query cannot contain control characters")
+        return clean
+
+
 class ApplicationFormApprovalRequest(StrictModel):
     expected_revision: int = Field(ge=1)
     schema_hash: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")

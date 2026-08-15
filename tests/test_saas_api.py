@@ -833,7 +833,7 @@ def test_ziprecruiter_url_is_not_a_supported_managed_application() -> None:
     assert response.json()["error"]["code"] == "application_provider_unsupported"
 
 
-def test_connection_only_provider_cannot_queue_application_automation() -> None:
+def test_unbound_yc_job_cannot_queue_application_automation() -> None:
     job_id = str(uuid4())
     settings = browser_settings(Fernet.generate_key().decode())
     settings = replace(
@@ -868,8 +868,349 @@ def test_connection_only_provider_cannot_queue_application_automation() -> None:
     )
 
     assert response.status_code == 409
-    assert response.json()["error"]["code"] == "provider_automation_unavailable"
+    assert response.json()["error"]["code"] == "yc_exact_job_url_required"
     assert store.rpc_calls == []
+
+
+def test_explicit_yc_job_save_canonicalizes_binds_and_queues_exact_scan() -> None:
+    queued_id = str(uuid4())
+    settings = replace(
+        browser_settings(Fernet.generate_key().decode()),
+        allowed_browser_providers=("yc",),
+    )
+    store = FakeStore(
+        {
+            "connections": [
+                {
+                    "id": str(uuid4()),
+                    "user_id": str(USER_ID),
+                    "provider": "yc",
+                    "mode": "managed_browser",
+                    "status": "connected",
+                }
+            ],
+            "resumes": [
+                {
+                    "id": str(uuid4()),
+                    "user_id": str(USER_ID),
+                    "is_active": True,
+                    "parse_status": "parsed",
+                }
+            ],
+        },
+        rpc_results={
+            "enqueue_automation_job": [{"id": queued_id, "status": "queued"}]
+        },
+    )
+    client = TestClient(create_app(settings=settings, auth=FakeAuth(), store=store))
+
+    saved = client.post(
+        "/api/v1/jobs",
+        json={
+            "title": "Founding Engineer",
+            "company": "Acme",
+            "description": "Build the first version of a carefully scoped product.",
+            "apply_url": (
+                "https://ycombinator.com/companies/acme/jobs/12345-founding-engineer"
+                "?utm_source=shared#apply"
+            ),
+            "metadata": {
+                "application_provider": "company_form",
+                "yc_job_target_url": "https://attacker.example.test/job",
+            },
+        },
+    )
+    assert saved.status_code == 201, saved.text
+    job = saved.json()["data"]
+    expected_url = (
+        "https://www.ycombinator.com/companies/acme/jobs/12345-founding-engineer"
+    )
+    assert job["apply_url"] == expected_url
+    assert job["normalized_url"] == expected_url
+    assert job["metadata"] == {
+        "application_provider": "yc",
+        "yc_job_target_url": expected_url,
+    }
+    assert store.client.tables["yc_application_targets"] == [
+        {
+            "id": store.client.tables["yc_application_targets"][0]["id"],
+            "job_id": job["id"],
+            "user_id": str(USER_ID),
+            "target_url": expected_url,
+        }
+    ]
+    assert store.client.tables.get("company_form_targets", []) == []
+
+    scan = client.post(
+        f"/api/v1/jobs/{job['id']}/application/scan",
+        json={"idempotency_key": "yc-exact-scan-001"},
+    )
+    assert scan.status_code == 202, scan.text
+    enqueue = next(call for call in store.rpc_calls if call[0] == "enqueue_automation_job")
+    assert enqueue[1] == {
+        "kind_input": "application_scan",
+        "provider_input": "yc",
+        "application_id_input": scan.json()["data"]["application_id"],
+        "payload_input": {
+            "job_id": job["id"],
+            "yc_job_target_url": expected_url,
+        },
+        "idempotency_key_input": "yc-exact-scan-001",
+    }
+
+
+@pytest.mark.parametrize(
+    ("apply_url", "expected_error"),
+    [
+        ("https://www.ycombinator.com/jobs", "application_provider_unsupported"),
+        (
+            "https://www.ycombinator.com/companies/acme",
+            "application_provider_unsupported",
+        ),
+        (
+            "https://account.ycombinator.com/authenticate",
+            "application_provider_unsupported",
+        ),
+        (
+            "https://subdomain.workatastartup.com/application",
+            "application_provider_unsupported",
+        ),
+        ("https://www.workatastartup.com/jobs/12345", "yc_exact_job_url_required"),
+    ],
+)
+def test_non_exact_yc_owned_url_never_becomes_generic_company_automation(
+    apply_url: str, expected_error: str
+) -> None:
+    settings = replace(
+        browser_settings(Fernet.generate_key().decode()),
+        allowed_browser_providers=("company_form", "yc"),
+    )
+    store = FakeStore(
+        {
+            "resumes": [
+                {
+                    "id": str(uuid4()),
+                    "user_id": str(USER_ID),
+                    "is_active": True,
+                }
+            ]
+        }
+    )
+    client = TestClient(create_app(settings=settings, auth=FakeAuth(), store=store))
+
+    saved = client.post(
+        "/api/v1/jobs",
+        json={
+            "title": "YC role requiring manual review",
+            "company": "YC company",
+            "description": "A saved lead that must never bypass the exact YC job boundary.",
+            "apply_url": apply_url,
+            "metadata": {
+                "application_provider": "company_form",
+                "company_form_host": "www.ycombinator.com",
+                "company_form_target_url": apply_url,
+                "yc_job_target_url": "https://attacker.example.test/job",
+            },
+        },
+    )
+
+    assert saved.status_code == 201, saved.text
+    job = saved.json()["data"]
+    assert job["metadata"] == {}
+    assert store.client.tables.get("company_form_targets", []) == []
+    assert store.client.tables.get("yc_application_targets", []) == []
+
+    scan = client.post(
+        f"/api/v1/jobs/{job['id']}/application/scan",
+        json={"idempotency_key": f"yc-reserved-{job['id']}"},
+    )
+
+    assert scan.status_code == 409, scan.text
+    assert scan.json()["error"]["code"] == expected_error
+    assert not any(call[0] == "enqueue_automation_job" for call in store.rpc_calls)
+
+
+def test_patching_existing_exact_yc_job_recreates_missing_service_binding() -> None:
+    job_id = str(uuid4())
+    queued_id = str(uuid4())
+    exact_url = "https://www.ycombinator.com/companies/acme/jobs/AbC123-platform-engineer"
+    store = FakeStore(
+        {
+            "jobs": [
+                {
+                    "id": job_id,
+                    "user_id": str(USER_ID),
+                    "title": "Platform Engineer",
+                    "company": "Acme",
+                    "description": "Build reliable platform systems for Acme customers.",
+                    "apply_url": exact_url,
+                    "normalized_url": exact_url,
+                    "metadata": {"source": "legacy_exact_yc_save"},
+                }
+            ],
+            "connections": [
+                {
+                    "id": str(uuid4()),
+                    "user_id": str(USER_ID),
+                    "provider": "yc",
+                    "mode": "managed_browser",
+                    "status": "connected",
+                }
+            ],
+            "resumes": [
+                {
+                    "id": str(uuid4()),
+                    "user_id": str(USER_ID),
+                    "is_active": True,
+                    "parse_status": "parsed",
+                }
+            ],
+        },
+        rpc_results={
+            "enqueue_automation_job": [{"id": queued_id, "status": "queued"}]
+        },
+    )
+    settings = replace(
+        browser_settings(Fernet.generate_key().decode()),
+        allowed_browser_providers=("yc",),
+    )
+    client = TestClient(create_app(settings=settings, auth=FakeAuth(), store=store))
+
+    before_rebind = client.post(
+        f"/api/v1/jobs/{job_id}/application/scan",
+        json={"idempotency_key": "yc-missing-binding-0001"},
+    )
+    assert before_rebind.status_code == 409
+    assert before_rebind.json()["error"]["code"] == "yc_exact_job_url_required"
+
+    rebound = client.patch(
+        f"/api/v1/jobs/{job_id}",
+        json={"apply_url": exact_url},
+    )
+    assert rebound.status_code == 200, rebound.text
+    assert rebound.json()["data"]["metadata"] == {
+        "source": "legacy_exact_yc_save",
+        "application_provider": "yc",
+        "yc_job_target_url": exact_url,
+    }
+    assert store.client.tables["yc_application_targets"] == [
+        {
+            "id": store.client.tables["yc_application_targets"][0]["id"],
+            "job_id": job_id,
+            "user_id": str(USER_ID),
+            "target_url": exact_url,
+        }
+    ]
+
+    scan = client.post(
+        f"/api/v1/jobs/{job_id}/application/scan",
+        json={"idempotency_key": "yc-rebound-scan-0001"},
+    )
+    assert scan.status_code == 202, scan.text
+    enqueue = next(call for call in store.rpc_calls if call[0] == "enqueue_automation_job")
+    assert enqueue[1]["provider_input"] == "yc"
+    assert enqueue[1]["payload_input"] == {
+        "job_id": job_id,
+        "yc_job_target_url": exact_url,
+    }
+
+
+def test_patching_company_form_to_non_exact_yc_url_removes_generic_authority() -> None:
+    job_id = str(uuid4())
+    source_url = "https://careers.acme.com/jobs/42"
+    yc_listing_url = "https://www.ycombinator.com/companies/acme"
+    store = FakeStore(
+        {
+            "jobs": [
+                {
+                    "id": job_id,
+                    "user_id": str(USER_ID),
+                    "title": "Platform Engineer",
+                    "company": "Acme",
+                    "description": "Build reliable platform systems for Acme customers.",
+                    "apply_url": source_url,
+                    "metadata": {
+                        "application_provider": "company_form",
+                        "company_form_host": "careers.acme.com",
+                        "company_form_target_url": source_url,
+                    },
+                }
+            ],
+            "company_form_targets": [
+                {
+                    "id": str(uuid4()),
+                    "job_id": job_id,
+                    "user_id": str(USER_ID),
+                    "source_url": source_url,
+                    "target_url": source_url,
+                    "exact_host": "careers.acme.com",
+                }
+            ],
+        }
+    )
+    settings = replace(
+        browser_settings(Fernet.generate_key().decode()),
+        allowed_browser_providers=("company_form", "yc"),
+    )
+    client = TestClient(create_app(settings=settings, auth=FakeAuth(), store=store))
+
+    patched = client.patch(
+        f"/api/v1/jobs/{job_id}",
+        json={
+            "apply_url": yc_listing_url,
+            "metadata": {
+                "application_provider": "company_form",
+                "company_form_host": "www.ycombinator.com",
+                "company_form_target_url": yc_listing_url,
+            },
+        },
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["data"]["metadata"] == {}
+    assert store.client.tables["company_form_targets"] == []
+    assert store.client.tables.get("yc_application_targets", []) == []
+
+    scan = client.post(
+        f"/api/v1/jobs/{job_id}/application/scan",
+        json={"idempotency_key": "yc-reserved-patch-0001"},
+    )
+    assert scan.status_code == 409, scan.text
+    assert scan.json()["error"]["code"] == "application_provider_unsupported"
+    assert not any(call[0] == "enqueue_automation_job" for call in store.rpc_calls)
+
+
+def test_yc_preferences_are_matching_only_and_never_enqueue_discovery() -> None:
+    store = FakeStore()
+    client = TestClient(
+        create_app(settings=configured_settings(), auth=FakeAuth(), store=store)
+    )
+
+    initial = client.get("/api/v1/providers/yc/preferences")
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["data"] == {
+        "user_id": str(USER_ID),
+        "provider": "yc",
+        "query": None,
+        "remote_only": False,
+        "limit": 10,
+    }
+
+    updated = client.patch(
+        "/api/v1/providers/yc/preferences",
+        json={"query": "  machine   learning engineer  ", "remote_only": True, "limit": 7},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["data"] == {
+        "user_id": str(USER_ID),
+        "provider": "yc",
+        "query": "machine learning engineer",
+        "remote_only": True,
+        "limit": 7,
+    }
+    assert not any(
+        call[0] == "enqueue_automation_job" for call in store.rpc_calls
+    )
 
 
 def test_form_revision_approval_binds_revision_hash_and_answers() -> None:

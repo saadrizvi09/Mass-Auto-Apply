@@ -118,7 +118,10 @@ pair exists. Both sources being absent disables managed-browser work. An empty
 initial allowlist above enables Greenhouse plus one-page Google Forms scan,
 exact-approved submit, and verified-confirmation handling and excludes ZipRecruiter.
 Add Lever, Ashby, or Wellfound individually only after its controlled canary passes. YC
-has an adapter but remains launch-gated pending a controlled signed-in canary. The
+has a finished exact saved-job scan/review/sealed-submit state machine but remains
+launch-gated pending a controlled signed-in canary. After that canary, add `yc`
+explicitly, for example
+`ALLOWED_BROWSER_PROVIDERS=google_forms,greenhouse,yc`. The
 generic exact-host `company_form` adapter is internal/gated and is not a public catalog
 or allowlist entry. Leave Cutshort and Instahyre out until their tenant-aware multi-step
 state machines are implemented and validated.
@@ -142,7 +145,9 @@ remains a foreground, user-initiated API call.
 ## 3. Database schema
 
 The canonical executable schema is the ordered Supabase migrations. Deployments must
-apply through `202608150002_user_provider_credentials.sql`. In particular,
+apply through `202608150003_yc_exact_job_automation.sql`. That migration installs the
+exact-current-YC-job target contract, tenant-only YC preferences, provider/job binding,
+and service-role guards without enabling YC discovery. In particular,
 `202608130001_google_forms_manual_submit.sql` is a temporary fail-closed state;
 `202608130002_google_forms_approved_submit.sql` is the required forward migration that
 removes that prohibition and installs the exact-approved/required-answer submit gate.
@@ -628,6 +633,7 @@ It exposes no durable Hunter job or unattended company search.
 | GET/PATCH | `/api/v1/applications/{id}` | own resource |
 | POST | `/api/v1/applications/{id}/approve` | validate then set approved |
 | POST | `/api/v1/applications/{id}/send` | one reviewed Gmail send |
+| GET/PATCH | `/api/v1/providers/yc/preferences` | read/update optional tenant YC query/remote/limit preferences; never fetch, scrape, discover, or enqueue YC provider work |
 
 Job fit is a deterministic relevance aid, not a hiring prediction. It compares the
 owned parsed résumé and profile skills/target roles with each owned job's title and
@@ -906,7 +912,7 @@ Hosted catalog matrix:
 | Greenhouse | individual URL detection plus bounded official public-board enumeration | aligned `managed_browser`; controlled staging still required |
 | Lever / Ashby | individual URL detection plus bounded official public-board enumeration | read-only live scan passed; controlled submit canaries still required |
 | Wellfound | URL/import detection | safe mapping pending a signed-in controlled canary |
-| YC | URL/import detection | worker adapter exists, but public automation remains gated pending a controlled signed-in tenant-aware canary |
+| YC | Exact user-saved current public job URL only; no YC search/scraping/discovery | finished tenant-isolated Browserbase BYOK scan → résumé/Groq-grounded immutable review → sealed single submit → fresh-confirmation verification; operator-allowlist gated until signed-in canary |
 | Generic company form | No public catalog/discovery entry | exact-host adapter exists only as a gated controlled-canary path; it is not enabled public functionality |
 | Cutshort / Instahyre | URL/import detection | connection-only; application jobs fail safely pending tenant-aware multi-step state machines |
 | Gmail | None | official OAuth reviewed send |
@@ -963,9 +969,23 @@ Only enabled application handlers scan fields,
 fill approved answers/résumé, and recheck URL, schema, approval, and required answers
 before a provider action. For Google Forms, the normal `application_submit` handler
 activates exactly one unambiguous Submit control and succeeds only after fresh provider
-confirmation (`application_submitted`/`confirmed`). The YC adapter and dynamically
-exact-host-bound `company_form` adapter remain controlled-canary code paths rather than
-publicly enabled capabilities.
+confirmation (`application_submitted`/`confirmed`). YC and the dynamically
+exact-host-bound `company_form` adapter have different launch states. YC is a finished
+exact-job state machine but remains operator-allowlist gated until its signed-in canary;
+the generic adapter remains an internal controlled-canary code path.
+
+The YC handler accepts only one exact current public job-detail URL already saved by the
+tenant. It rejects search, listing, account, generic application, and unsupported legacy
+targets before creating a Browserbase session. The API, migration, and worker also
+reserve every `ycombinator.com` and `workatastartup.com` root/subdomain from the generic
+company-form adapter. Login occurs inside that tenant's
+isolated persistent BYOK context. Playwright in this separate continuously running
+worker opens the bound job, scans only visible job fields, and applies only an approved
+immutable revision grounded in the owned profile/résumé and reviewable Groq
+suggestions. It activates one unique submit control once and requires a fresh YC
+confirmation. Query, remote, and limit preferences are storage/display/matching values
+only and never cause a YC request, crawl, discovery job, or bulk application. Vercel
+does not launch Chromium, connect to Browserbase CDP, or run this worker.
 Connection-only or unsupported multi-step paths return `needs_attention` without
 attempting an application. CAPTCHA, MFA, login/security challenge, an unknown required
 field, changed schema, and uncertain confirmation do the same and may retain Live View
@@ -1068,6 +1088,8 @@ controlled provider accounts/jobs, and current provider terms. Validation must p
 that saving the pair uses only the read-only project endpoint and creates no session;
 worker tests must prove BYOK priority, same-source key/project pairing, immediate close,
 and the 90-second stall cap. Mocked tests cannot satisfy that gate.
-YC and the exact-host generic company-form adapter remain gated controlled canaries
-until such validation explicitly promotes them; implementation code alone is not
-enablement evidence.
+YC remains operator-allowlist gated until a signed-in exact-job canary proves URL
+rejection, tenant context isolation, visible-field scan, immutable grounded review,
+single sealed submit, fresh confirmation, and fail-closed outcomes. The exact-host
+generic company-form adapter remains an internal gated canary. Implementation code
+alone is not enablement evidence.

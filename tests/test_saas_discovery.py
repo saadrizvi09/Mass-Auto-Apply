@@ -102,6 +102,20 @@ def test_company_form_target_rejects_non_public_or_ambiguous_hosts(url: str) -> 
     assert public_company_form_target(url) is None
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.ycombinator.com/jobs",
+        "https://ycombinator.com/companies/acme",
+        "https://account.ycombinator.com/authenticate",
+        "https://www.workatastartup.com/jobs/12345",
+        "https://subdomain.workatastartup.com/application",
+    ],
+)
+def test_company_form_target_never_claims_yc_owned_hosts(url: str) -> None:
+    assert public_company_form_target(url) is None
+
+
 def test_public_ats_urls_become_job_create_items() -> None:
     jobs = discover_provider_urls(
         "Apply at https://jobs.lever.co/nimbus-ai/abc and "
