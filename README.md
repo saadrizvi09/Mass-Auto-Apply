@@ -12,6 +12,16 @@ The hosted application is the supported product entrypoint. The earlier single-u
 desktop implementation remains in the repository only as migration/reference code and
 is never imported by the Vercel application.
 
+## Watch the product demo
+
+<video src="https://raw.githubusercontent.com/saadrizvi09/Mass-Auto-Apply/main/docs/demo/autoapply-complete-product-demo.mp4" width="100%" controls preload="metadata" title="AutoApply complete product demonstration"></video>
+
+This 1 minute 48 second narrated walkthrough demonstrates Telegram and LinkedIn job
+discovery, multi-platform applications, a verified YC application, Google Form autofill,
+LinkedIn assisted apply, contact discovery, controlled email outreach, and sent-mail proof.
+
+[Open the full MP4 on GitHub](./docs/demo/autoapply-complete-product-demo.mp4)
+
 ## Product capabilities
 
 | Capability | Launch behavior |
