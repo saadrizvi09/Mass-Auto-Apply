@@ -14,13 +14,16 @@ is never imported by the Vercel application.
 
 ## Watch the product demo
 
-<video src="https://raw.githubusercontent.com/saadrizvi09/Mass-Auto-Apply/main/docs/demo/autoapply-complete-product-demo.mp4" width="100%" controls preload="metadata" title="AutoApply complete product demonstration"></video>
+[![Watch the complete AutoApply product demo](./docs/demo/autoapply-demo-preview.jpg)](https://saadrizvi09.github.io/Mass-Auto-Apply/demo/autoapply-complete-product-demo.mp4)
+
+### [▶ Watch the complete 1:48 product demo](https://saadrizvi09.github.io/Mass-Auto-Apply/demo/autoapply-complete-product-demo.mp4)
 
 This 1 minute 48 second narrated walkthrough demonstrates Telegram and LinkedIn job
 discovery, multi-platform applications, a verified YC application, Google Form autofill,
 LinkedIn assisted apply, contact discovery, controlled email outreach, and sent-mail proof.
 
-[Open the full MP4 on GitHub](./docs/demo/autoapply-complete-product-demo.mp4)
+The video is hosted directly from this repository through GitHub Pages. If playback is
+unavailable, [open the source MP4](./docs/demo/autoapply-complete-product-demo.mp4).
 
 ## Product capabilities
 
