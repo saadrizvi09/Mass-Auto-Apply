@@ -4740,26 +4740,6 @@ def create_app(
             PUBLIC_DIR / "index.html", headers={"Cache-Control": "no-store"}
         )
 
-    @application.get("/app.js", include_in_schema=False)
-    async def public_javascript() -> FileResponse:
-        return FileResponse(
-            PUBLIC_DIR / "app.js",
-            media_type="text/javascript",
-            headers={"Cache-Control": "no-store"},
-        )
-
-    @application.get("/vendor/supabase.js", include_in_schema=False)
-    async def public_supabase_bundle() -> FileResponse:
-        return FileResponse(PUBLIC_DIR / "vendor" / "supabase.js", media_type="text/javascript")
-
-    @application.get("/styles.css", include_in_schema=False)
-    async def public_styles() -> FileResponse:
-        return FileResponse(
-            PUBLIC_DIR / "styles.css",
-            media_type="text/css",
-            headers={"Cache-Control": "no-store"},
-        )
-
     @application.get("/privacy.html", include_in_schema=False)
     async def privacy_page() -> FileResponse:
         return FileResponse(PUBLIC_DIR / "privacy.html")

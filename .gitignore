@@ -52,6 +52,10 @@ digest_seen.json
 .venv-saas/
 .worker-state/
 frontend/node_modules/
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+public/_next/
+public/static/
 build/
 dist/
 out/

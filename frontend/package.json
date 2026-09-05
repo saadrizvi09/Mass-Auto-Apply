@@ -1,16 +1,24 @@
 {
-  "name": "autoapply-cloud-frontend-assets",
-  "version": "1.0.0",
+  "name": "autoapply-cloud-frontend",
+  "version": "2.1.0",
   "private": true,
-  "type": "module",
   "scripts": {
-    "build": "node scripts/build.mjs",
-    "check": "npm run build && node --check ../public/app.js"
+    "dev": "next dev",
+    "build": "next build --webpack",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run build"
   },
   "dependencies": {
-    "@supabase/supabase-js": "2.57.4"
+    "@supabase/supabase-js": "2.57.4",
+    "next": "16.3.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
   },
   "devDependencies": {
-    "esbuild": "0.25.9"
+    "@types/node": "24.10.1",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "typescript": "7.0.2"
   }
 }
