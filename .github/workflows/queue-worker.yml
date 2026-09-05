@@ -1,0 +1,48 @@
+name: AutoApply queue worker
+
+on:
+  schedule:
+    # The durable Supabase lease makes delayed or overlapping runs safe.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: autoapply-queue-worker
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  drain-queue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out worker
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: worker/requirements.txt
+
+      - name: Install worker dependencies
+        run: python -m pip install --requirement worker/requirements.txt
+
+      - name: Drain durable queue
+        run: python -m worker.main
+        env:
+          SUPABASE_URL: ${{ secrets.AUTOAPPLY_SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.AUTOAPPLY_SUPABASE_SECRET_KEY }}
+          TOKEN_ENCRYPTION_KEY: ${{ secrets.AUTOAPPLY_TOKEN_ENCRYPTION_KEY }}
+          GOOGLE_CLIENT_ID: ${{ secrets.AUTOAPPLY_GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.AUTOAPPLY_GOOGLE_CLIENT_SECRET }}
+          WORKER_ID: github-actions-queue-worker
+          WORKER_POLL_SECONDS: "2"
+          WORKER_MAX_IDLE_POLL_SECONDS: "5"
+          WORKER_MAX_RUNTIME_SECONDS: "240"
+          WORKER_LEASE_SECONDS: "120"
+          WORKER_HEARTBEAT_SECONDS: "20"
+          WORKER_LOG_LEVEL: INFO

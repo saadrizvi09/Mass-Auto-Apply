@@ -219,6 +219,7 @@ class WorkerConfig:
     worker_id: str
     poll_seconds: float = 2.0
     max_idle_poll_seconds: float = 15.0
+    max_runtime_seconds: int = 0
     lease_seconds: int = 120
     retry_base_seconds: int = 15
     max_retry_seconds: int = 300
@@ -246,6 +247,9 @@ class WorkerConfig:
             worker_id=worker_id,
             poll_seconds=poll_seconds,
             max_idle_poll_seconds=max_idle_poll_seconds,
+            max_runtime_seconds=_bounded_int(
+                "WORKER_MAX_RUNTIME_SECONDS", 0, 0, 3600
+            ),
             lease_seconds=_bounded_int("WORKER_LEASE_SECONDS", 120, 30, 3600),
             heartbeat_seconds=_bounded_float(
                 "WORKER_HEARTBEAT_SECONDS", 20.0, 1.0, 300.0
@@ -427,6 +431,15 @@ class Worker:
         except TimeoutError:
             pass
 
+    async def _stop_after_runtime(self) -> None:
+        """Stop a bounded runner without interrupting the current lease update."""
+
+        try:
+            await asyncio.sleep(self.config.max_runtime_seconds)
+            self.stop_event.set()
+        except asyncio.CancelledError:
+            raise
+
     async def run_forever(self) -> None:
         queue_backoff = BoundedBackoff(
             base_seconds=max(self.config.poll_seconds, 0.1),
@@ -441,6 +454,9 @@ class Worker:
         )
         consecutive_errors = 0
         consecutive_idle_polls = 0
+        runtime_timer: asyncio.Task[None] | None = None
+        if self.config.max_runtime_seconds > 0:
+            runtime_timer = asyncio.create_task(self._stop_after_runtime())
         self.logger.info("Worker started for %d safe job kinds.", len(self.config.kinds))
         try:
             while not self.stop_event.is_set():
@@ -461,6 +477,10 @@ class Worker:
                 consecutive_idle_polls += 1
                 await self._wait_or_stop(idle_backoff.delay(consecutive_idle_polls))
         finally:
+            if runtime_timer is not None:
+                runtime_timer.cancel()
+                with suppress(asyncio.CancelledError):
+                    await runtime_timer
             try:
                 await self.store.close()
             except Exception:

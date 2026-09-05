@@ -509,6 +509,14 @@ but it still has capacity/reclamation risk. Recheck current limits, pricing, ter
 regional availability immediately before deploying; no provider guarantees perpetual
 free production hosting.
 
+For this public repository, `.github/workflows/queue-worker.yml` is an available
+no-new-host fallback. It starts a four-minute bounded drain every five minutes using
+GitHub Actions encrypted secrets named `AUTOAPPLY_SUPABASE_URL`,
+`AUTOAPPLY_SUPABASE_SECRET_KEY`, `AUTOAPPLY_TOKEN_ENCRYPTION_KEY`, and optionally the
+platform Gmail client pair. The queue is still durable and lease-protected, but GitHub
+scheduled runs can be delayed; use a continuously running Docker host for production
+SLA requirements.
+
 ### 14.2 Build and configure
 
 Build from the repository root because the Dockerfile also copies `app/saas/`:

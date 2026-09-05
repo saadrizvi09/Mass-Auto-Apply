@@ -506,6 +506,14 @@ fallback `BROWSERBASE_API_KEY`/`BROWSERBASE_PROJECT_ID`. Keep the allowlist
 empty until staging has exercised Greenhouse and one-page Google Forms, then begin with
 only those two entries.
 
+For this public repository, `.github/workflows/queue-worker.yml` also provides a
+bounded scheduler: it drains the same queue for four minutes every five minutes outside
+Vercel. The repository's encrypted Actions secrets must contain the three required
+`AUTOAPPLY_*` Supabase/encryption values; the two Google values are needed only when
+platform-managed Gmail OAuth is enabled. A continuously running Docker worker remains
+the preferred production host because GitHub scheduled runs can be delayed by the
+platform.
+
 The root `.dockerignore` is deny-by-default and sends only `worker/` plus the SaaS
 modules copied by `worker/Dockerfile` to the build daemon. Keep that allowlist in sync
 with Dockerfile `COPY` statements; never replace it with a broad build context on a

@@ -369,6 +369,21 @@ def test_worker_config_reads_and_validates_adaptive_idle_polling(
         WorkerConfig.from_env()
 
 
+def test_worker_config_reads_bounded_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORKER_ID", "worker-test-1")
+    monkeypatch.setenv("WORKER_MAX_RUNTIME_SECONDS", "240")
+
+    config = WorkerConfig.from_env()
+
+    assert config.max_runtime_seconds == 240
+
+    monkeypatch.setenv("WORKER_MAX_RUNTIME_SECONDS", "3601")
+    with pytest.raises(ValueError, match="WORKER_MAX_RUNTIME_SECONDS"):
+        WorkerConfig.from_env()
+
+
 def test_idle_poll_default_never_falls_below_a_slow_initial_poll(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
