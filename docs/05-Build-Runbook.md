@@ -380,7 +380,7 @@ Exercise the reviewed workflow in this order:
 4. In the **Build campaign** subtab of **Mass Cold Email**, generate the résumé-bound
    research prompt, run it in an external AI with web/search access, and upload its
    CSV/XLSX workbook. The importer selects the recognizable data sheet, preserves the
-   exact JD and public evidence URLs, and accepts only public/user-supplied email
+   faithful JD summary and public evidence URLs, and accepts only public/user-supplied email
    strings. It never guesses, probes a mailbox, or sends verification mail.
 5. Select no more than 30 roles in order, review the public contact lead, ask Groq to
    draft from the JD and résumé, and switch to **Review & send**. Verify that ATS/form

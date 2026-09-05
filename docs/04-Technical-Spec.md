@@ -865,8 +865,9 @@ The browser provides convenience orchestration around a durable, review-gated qu
 
 1. Generate a bounded résumé-bound external-AI research prompt. The user runs it in
    Claude, ChatGPT, or Gemini with web/search access and uploads the resulting workbook.
-   The workbook must contain the exact JD, job URL, source URL, contact provenance, and
-   only publicly listed emails; unknown values stay blank and no mailbox is probed.
+   The workbook must contain a faithful JD summary, job URL, role/contact evidence URLs,
+   contact provenance, and only publicly listed emails; unknown values stay blank and no
+   mailbox is probed.
 2. Parse CSV/XLSX in memory, select a recognizable data sheet (README sheets are
    ignored), validate public URLs and email syntax, and ingest no more than 200 rows.
 3. Build an in-memory selection of at most 30 owned, non-archived jobs in user order.

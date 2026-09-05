@@ -77,7 +77,7 @@ Email**. The final destination contains two ordered subtabs: **Build campaign �
    parsing, scanning, and suggestion generation never approve or submit by themselves.
 4. **Mass Cold Email — Build campaign:** generate the résumé-bound external research
    prompt, paste it into Claude, ChatGPT, or Gemini, and upload the resulting CSV/XLSX
-   workbook. The importer accepts exact job descriptions, public source URLs, named
+   workbook. The importer accepts faithful JD summaries, public source URLs, named
    contacts, and publicly listed emails; it never guesses an address or probes a
    mailbox. Select up to 30 roles in the order you want to process, review any public
    contact lead, and ask Groq to create editable drafts from the JD and résumé.
