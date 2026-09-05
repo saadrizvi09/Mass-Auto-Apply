@@ -2779,7 +2779,7 @@ async function importJobFile(event) {
       const count = importedCount(payload);
       byId("outreach-import-form").reset();
       state.pendingJobImportFile = null;
-      setText("outreach-import-file-label", "Required: company, role, JD, email, and source URL when available.");
+    setText("outreach-import-file-label", "Required: company, role, JD summary, public email, and evidence URL when available.");
       await Promise.all([loadJobs(true), loadGoogleForms(true)]);
       setFormMessage("outreach-research-status", `${count} role${count === 1 ? "" : "s"} imported. Select them below to review contacts and draft emails.`, "success");
     } catch (error) {
@@ -2805,7 +2805,7 @@ async function generateOutreachResearchPrompt(event) {
       byId("outreach-research-prompt").value = data.prompt || "";
       byId("outreach-prompt-output").hidden = !data.prompt;
       const years = data.estimated_years_experience;
-      setText("outreach-prompt-summary", `Estimated experience: ${years == null ? "review dated roles" : `${years} years`} · ${Array.isArray(data.target_roles) && data.target_roles.length ? data.target_roles.join(", ") : "resume-derived roles"}`);
+      setText("outreach-prompt-summary", `Professional experience: ${years == null ? "review dated roles" : `${years} years`} (education and academic projects excluded) · ${Array.isArray(data.target_roles) && data.target_roles.length ? data.target_roles.join(", ") : "resume-derived roles"}`);
       setFormMessage("outreach-research-status", "Prompt ready. Paste it into an AI tool with web/search access, then upload the completed workbook below.", "success");
     } catch (error) {
       setFormMessage("outreach-research-status", errorMessage(error, "The research prompt could not be generated."), "error");
@@ -2824,17 +2824,6 @@ async function copyOutreachResearchPrompt(button) {
     byId("outreach-research-prompt").select();
     setFormMessage("outreach-research-status", "Select the prompt and copy it manually.", "info");
   }
-}
-
-function downloadOutreachTemplate() {
-  const columns = ["company", "role", "person_name", "person_title", "email", "linkedin_url", "job_url", "jd", "experience_required", "source_url", "source_date", "contact_source"];
-  const csv = `${columns.join(",")}\n${columns.map(() => "").join(",")}\n`;
-  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
-  const anchor = createElement("a", { attrs: { href: url, download: "autoapply-outreach-template.csv" } });
-  document.body.append(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
 }
 
 async function ingestAtsLinks(event) {
@@ -6423,11 +6412,10 @@ function bindWorkspaceEvents() {
   byId("resume-discovery-form").addEventListener("submit", submitResumeGuidedDiscovery);
   byId("outreach-research-form").addEventListener("submit", generateOutreachResearchPrompt);
   byId("outreach-copy-prompt").addEventListener("click", (event) => copyOutreachResearchPrompt(event.currentTarget));
-  byId("outreach-download-template").addEventListener("click", downloadOutreachTemplate);
   byId("outreach-import-form").addEventListener("submit", importJobFile);
   byId("outreach-import-file").addEventListener("change", (event) => {
     state.pendingJobImportFile = event.target.files?.[0] || null;
-    setText("outreach-import-file-label", state.pendingJobImportFile ? `${state.pendingJobImportFile.name} · ${formatBytes(state.pendingJobImportFile.size)}` : "Required: company, role, JD, email, and source URL when available.");
+    setText("outreach-import-file-label", state.pendingJobImportFile ? `${state.pendingJobImportFile.name} · ${formatBytes(state.pendingJobImportFile.size)}` : "Required: company, role, JD summary, public email, and evidence URL when available.");
   });
   byId("ats-link-form").addEventListener("submit", ingestAtsLinks);
   byId("ats-board-form").addEventListener("submit", queueAtsBoardDiscovery);

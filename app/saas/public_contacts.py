@@ -27,6 +27,8 @@ def _candidate(
     name: str | None = None,
     position: str | None = None,
     linkedin_url: str | None = None,
+    source_url: str | None = None,
+    verification_status: str = "public_source_unverified",
 ) -> dict[str, Any]:
     domain = email.rsplit("@", 1)[-1]
     candidate: dict[str, Any] = {
@@ -35,11 +37,13 @@ def _candidate(
         "position": position or "Public listing contact",
         "domain": domain,
         "source": source,
-        "verification_status": "public_source_unverified",
+        "verification_status": verification_status,
         "confidence": None,
     }
     if linkedin_url:
         candidate["linkedin_url"] = linkedin_url
+    if source_url:
+        candidate["source_url"] = source_url
     return candidate
 
 
@@ -67,8 +71,27 @@ def public_contact_candidates(job: Mapping[str, Any]) -> list[dict[str, Any]]:
     linkedin_url = linkedin_url.strip()[:2_048] if isinstance(linkedin_url, str) and linkedin_url.strip() else None
     imported_source = metadata.get("contact_source")
     imported_source = imported_source.strip()[:240] if isinstance(imported_source, str) and imported_source.strip() else None
+    imported_source_url = metadata.get("contact_source_url")
+    imported_source_url = (
+        imported_source_url.strip()[:2_048]
+        if isinstance(imported_source_url, str) and imported_source_url.strip()
+        else None
+    )
+    imported_status = metadata.get("email_verification_status")
+    imported_status = imported_status.strip().lower() if isinstance(imported_status, str) else ""
+    verification_status = (
+        "public_source_verified"
+        if imported_status in {"public_source_verified", "source_verified", "publicly_listed"}
+        else "public_source_unverified"
+    )
     values: list[tuple[Any, str, str | None, str | None, str | None]] = [
-        (job.get("contact_email"), imported_source or "saved contact field", contact_name, contact_title, linkedin_url),
+        (
+            job.get("contact_email"),
+            imported_source or "saved contact field",
+            contact_name,
+            contact_title,
+            linkedin_url,
+        ),
         (job.get("description"), source_label, None, None, None),
     ]
     candidates: list[dict[str, Any]] = []
@@ -85,6 +108,8 @@ def public_contact_candidates(job: Mapping[str, Any]) -> list[dict[str, Any]]:
                     name=name,
                     position=position,
                     linkedin_url=profile_url,
+                    source_url=imported_source_url,
+                    verification_status=verification_status,
                 )
             )
             if len(candidates) >= _MAX_CANDIDATES:

@@ -1011,7 +1011,7 @@
               <div><p class="eyebrow">External research handoff</p><h2 id="outreach-research-heading">Find hiring contacts with your preferred AI</h2></div>
               <span class="status-pill status-info">Public sources only</span>
             </div>
-            <p class="form-intro">Generate one evidence-first prompt, paste it into Claude, ChatGPT, or Gemini with web access, download the requested XLSX, then upload it here. The workbook's job description, source URL, and public email stay attached to each opportunity.</p>
+            <p class="form-intro">Generate one evidence-first prompt targeting at least 100 source-verified public contacts, paste it into Claude, ChatGPT, or Gemini with web access, export the requested XLSX, then upload it here. The workbook's paraphrased JD, role source, contact source, and public email stay attached to each opportunity. If 100 cannot be verified, the AI must report the shortfall instead of inventing rows.</p>
             <form id="outreach-research-form" class="research-prompt-controls">
               <div class="form-grid three-columns">
                 <div class="field"><label for="outreach-target-role">Target role <span class="optional-label">optional</span></label><input id="outreach-target-role" maxlength="160" placeholder="Backend or AI engineer" /></div>
@@ -1020,7 +1020,6 @@
               </div>
               <div class="button-row">
                 <button id="outreach-generate-prompt" class="button button-primary button-small" type="submit">Generate research prompt</button>
-                <button id="outreach-download-template" class="button button-ghost button-small" type="button">Download Excel columns</button>
               </div>
             </form>
             <div id="outreach-prompt-output" class="research-prompt-output" hidden>
@@ -1029,7 +1028,7 @@
             </div>
             <form id="outreach-import-form" class="mini-upload-zone outreach-import-zone">
               <input id="outreach-import-file" class="file-input" type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required />
-              <label for="outreach-import-file"><span class="upload-icon" aria-hidden="true">⇧</span><strong>Upload the completed CSV or XLSX</strong><small id="outreach-import-file-label">Required: company, role, JD, email, and source URL when available.</small></label>
+              <label for="outreach-import-file"><span class="upload-icon" aria-hidden="true">⇧</span><strong>Upload the completed CSV or XLSX</strong><small id="outreach-import-file-label">Required: company, role, JD summary, public email, and evidence URL when available.</small></label>
               <button id="outreach-import-submit" class="button button-primary button-small" type="submit">Import into outreach</button>
             </form>
             <p id="outreach-research-status" class="form-message" role="status" aria-live="polite"></p>

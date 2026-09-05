@@ -135,6 +135,9 @@ def profile_suggestions(text: str) -> dict[str, Any]:
         suggestions["email"] = emails[0]
     if phones:
         suggestions["phone"] = phones[0]
+    experience = estimate_years_experience(normalized)
+    if experience is not None:
+        suggestions["years_experience"] = experience
 
     for link in links:
         clean = link.rstrip(".,;:")
@@ -193,78 +196,185 @@ def normalize_resume_text(value: str) -> str:
     return _normalize_text(value)
 
 
-def estimate_years_experience(text: str) -> float | None:
-    """Estimate total professional experience from explicit years and date ranges.
+_PROFESSIONAL_HEADINGS = frozenset(
+    {
+        "experience",
+        "professional experience",
+        "work experience",
+        "employment",
+        "employment history",
+        "work history",
+        "career history",
+        "internship",
+        "internships",
+    }
+)
+_NON_PROFESSIONAL_HEADINGS = frozenset(
+    {
+        "education",
+        "academic background",
+        "academic projects",
+        "projects",
+        "academic experience",
+        "coursework",
+        "certifications",
+        "certificates",
+        "volunteering",
+        "volunteer experience",
+        "leadership",
+        "extracurricular activities",
+        "activities",
+        "awards",
+        "publications",
+    }
+)
+_NON_PROFESSIONAL_CONTEXT = re.compile(
+    r"\b(?:education|academic|project|coursework|certificat(?:e|ion)|university|"
+    r"college|school|b\.?\s*tech|bachelor|master|degree|graduat(?:e|ion)|"
+    r"expected|gpa|cgpa|volunteer|leadership|extracurricular)\b",
+    re.I,
+)
+_ROLE_CONTEXT = re.compile(
+    r"\b(?:engineer|developer|designer|architect|analyst|scientist|consultant|"
+    r"research(?:er| assistant)?|assistant|associate|manager|lead|intern|"
+    r"internship|trainee|fellow|apprentice|employee|freelance|contract(?:or)?|"
+    r"company|corp(?:oration)?|technolog(?:y|ies)|solutions|labs?|inc|ltd)\b",
+    re.I,
+)
+_STUDENT_CONTEXT = re.compile(
+    r"\b(?:final[- ]year|undergraduate|student|pursuing|expected\s+(?:to\s+)?"
+    r"graduat(?:e|ion)|currently\s+studying)\b",
+    re.I,
+)
+_DATE_MONTH_NAMES = (
+    r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|"
+    r"Nov(?:ember)?|Dec(?:ember)?"
+)
+_DATE_RANGE_PATTERN = re.compile(
+    rf"\b(?:(?P<start_month>{_DATE_MONTH_NAMES})\s+)?"
+    rf"(?P<start_year>19\d{{2}}|20\d{{2}})\s*(?:-|–|—|to)\s*"
+    rf"(?:(?P<end_month>{_DATE_MONTH_NAMES})\s+)?"
+    rf"(?P<end_year>19\d{{2}}|20\d{{2}}|(?P<present>present|current))\b",
+    re.I,
+)
+_MONTH_NUMBERS = {
+    name[:3].lower(): index
+    for index, name in enumerate(
+        ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"),
+        start=1,
+    )
+}
 
-    This is a conservative planning signal for the external research prompt, not a
-    claim that an employer will accept the applicant.  Explicit ``X years`` text is
-    preferred; otherwise non-overlapping year ranges are unioned so concurrent roles
-    are not double-counted.
+
+def _heading_kind(line: str) -> str | None:
+    """Classify common résumé section headings without treating role lines as headings."""
+
+    if not isinstance(line, str) or len(line.strip()) > 100:
+        return None
+    compact = re.sub(r"[^a-z0-9]+", " ", line.casefold()).strip()
+    if compact in _PROFESSIONAL_HEADINGS:
+        return "professional"
+    if compact in _NON_PROFESSIONAL_HEADINGS:
+        return "nonprofessional"
+    # PDF extraction often leaves headings such as ``Education: B.Tech`` on one line.
+    if re.match(r"^(?:education|academic|projects?|coursework|certifications?)\b", compact):
+        return "nonprofessional"
+    if re.match(r"^(?:professional|work|employment|career)\s+(?:experience|history)\b", compact):
+        return "professional"
+    if re.match(r"^internships?\b", compact):
+        return "professional"
+    return None
+
+
+def _date_range_months(match: re.Match[str], today: date) -> tuple[int, int] | None:
+    start_year = int(match.group("start_year"))
+    end_value = match.group("end_year")
+    end_year = today.year if end_value.lower() in {"present", "current"} else int(end_value)
+    if not 1950 <= start_year <= end_year <= today.year + 1:
+        return None
+    start_month = _MONTH_NUMBERS.get((match.group("start_month") or "Jan")[:3].lower(), 1)
+    if match.group("end_month"):
+        end_month = _MONTH_NUMBERS[(match.group("end_month") or "")[:3].lower()]
+    elif end_value.lower() in {"present", "current"}:
+        end_month = today.month
+    else:
+        # ``2023 - 2024`` means one elapsed year, not January 2023 through January 2024.
+        end_month = 1
+    start_index = start_year * 12 + start_month - 1
+    end_index = end_year * 12 + end_month - 1
+    if not match.group("end_month") and end_value.lower() not in {"present", "current"}:
+        end_index -= 1
+    return (start_index, end_index) if end_index >= start_index else None
+
+
+def _professional_date_ranges(text: str) -> list[tuple[int, int]]:
+    """Read date ranges only from professional sections or role-like context."""
+
+    lines = normalize_resume_text(text).splitlines()
+    today = date.today()
+    active_section: str | None = None
+    ranges: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
+        heading = _heading_kind(line)
+        if heading is not None:
+            active_section = heading
+        matches = list(_DATE_RANGE_PATTERN.finditer(line))
+        if not matches:
+            continue
+        context = " ".join(lines[max(0, index - 2) : min(len(lines), index + 3)])
+        for match in matches:
+            if active_section == "nonprofessional":
+                continue
+            if active_section != "professional":
+                # Unsectioned résumé text must look like an actual role. This keeps
+                # ``B.Tech 2022 - 2026`` and academic project dates out of the total.
+                if _NON_PROFESSIONAL_CONTEXT.search(context) or not _ROLE_CONTEXT.search(context):
+                    continue
+            elif not _ROLE_CONTEXT.search(context):
+                # A bare ``Experience: 2020 - 2022`` is not enough evidence to count.
+                continue
+            parsed = _date_range_months(match, today)
+            if parsed is not None:
+                ranges.append(parsed)
+    return ranges
+
+
+def estimate_years_experience(text: str) -> float | None:
+    """Estimate dated professional experience while excluding education and projects.
+
+    Education enrollment dates and academic-project dates are deliberately ignored.
+    When a résumé contains both a prose claim and dated roles, the dated professional
+    evidence wins and the smaller value is used if the prose claim is more conservative.
     """
 
     normalized = normalize_resume_text(text)
+    ranges = _professional_date_ranges(normalized)
     explicit = [
         float(number)
-        for number in re.findall(r"(?<!\d)(\d{1,2}(?:\.\d{1,2})?)\s*\+?\s+years?\b", normalized, re.I)
+        for number in re.findall(
+            r"(?<!\d)(\d{1,2}(?:\.\d{1,2})?)\s*\+?\s+years?\b",
+            normalized,
+            re.I,
+        )
         if 0 <= float(number) <= 60
     ]
+    if ranges:
+        ranges.sort()
+        merged: list[list[int]] = []
+        for start, end in ranges:
+            if not merged or start > merged[-1][1] + 1:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        total_months = sum(end - start + 1 for start, end in merged)
+        dated_years = round(min(total_months / 12, 60) + 1e-9, 1)
+        return round(min(dated_years, max(explicit)), 1) if explicit else dated_years
     if explicit:
         return round(max(explicit), 1)
-
-    today = date.today()
-    month_names = (
-        r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
-        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|"
-        r"Nov(?:ember)?|Dec(?:ember)?"
-    )
-    month_numbers = {
-        name[:3].lower(): index
-        for index, name in enumerate(
-            ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"),
-            start=1,
-        )
-    }
-    ranges: list[tuple[int, int]] = []
-    range_pattern = re.compile(
-        rf"\b(?:(?P<start_month>{month_names})\s+)?(?P<start_year>19\d{{2}}|20\d{{2}})"
-        rf"\s*(?:-|–|—|to)\s*"
-        rf"(?:(?P<end_month>{month_names})\s+)?(?P<end_year>19\d{{2}}|20\d{{2}}|(?P<present>present|current))\b",
-        re.I,
-    )
-    for match in range_pattern.finditer(normalized):
-        start_year = int(match.group("start_year"))
-        end_value = match.group("end_year")
-        end_year = today.year if end_value.lower() in {"present", "current"} else int(end_value)
-        if not 1950 <= start_year <= end_year <= today.year + 1:
-            continue
-        start_month = month_numbers.get((match.group("start_month") or "Jan")[:3].lower(), 1)
-        if match.group("end_month"):
-            end_month = month_numbers[(match.group("end_month") or "")[:3].lower()]
-        elif end_value.lower() in {"present", "current"}:
-            end_month = today.month
-        else:
-            # Year-only ranges are interpreted as elapsed calendar years; this
-            # avoids overstating ``2020 - 2022`` as three full years.
-            end_month = 1
-        start_index = start_year * 12 + start_month - 1
-        end_index = end_year * 12 + end_month - 1
-        if not match.group("end_month") and end_value.lower() not in {"present", "current"}:
-            end_index -= 1
-        if end_index >= start_index:
-            ranges.append((start_index, end_index))
-    if not ranges:
-        return None
-    ranges.sort()
-    merged: list[list[int]] = []
-    for start, end in ranges:
-        if not merged or start > merged[-1][1]:
-            merged.append([start, end])
-        else:
-            merged[-1][1] = max(merged[-1][1], end)
-    total_months = sum(end - start + 1 for start, end in merged)
-    # Add a tiny epsilon so a half-year (e.g. 27 months = 2.25 years) rounds
-    # in the human-expected direction instead of Python's binary tie behavior.
-    return round(min(total_months / 12, 60) + 1e-9, 1)
+    if _STUDENT_CONTEXT.search(normalized):
+        return 0.0
+    return None
 
 
 def _normalize_text(value: str) -> str:

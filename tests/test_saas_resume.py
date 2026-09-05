@@ -82,6 +82,22 @@ def test_resume_signals_collapse_spaced_phone_digits_and_union_dated_roles() -> 
     assert estimate_years_experience("Engineer 2020 - 2022\nEngineer 2021 - present") >= 6.0
 
 
+def test_experience_excludes_degree_and_academic_project_dates() -> None:
+    resume = """
+    EDUCATION
+    B.Tech (ECE) | 2022 - 2026
+    EXPERIENCE
+    ASIC Design Intern | Cobalt Semiconductor
+    2023 - 2024
+    PROJECTS
+    Academic RTL Project | 2024 - 2025
+    """
+
+    assert estimate_years_experience(resume) == 1.0
+    assert profile_suggestions(resume)["years_experience"] == 1.0
+    assert estimate_years_experience("Final-year B.Tech student, graduating in 2026") == 0.0
+
+
 def test_profile_suggestions_skip_placeholder_links_and_use_real_annotation_target() -> None:
     result = profile_suggestions(
         "https://linkedin.com/in/CHANGE-ME "

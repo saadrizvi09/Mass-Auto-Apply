@@ -41,6 +41,12 @@ def test_active_provider_catalog_has_no_hunter_and_research_prompt_is_resume_bou
     assert "job_url" in data["workbook_columns"]
     assert "Never guess an email pattern" in data["prompt"]
     assert "mailbox" in data["prompt"]
+    assert "at least 100 distinct, contactable rows" in data["prompt"]
+    assert "public_source_verified" in data["prompt"]
+    assert "faithful, concise paraphrase" in data["prompt"]
+    assert "education enrollment range" in data["prompt"]
+    assert "contact_source_url" in data["workbook_columns"]
+    assert "email_verification_status" in data["workbook_columns"]
 
 
 def test_single_send_compatibility_route_only_enqueues_the_persistent_worker() -> None:

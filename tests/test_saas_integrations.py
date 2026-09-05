@@ -374,6 +374,29 @@ def test_groq_resume_analysis_discards_placeholder_profile_urls() -> None:
     assert result == {"github_url": "https://github.com/ada"}
 
 
+def test_groq_resume_analysis_replaces_llm_experience_with_deterministic_work_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        groq.requests,
+        "post",
+        lambda *_args, **_kwargs: FakeResponse(
+            200,
+            {"choices": [{"message": {"content": '{"years_experience":4.8}'}}]},
+        ),
+    )
+
+    result = groq.analyze_resume_profile(
+        "gsk_test_key",
+        "openai/gpt-oss-120b",
+        "Final-year B.Tech student\nEducation: 2022 - 2026\n"
+        "Experience\nASIC Design Intern\n2023 - 2024\n"
+        "Academic Project\n2024 - 2025",
+    )
+
+    assert result["years_experience"] == 1.0
+
+
 def test_refresh_preserves_refresh_token(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.saas import gmail
 

@@ -441,6 +441,8 @@ def test_outreach_is_a_bounded_review_gated_workflow() -> None:
     assert 'id="outreach-research-prompt"' in outreach_view
     assert 'id="outreach-import-form"' in outreach_view
     assert 'id="outreach-generate-prompt"' in outreach_view
+    assert 'id="outreach-download-template"' not in outreach_view
+    assert "at least 100 source-verified public contacts" in outreach_view
 
     assert 'headers.set("X-Hunter-Api-Key", key)' not in APP_JS
     assert 'title: "Mass Cold Email"' in APP_JS

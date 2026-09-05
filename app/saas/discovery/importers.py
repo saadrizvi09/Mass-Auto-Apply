@@ -60,10 +60,21 @@ HEADER_SYNONYMS: dict[str, frozenset[str]] = {
         "contact title", "contact_title", "person title", "person_title", "recruiter title",
         "recruiter_title", "job title at company", "contact role",
     }),
+    "contact_type": frozenset({
+        "contact type", "contact_type", "recipient type", "recipient_type",
+    }),
+    "email_verification_status": frozenset({
+        "email verification status", "email_verification_status", "verification status",
+        "verification_status", "email status", "email_status",
+    }),
     "linkedin_url": frozenset({
         "linkedin", "linkedin url", "linkedin_url", "person linkedin", "person_linkedin",
     }),
     "source_url": frozenset({"source url", "source_url", "evidence url", "evidence_url"}),
+    "contact_source_url": frozenset({
+        "contact source url", "contact_source_url", "email source url", "email_source_url",
+        "contact evidence url", "contact_evidence_url",
+    }),
     "source_date": frozenset({"source date", "source_date", "evidence date", "evidence_date"}),
     "contact_source": frozenset({"contact source", "contact_source", "email source", "email_source"}),
     "experience_required": frozenset({
@@ -138,6 +149,8 @@ def _matrix_to_jobs(matrix: list[list[Any]], *, max_rows: int) -> list[Normalize
         salary = _value(row, mapping, "salary")
         raw_external_id = _value(row, mapping, "external_id")
         source = _value(row, mapping, "source") or "file_import"
+        verified_value = _norm_header(_value(row, mapping, "verified"))
+        email_status = _norm_header(_value(row, mapping, "email_verification_status"))
         if not description:
             details = [f"{title} opportunity at {company}."]
             if location:
@@ -167,12 +180,26 @@ def _matrix_to_jobs(matrix: list[list[Any]], *, max_rows: int) -> list[Normalize
                     "import_row": row_number,
                     "domain": domain,
                     "compensation": salary,
-                    "verified": _norm_header(_value(row, mapping, "verified"))
-                    in {"1", "true", "yes", "y", "verified", "trusted"},
+                    "verified": verified_value
+                    in {"1", "true", "yes", "y", "verified", "trusted"}
+                    or email_status
+                    in {
+                        "public source verified",
+                        "source verified",
+                        "publicly listed",
+                        "public source",
+                    },
                     "contact_name": _value(row, mapping, "contact_name")[:160] or None,
                     "contact_title": _value(row, mapping, "contact_title")[:160] or None,
+                    "contact_type": _value(row, mapping, "contact_type")[:80] or None,
+                    "email_verification_status": (
+                        _value(row, mapping, "email_verification_status")[:80] or None
+                    ),
                     "linkedin_url": safe_http_url(_value(row, mapping, "linkedin_url")),
                     "source_url": safe_http_url(_value(row, mapping, "source_url")),
+                    "contact_source_url": safe_http_url(
+                        _value(row, mapping, "contact_source_url")
+                    ),
                     "source_date": _value(row, mapping, "source_date")[:40] or None,
                     "contact_source": _value(row, mapping, "contact_source")[:240] or None,
                     "experience_required": _value(row, mapping, "experience_required")[:160] or None,

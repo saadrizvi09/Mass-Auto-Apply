@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 import requests
 
 from .profile_urls import is_placeholder_profile_url
+from .resume import estimate_years_experience
 
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -397,7 +398,14 @@ def analyze_resume_profile(
     except (KeyError, IndexError, TypeError) as exc:
         raise GroqProviderError("groq_invalid_response", "Groq returned invalid résumé analysis.") from exc
     parsed = _json_object_from_content(content, purpose="résumé analysis")
-    return _clean_resume_analysis(parsed)
+    result = _clean_resume_analysis(parsed)
+    # LLMs frequently count degree dates and academic projects as employment.
+    # Replace only this numeric field with the deterministic, section-aware parser;
+    # names, contact details, and skills still come from the reviewed model output.
+    experience = estimate_years_experience(resume_text)
+    if experience is not None:
+        result["years_experience"] = experience
+    return result
 
 
 def generate_application_draft(

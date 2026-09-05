@@ -66,6 +66,22 @@ def test_public_contact_endpoint_is_tenant_bound_and_has_no_verification_side_ef
     assert store.rpc_calls == []
 
 
+def test_imported_public_source_status_is_preserved_for_review() -> None:
+    candidates = public_contact_candidates(
+        {
+            "contact_email": "recruiter@acme.example",
+            "metadata": {
+                "contact_source": "company team page",
+                "contact_source_url": "https://acme.example/team",
+                "email_verification_status": "public_source_verified",
+            },
+        }
+    )
+
+    assert candidates[0]["verification_status"] == "public_source_verified"
+    assert candidates[0]["source_url"] == "https://acme.example/team"
+
+
 def test_public_contact_endpoint_cannot_read_another_tenants_job() -> None:
     job_id = str(uuid4())
     store = FakeStore(

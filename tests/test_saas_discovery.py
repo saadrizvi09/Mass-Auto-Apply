@@ -405,11 +405,15 @@ def test_xlsx_import_is_in_memory_and_skips_an_external_ai_readme_sheet() -> Non
     readme.title = "README"
     readme.append(["This workbook was created from public sources."])
     sheet = workbook.create_sheet("Roles")
-    sheet.append(["Company", "Role", "Email", "Job URL", "JD", "Source URL"])
+    sheet.append([
+        "Company", "Role", "Email", "Job URL", "JD", "Source URL",
+        "Contact Source URL", "Email Verification Status", "Contact Type",
+    ])
     sheet.append([
         "Cobalt", "Frontend Engineer", "recruiting@cobalt.example",
         "https://jobs.ashbyhq.com/cobalt/42", "Build accessible products.",
-        "https://cobalt.example/careers/42",
+        "https://cobalt.example/careers/42", "https://cobalt.example/team",
+        "public_source_verified", "recruiting_inbox",
     ])
     buffer = BytesIO()
     workbook.save(buffer)
@@ -420,6 +424,9 @@ def test_xlsx_import_is_in_memory_and_skips_an_external_ai_readme_sheet() -> Non
     assert jobs[0]["title"] == "Frontend Engineer"
     assert jobs[0]["apply_url"] == "https://jobs.ashbyhq.com/cobalt/42"
     assert jobs[0]["metadata"]["source_url"] == "https://cobalt.example/careers/42"
+    assert jobs[0]["metadata"]["contact_source_url"] == "https://cobalt.example/team"
+    assert jobs[0]["metadata"]["email_verification_status"] == "public_source_verified"
+    assert jobs[0]["metadata"]["verified"] is True
     _assert_job_contract(jobs)
 
 
