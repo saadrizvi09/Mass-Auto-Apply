@@ -50,14 +50,14 @@
           <li><strong>Account information:</strong> your email address, authentication records, and account identifiers managed through Supabase Auth.</li>
           <li><strong>Applicant information:</strong> profile details, skills, education, preferences, résumé PDFs, and résumé-derived suggestions.</li>
           <li><strong>Job-search information:</strong> job descriptions, company and contact details, application links, drafts, approvals, send history, and status updates.</li>
-          <li><strong>Connection information:</strong> connection status, authorized scopes, provider account metadata, encrypted OAuth tokens, encrypted user-supplied Google Web OAuth client credentials, encrypted Groq/Hunter/Browserbase credentials, Browserbase Project ID, or opaque managed-browser context identifiers when a supported connection is enabled.</li>
+          <li><strong>Connection information:</strong> connection status, authorized scopes, provider account metadata, encrypted OAuth tokens, encrypted user-supplied Google Web OAuth client credentials, encrypted Groq/Browserbase credentials, Browserbase Project ID, or opaque managed-browser context identifiers when a supported connection is enabled.</li>
           <li><strong>Operational information:</strong> automation job states, audit events, request identifiers, security events, Turnstile challenge results, and limited technical logs needed to operate and protect the service.</li>
           <li><strong>Gmail abuse-prevention records:</strong> domain-separated SHA-256 hashes of the Google provider account identifier and normalized recipient, a random event identifier, outcome, and expiry. These rows contain no AutoApply user ID, plaintext email address, message, or OAuth token.</li>
         </ul>
 
         <h2>Your provider API credentials</h2>
         <p>
-          If you save a Groq key, Hunter key, or Browserbase API key and Project ID, AutoApply
+          If you save a Groq key or Browserbase API key and Project ID, AutoApply
           sends it once to its authenticated backend, validates it, encrypts a versioned
           credential envelope, and stores only ciphertext in a table restricted to the trusted
           service role. Plaintext and ciphertext are not returned to your browser, placed in
@@ -65,7 +65,7 @@
           masked hints, and validation timestamps. The trusted API or worker decrypts a credential
           only when needed for an operation you request for your account. Deleting a credential
           removes the stored row but does not revoke it at the provider; rotate or revoke it with
-          Groq, Hunter, or Browserbase when appropriate.
+          Groq or Browserbase when appropriate.
         </p>
         <p>
           Browserbase requires both an API key and Project ID. AutoApply validates the pair using
@@ -112,7 +112,7 @@
           Information is disclosed only as needed to operate the service or perform an action
           you request. Service providers may include Supabase for authentication, database, and
           private file storage; Vercel for application hosting and request execution; Groq for
-          AI requests made with your key; Hunter for requested professional-contact searches;
+          AI requests made with your key;
           Browserbase for managed-browser sessions; Google for Gmail authorization, token exchange or
           refresh using the OAuth client you selected, and approved sends;
           Cloudflare for Turnstile bot challenges.
@@ -129,13 +129,13 @@
         <p>
           Supabase stores authentication session material in your browser so you can remain
           signed in. AutoApply may also use browser storage for limited non-secret interface
-          preferences. It does not store Groq, Hunter, Browserbase, or Google OAuth client
+          preferences. It does not store Groq, Browserbase, or Google OAuth client
           secrets there. Signing out removes the AutoApply authentication session; account-scoped
           encrypted provider credentials remain in server storage until you delete them or delete
           the account.
         </p>
         <p>
-          If you used an earlier AutoApply release that stored a user-namespaced Groq or Hunter
+          If you used an earlier AutoApply release that stored a user-namespaced Groq
           key in this browser, the first authenticated load may import it through the same
           validated encrypted-storage process. AutoApply removes the browser copy only after the
           account save succeeds. If validation or the network fails, it keeps that existing copy
@@ -159,7 +159,7 @@
         </p>
         <p>
           Account deletion removes tenant workspace rows, private résumé objects, encrypted
-          Groq/Hunter/Browserbase credentials, and supported provider connections. To prevent deletion/recreation from evading Gmail caps or
+          Groq/Browserbase credentials, and supported provider connections. To prevent deletion/recreation from evading Gmail caps or
           duplicate-recipient protection, pseudonymous provider-account/recipient hash rows may
           remain after deletion. Their active use expires no later than 90 days from creation (and
           therefore no later than 90 days after account deletion), and normally sooner with the
@@ -188,7 +188,7 @@
         <h2>Your choices</h2>
         <p>
           You decide what profile and job information to provide, whether to upload a résumé,
-          whether to save or delete account-scoped Groq, Hunter, or Browserbase credentials, whether to use the deployment's Google OAuth
+          whether to save or delete account-scoped Groq or Browserbase credentials, whether to use the deployment's Google OAuth
           client or save your own, and whether to connect Gmail or another supported provider.
           You can edit drafts before approval, decline to send, use a manual handoff, disconnect
           services, and delete stored resources through the workspace.

@@ -16,6 +16,10 @@ class SettingsError(ValueError):
     """Raised for invalid deployment configuration without exposing its value."""
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_VERCEL_ENVIRONMENTS = frozenset({"production", "preview", "development"})
+
+
 def _integer(
     values: Mapping[str, str], name: str, default: int, minimum: int, maximum: int
 ) -> int:
@@ -44,6 +48,38 @@ def _url(values: Mapping[str, str], name: str) -> str:
     return value
 
 
+def _is_loopback_url(value: str) -> bool:
+    """Return whether an already-validated URL points at local development."""
+
+    return urlparse(value).hostname in _LOOPBACK_HOSTS
+
+
+def _vercel_origin(values: Mapping[str, str]) -> str:
+    """Resolve Vercel's request origin when a deployment value was mis-copied.
+
+    Vercel exposes host-only system variables, while local configuration normally
+    uses a full URL.  Normalising the system value here keeps a copied local
+    ``SITE_URL`` from leaking into OAuth redirects in a deployed function.
+    Explicit non-loopback ``SITE_URL`` still wins over this fallback.
+    """
+
+    environment = values.get("VERCEL_ENV", "").strip().lower()
+    if environment not in _VERCEL_ENVIRONMENTS:
+        return ""
+    names = (
+        ("VERCEL_PROJECT_PRODUCTION_URL", "VERCEL_URL")
+        if environment == "production"
+        else ("VERCEL_URL", "VERCEL_BRANCH_URL", "VERCEL_PROJECT_PRODUCTION_URL")
+    )
+    for name in names:
+        raw = values.get(name, "").strip()
+        if not raw:
+            continue
+        candidate = raw if "://" in raw else f"https://{raw}"
+        return _url({name: candidate}, name)
+    return ""
+
+
 def _valid_fernet_key(value: str) -> bool:
     if not value or not value.isascii():
         return False
@@ -68,7 +104,7 @@ class Settings:
     google_redirect_uri: str = ""
     groq_model: str = "openai/gpt-oss-120b"
     max_resume_bytes: int = 6 * 1024 * 1024
-    default_daily_send_cap: int = 10
+    default_daily_send_cap: int = 150
     oauth_state_ttl_seconds: int = 600
     browserbase_api_key: str = field(default="", repr=False)
     browserbase_project_id: str = ""
@@ -84,8 +120,11 @@ class Settings:
 
         values = os.environ if environ is None else environ
         site_url = _url(values, "SITE_URL")
+        deployment_origin = _vercel_origin(values)
+        if (not site_url or _is_loopback_url(site_url)) and deployment_origin:
+            site_url = deployment_origin
         google_redirect = _url(values, "GOOGLE_REDIRECT_URI")
-        if not google_redirect and site_url:
+        if (not google_redirect or _is_loopback_url(google_redirect)) and site_url:
             google_redirect = f"{site_url}/api/v1/oauth/google/callback"
         allowed = tuple(
             dict.fromkeys(
@@ -124,7 +163,7 @@ class Settings:
                 values, "MAX_RESUME_BYTES", 6 * 1024 * 1024, 1, 6 * 1024 * 1024
             ),
             default_daily_send_cap=_integer(
-                values, "DEFAULT_DAILY_SEND_CAP", 10, 0, 25
+                values, "DEFAULT_DAILY_SEND_CAP", 150, 0, 150
             ),
             oauth_state_ttl_seconds=_integer(
                 values, "OAUTH_STATE_TTL_SECONDS", 600, 120, 1800

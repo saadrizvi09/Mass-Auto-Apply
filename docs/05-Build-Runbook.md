@@ -28,8 +28,9 @@ below.
 - A persistent worker host for managed-browser work. A controlled Browserbase API
   key/project ID may be saved as account BYOK; operator Browserbase values are an
   optional platform fallback.
-- Controlled Groq and Hunter test accounts/keys for encrypted account-scoped BYOK. These
-  are authenticated user inputs for staging verification, not deployment secrets.
+- A controlled Groq test key for encrypted account-scoped BYOK. It is an authenticated
+  user input for staging verification, not a deployment secret. Public contact lookup
+  requires no provider key.
 - Controlled test accounts and test job/form URLs for every browser provider enabled.
 - Python 3.12 for production-parity local tests.
 
@@ -49,7 +50,7 @@ credentials/data in the working directory. Deploy from a clean Git checkout and 
    ```
 
    Verify migrations were applied in filename order through
-   `202608150003_yc_exact_job_automation.sql`. Do not stop at
+   `202609050001_outreach_email_queue.sql`. Do not stop at
    `202608130001_google_forms_manual_submit.sql`: it is the temporary fail-closed
    prohibition. The required forward migration `202608130002_google_forms_approved_submit.sql`
    removes that prohibition and installs the exact-approved/required-answer submit gate;
@@ -126,8 +127,12 @@ it must not request `gmail.send`.
    application Gmail callback at `/api/v1/oauth/google/callback`.
 4. On the Supabase Google provider page, enable the provider and save the Web client ID
    and secret. They stay in Supabase; they are not Vercel variables.
-5. In Supabase Authentication → URL Configuration, keep the exact local URL allowed
-   during development and add Preview/Production URLs before testing those deployments.
+5. In Supabase Authentication → URL Configuration, set the hosted project's **Site URL**
+   to `https://autoapply-cloud.vercel.app` and add
+   `https://autoapply-cloud.vercel.app/**` under Redirect URLs. Keep the exact local URL
+   allowed during development and add Preview URLs only when they are intentionally
+   enabled. A redirect URL that is not allow-listed is silently replaced by Supabase's
+   Site URL, which is why a local Site URL can send a production login to `127.0.0.1`.
 6. Test both a new Google account and an existing verified password account. Confirm
    both reach one tenant-isolated workspace and that the Google consent screen asks
    only for `openid`, email, and profile access.
@@ -277,16 +282,17 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 Store it as `TOKEN_ENCRYPTION_KEY` in Vercel and the worker. Do not commit or expose it.
 Back it up securely; losing it requires every user to reconnect Gmail and users of the
-advanced path to re-save their Google OAuth client, Groq key, Hunter key, and
+advanced path to re-save their Google OAuth client, Groq key, and
 Browserbase key/project pair. The value must be identical in the API and all workers.
 
 For an existing deployment, apply
 `202608150002_user_provider_credentials.sql` before deploying code that resolves stored
-credentials, then apply `202608150003_yc_exact_job_automation.sql` before deploying the
-YC exact-job UI/API/worker. Confirm the credential table has RLS enabled, no browser grants/policies, and a
+credentials, then apply `202608150003_yc_exact_job_automation.sql` and the final
+`202609050001_outreach_email_queue.sql` before deploying the corresponding
+UI/API/worker. Confirm the credential table has RLS enabled, no browser grants/policies, and a
 service-role grant. Deploy API and worker with the same encryption key before the new
 frontend. On the first authenticated load, the frontend performs a one-time import of
-that user's namespaced legacy Groq/Hunter browser values through the normal validated
+that user's namespaced legacy Groq browser value through the normal validated
 PUT endpoints. It removes a legacy browser copy only after the encrypted account save
 succeeds (or when the same credential is already configured); on validation/network
 failure it keeps the browser copy, shows a warning, and allows a safe retry. The value
@@ -371,17 +377,17 @@ Exercise the reviewed workflow in this order:
    confirmation; an uncertain/login/challenge/schema result becomes `needs_attention`
    and may expose Live View. Parsing, suggestions, and scan never approve or submit on
    their own.
-4. In the **Build campaign** subtab of **Mass Cold Email**, add and validate the
-   encrypted account-scoped Hunter key at the top of the view, then select no more than ten jobs.
-   Show projected credit use inline before the explicit lookup calls
-   `POST /api/v1/jobs/{id}/contacts/hunter`, which resolves the owned key, and let
-   the user choose a contact for each job.
-5. Generate Groq email drafts, switch to the second **Review & send** subtab in the same
-   destination, verify that ATS/form applications are excluded, and review and approve
-   each exact draft individually. Require a
-   separate final confirmation, then send approved items sequentially through the
-   existing Gmail application-send endpoint so daily-cap, duplicate-recipient, and
-   idempotency reservations remain authoritative.
+4. In the **Build campaign** subtab of **Mass Cold Email**, generate the résumé-bound
+   research prompt, run it in an external AI with web/search access, and upload its
+   CSV/XLSX workbook. The importer selects the recognizable data sheet, preserves the
+   exact JD and public evidence URLs, and accepts only public/user-supplied email
+   strings. It never guesses, probes a mailbox, or sends verification mail.
+5. Select no more than 30 roles in order, review the public contact lead, ask Groq to
+   draft from the JD and résumé, and switch to **Review & send**. Verify that ATS/form
+   applications are excluded, approve every exact draft individually, and confirm the
+   final handoff. The API creates durable `send_email` rows; the persistent worker
+   sends them after the browser closes with daily-cap, duplicate-recipient, and
+   idempotency gates authoritative in Supabase.
 
 This is bounded, user-reviewed orchestration. It is not autonomous or unreviewed bulk
 cold email.
@@ -441,7 +447,7 @@ entry. Leave `cutshort` and `instahyre` out until tenant-aware multi-step applic
 state machines have been implemented and live-validated. Multi-page or branching Google
 Forms remain unsupported.
 
-Users' Groq, Hunter, and Browserbase credentials are not Vercel environment variables.
+Users' Groq and Browserbase credentials are not Vercel environment variables.
 They are validated, encrypted with `TOKEN_ENCRYPTION_KEY`, and stored in the
 service-role-only `user_provider_credentials` table. The browser receives only safe
 status/hints and stores no provider secret. `GOOGLE_REDIRECT_URI` is
@@ -497,16 +503,13 @@ Do not promote until all pass:
 - `GET /api/v1/discovery/google-forms` is tenant-scoped and deduplicated, and viewing
   the queue never starts a scan; an explicit scan records fields for the existing
   immutable review/approval flow;
-- the Hunter key validates through `PUT /api/v1/provider-credentials/hunter`, persists
-  only as encrypted ciphertext, resolves for owned contact searches, and never appears
-  in responses, browser storage, queue payloads, or logs;
-- `POST /api/v1/jobs/{id}/contacts/hunter` enforces job ownership and a bounded contact
-  result; the outreach UI shows the projected credit use inline, starts directly from
-  the explicit lookup button, and requires an explicit user-selected contact;
-- outreach selection cannot exceed ten jobs; Groq produces drafts only after contacts
+- `POST /api/v1/jobs/{id}/contacts/public` enforces job ownership and returns only
+  bounded, syntax-checked contact candidates already present in the job record; the
+  outreach UI requires an explicit user-selected contact;
+- outreach selection cannot exceed 30 jobs; Groq produces drafts only after contacts
   are selected, and editing any draft invalidates its exact-content approval;
-- the final outreach action requires a separate confirmation and sends approved drafts
-  sequentially through the existing Gmail path; daily-send, duplicate-recipient, and
+- the final outreach action requires a separate confirmation and enqueues approved
+  drafts to the persistent Gmail worker; daily-send, duplicate-recipient, and
   idempotency gates still fail closed and a retry cannot create a second message;
 - no UI or API path presents this workflow as autonomous or unreviewed bulk cold email;
 - pasted referral-digest ingestion enforces its 100,000-character schema bound, filters
@@ -575,7 +578,7 @@ Do not promote until all pass:
 ## 8. Worker deployment
 
 The web product is useful without a worker for onboarding, file/URL imports,
-drafting, tracking, manual handoff, and reviewed single Gmail sends. Deploy the
+drafting, tracking, manual handoff, and reviewed Gmail sends. Deploy the
 continuous worker on a persistent process host outside Vercel
 before enabling Telegram/RSS, LinkedIn guest discovery, or browser application jobs.
 Résumé-guided discovery queues the existing LinkedIn guest collector and passes its
@@ -626,6 +629,9 @@ WORKER_ID
 WORKER_POLL_SECONDS
 WORKER_MAX_IDLE_POLL_SECONDS
 WORKER_LEASE_SECONDS
+# Required here when the platform-managed Gmail OAuth path is enabled.
+GOOGLE_CLIENT_ID
+GOOGLE_CLIENT_SECRET
 ```
 
 Use `WORKER_POLL_SECONDS=2` and `WORKER_MAX_IDLE_POLL_SECONDS=15` as the starting
@@ -766,8 +772,8 @@ ledger tests, account deletion cleanup, and multi-worker lease/claim tests.
    ```
 
 8. Monitor auth failures, OAuth callbacks, send outcomes, discovery partial/throttle
-   results, résumé-guided queue failures, Hunter validation/search errors and quota
-   responses (never keys), queue age, worker leases, Browserbase session failures,
+   results, résumé-guided queue failures, public-contact extraction outcomes, queue
+   age, worker leases, Browserbase session failures,
    provider challenges, and provider rate errors, plus the provider-ledger cron job's
    last successful run/failures.
 
@@ -789,10 +795,11 @@ ledger tests, account deletion cleanup, and multi-worker lease/claim tests.
   and remediate when hourly cleanup fails or physical deletion is delayed.
 - Never enable LinkedIn candidate automation without official written partner access.
 - Never describe bounded LinkedIn guest discovery as an official API or Easy Apply.
-- Never turn the max-ten outreach assistant into autonomous/unreviewed bulk cold email:
-  retain inline Hunter-credit disclosure and an explicit search click, user contact
-  choice, exact-draft approval, final send confirmation, sequential Gmail sends, and
-  all daily/duplicate/idempotency gates.
+- Never turn the max-30 outreach assistant into autonomous/unreviewed bulk cold email:
+  retain an explicit external-research import, public-contact review, user contact
+  choice, exact-draft approval, final send confirmation, durable queue, and all
+  daily/duplicate/idempotency gates. Never probe mailboxes or send throwaway-account
+  verification messages.
 - Never bypass CAPTCHA/MFA or retry an ambiguous submit as though nothing happened.
 - Never add ZipRecruiter to the hosted provider list without a new reviewed product
   decision, migration, adapter, and staging gate.
@@ -805,16 +812,16 @@ ledger tests, account deletion cleanup, and multi-worker lease/claim tests.
 - Migrations must be forward-compatible through one application release; avoid immediate
   destructive column removal.
 - On token-encryption-key exposure: stop provider actions, rotate key, re-encrypt stored
-  tokens and Groq/Hunter/Browserbase credential envelopes, and require reconnect or
+  tokens and Groq/Browserbase credential envelopes, and require reconnect or
   credential re-entry where integrity is uncertain.
 - On Supabase secret-key exposure: rotate immediately, audit all tenant tables/storage,
   and invalidate worker/API deployments.
 - On suspected cross-tenant access: disable private APIs, preserve redacted audit logs,
   assess affected rows/objects, fix both API scope and RLS, then notify as required.
-- On Groq/Hunter credential exposure: delete the affected encrypted credential from
-  AutoApply, instruct the user to revoke/rotate it with the provider, audit credential
-  access and generation changes, and save the replacement through the authenticated
-  API. There is no deployment-wide Groq/Hunter environment key.
+- On Groq credential exposure: delete the affected encrypted credential from AutoApply,
+  instruct the user to revoke/rotate it with the provider, audit credential access and
+  generation changes, and save the replacement through the authenticated API. There is
+  no deployment-wide Groq or contact-provider key.
 - On Browserbase BYOK exposure: stop the user's browser jobs, disconnect retained
   contexts, delete the AutoApply credential, rotate the key in Browserbase Settings,
   then validate/save the new key with the same Project ID. Rotate the operator fallback
@@ -871,8 +878,8 @@ ledger tests, account deletion cleanup, and multi-worker lease/claim tests.
       Google-picker résumé uploads fail with `provider_login_required` without a
       context, and the same approved revision reuses only that tenant's saved Google
       context
-- [ ] Hunter BYOK validation/contact search tested with encrypted service-role-only
-      persistence and without plaintext/ciphertext in responses, browser storage, or logs
-- [ ] Max-ten reviewed outreach tested end to end: inline credit disclosure, explicit
-      lookup, contact choice, exact-draft approvals, final confirmation, and sequential
+- [ ] Public-contact extraction tested with owned job records, syntax-only status,
+      tenant ownership, and no mailbox/verification side effects
+- [ ] Max-30 reviewed outreach tested end to end: external-AI workbook import, public
+      contact choice, exact-draft approvals, final confirmation, durable queue, and
       gated Gmail sends; no ATS/form application appears in either Mass Cold Email subtab

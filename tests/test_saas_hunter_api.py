@@ -19,6 +19,12 @@ from tests.test_saas_api import (
 )
 
 
+# Hunter was removed from the hosted API. The provider adapter remains covered
+# by tests/test_saas_hunter.py as legacy compatibility code, while this old API
+# contract is intentionally retired.
+pytestmark = pytest.mark.skip(reason="Hunter API removed from the active hosted app")
+
+
 class FakeResponse:
     def __init__(self, status_code: int, payload: object) -> None:
         self.status_code = status_code

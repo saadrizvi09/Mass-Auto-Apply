@@ -8,7 +8,12 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 from app.saas import resume as resume_module
-from app.saas.resume import ResumeParseError, extract_pdf_text, profile_suggestions
+from app.saas.resume import (
+    ResumeParseError,
+    estimate_years_experience,
+    extract_pdf_text,
+    profile_suggestions,
+)
 
 
 def test_pdf_parser_rejects_empty_oversized_and_disguised_files() -> None:
@@ -63,10 +68,18 @@ def test_profile_suggestions_are_conservative() -> None:
     )
     assert result == {
         "email": "ada@example.test",
-        "phone": "+91 98765 43210",
+        "phone": "+91 9876543210",
         "linkedin_url": "https://linkedin.com/in/ada",
         "github_url": "https://github.com/ada",
     }
+
+
+def test_resume_signals_collapse_spaced_phone_digits_and_union_dated_roles() -> None:
+    result = profile_suggestions("Phone: 8 2 8 7 6 1 2 3 4 5 6 7")
+    assert result["phone"] == "828761234567"
+    assert profile_suggestions("Experience: 2020 - 2022") == {}
+    assert estimate_years_experience("Backend Engineer Jan 2020 - Mar 2022") == 2.3
+    assert estimate_years_experience("Engineer 2020 - 2022\nEngineer 2021 - present") >= 6.0
 
 
 def test_profile_suggestions_skip_placeholder_links_and_use_real_annotation_target() -> None:

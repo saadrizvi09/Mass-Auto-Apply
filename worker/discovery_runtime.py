@@ -30,6 +30,9 @@ _MAX_BATCH = 200
 _MAX_BATCH_BYTES = 1_500_000
 _MAX_SEARCH_TERMS = 20
 _MAX_SEARCH_TERM_LENGTH = 100
+_DEFAULT_TIMEOUT_SECONDS = 60
+_MIN_TIMEOUT_SECONDS = 15
+_MAX_TIMEOUT_SECONDS = 120
 _SEARCHABLE_FIELDS: tuple[str, ...] = (
     "title",
     "company",
@@ -40,6 +43,41 @@ _SEARCHABLE_FIELDS: tuple[str, ...] = (
 
 class DiscoveryRepository(Protocol):
     async def rpc(self, name: str, params: Mapping[str, Any]) -> Any: ...
+
+
+class DiscoveryTimeLimitExceeded(TimeoutError):
+    """A public-source call exceeded the user-selected worker budget."""
+
+
+def _bounded_timeout(value: Any) -> int:
+    if value is None:
+        return _DEFAULT_TIMEOUT_SECONDS
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not _MIN_TIMEOUT_SECONDS <= value <= _MAX_TIMEOUT_SECONDS
+    ):
+        raise ValueError("discovery timeout is invalid")
+    return value
+
+
+async def _run_with_deadline(
+    discover: Callable[..., Any],
+    *args: Any,
+    deadline: float,
+    **kwargs: Any,
+) -> Any:
+    """Run one synchronous public collector until the shared deadline."""
+
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise DiscoveryTimeLimitExceeded
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(discover, *args, **kwargs), timeout=remaining
+        )
+    except asyncio.TimeoutError as exc:
+        raise DiscoveryTimeLimitExceeded from exc
 
 
 def _bounded_int(value: Any, default: int, maximum: int) -> int:
@@ -165,29 +203,48 @@ class DiscoveryJobHandler:
             raise ValueError("discovery sources are invalid")
         sources = list(dict.fromkeys(raw_sources))
         limit = _bounded_int(payload.get("limit"), 60, _MAX_BATCH)
+        timeout_seconds = _bounded_timeout(payload.get("timeout_seconds"))
         search_terms = _validated_search_terms(payload.get("search_terms"))
         buckets: list[tuple[str, list[Mapping[str, Any]]]] = []
         errors: list[dict[str, str]] = []
-        for source in sources:
+
+        # The individual collectors already enforce their own source allowlists
+        # and response limits. Running the selected collectors concurrently keeps
+        # the combined run within the one user-visible time budget instead of
+        # multiplying the worst-case timeout by the number of sources.
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+
+        async def collect(
+            source: str,
+        ) -> tuple[str, list[Mapping[str, Any]], dict[str, str] | None]:
             discover = (
                 self.telegram_discovery if source == "telegram" else self.rss_discovery
             )
             try:
-                found = await asyncio.to_thread(discover)
+                found = await _run_with_deadline(discover, deadline=deadline)
+                if not isinstance(found, list):
+                    raise TypeError("discovery source returned an invalid result")
+            except DiscoveryTimeLimitExceeded:
+                return source, [], {"source": source, "code": "source_timeout"}
             except Exception:
-                errors.append({"source": source, "code": "source_unavailable"})
-                continue
-            buckets.append(
-                (
-                    source,
-                    [
-                        item
-                        for item in found
-                        if isinstance(item, Mapping)
-                        and _matches_search_terms(item, search_terms)
-                    ],
-                )
+                return source, [], {"source": source, "code": "source_unavailable"}
+            return (
+                source,
+                [
+                    item
+                    for item in found
+                    if isinstance(item, Mapping)
+                    and _matches_search_terms(item, search_terms)
+                ],
+                None,
             )
+
+        results = await asyncio.gather(*(collect(source) for source in sources))
+        for source, found, error in results:
+            if error is not None:
+                errors.append(error)
+            else:
+                buckets.append((source, found))
 
         # A busy Telegram catalog must not starve RSS (or vice versa).  Merge one
         # result per source per round, deduplicating before applying the global cap.
@@ -216,6 +273,7 @@ class DiscoveryJobHandler:
         keywords = payload.get("keywords")
         location = payload.get("location", "India")
         limit = _bounded_int(payload.get("limit"), 20, 25)
+        timeout_seconds = _bounded_timeout(payload.get("timeout_seconds"))
         remote = payload.get("remote", False)
         if (
             not isinstance(keywords, str)
@@ -225,14 +283,17 @@ class DiscoveryJobHandler:
             or not isinstance(remote, bool)
         ):
             raise ValueError("LinkedIn discovery payload is invalid")
-        result = await asyncio.to_thread(
+        result = await _run_with_deadline(
             self.linkedin_discovery,
             keywords.strip(),
             location=location.strip() or "India",
             remote=remote,
             limit=limit,
             max_pages=2,
+            deadline=asyncio.get_running_loop().time() + timeout_seconds,
         )
+        if not isinstance(result, list):
+            raise TypeError("LinkedIn discovery returned an invalid result")
         return [item for item in result if isinstance(item, Mapping)][:limit]
 
     async def _public_ats(
@@ -246,6 +307,7 @@ class DiscoveryJobHandler:
         ):
             raise ValueError("public ATS board payload is invalid")
         limit = _bounded_int(payload.get("limit"), 100, _MAX_BATCH)
+        timeout_seconds = _bounded_timeout(payload.get("timeout_seconds"))
 
         # Re-canonicalize the persisted payload before any request.  This keeps the
         # worker safe even if a queue row was created outside the HTTP API.
@@ -259,19 +321,38 @@ class DiscoveryJobHandler:
         buckets: list[tuple[str, list[Mapping[str, Any]]]] = []
         errors: list[dict[str, str]] = []
         per_board_limit = min(limit, 100)
-        for provider, board_url in boards:
+
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+
+        async def collect(
+            provider: str, board_url: str
+        ) -> tuple[str, str, list[Mapping[str, Any]], dict[str, str] | None]:
             try:
-                found = await asyncio.to_thread(
+                found = await _run_with_deadline(
                     self.public_ats_discovery,
                     board_url,
                     limit=per_board_limit,
+                    deadline=deadline,
                 )
+                if not isinstance(found, list):
+                    raise TypeError("public ATS source returned an invalid result")
+            except DiscoveryTimeLimitExceeded:
+                return provider, board_url, [], {"source": provider, "code": "source_timeout"}
             except Exception:
-                errors.append({"source": provider, "code": "source_unavailable"})
-                continue
-            buckets.append(
-                (provider, [item for item in found if isinstance(item, Mapping)])
+                return provider, board_url, [], {"source": provider, "code": "source_unavailable"}
+            return (
+                provider,
+                board_url,
+                [item for item in found if isinstance(item, Mapping)],
+                None,
             )
+
+        results = await asyncio.gather(*(collect(provider, url) for provider, url in boards))
+        for provider, _board_url, found, error in results:
+            if error is not None:
+                errors.append(error)
+            else:
+                buckets.append((provider, found))
 
         # Interleave boards so a large employer cannot consume the whole tenant run.
         jobs: list[Mapping[str, Any]] = []
@@ -315,6 +396,13 @@ class DiscoveryJobHandler:
                 status="needs_attention",
                 code="discovery_payload_invalid",
                 message="Review the bounded discovery search settings and try again.",
+                provider=job.provider,
+            )
+        except DiscoveryTimeLimitExceeded:
+            return HandlerOutcome(
+                status="needs_attention",
+                code="discovery_time_limit",
+                message="The public discovery source reached the selected time limit.",
                 provider=job.provider,
             )
         except Exception:

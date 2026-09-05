@@ -147,8 +147,8 @@ def test_resume_guided_discovery_derives_and_queues_a_bounded_private_plan(
         json={
             "location": "Hyderabad",
             "remote_only": True,
-            "linkedin_limit": 25,
-            "feed_limit": 120,
+            "max_jobs": 10,
+            "timeout_seconds": 30,
             "idempotency_key": "resume-bundle-0001",
         },
     )
@@ -205,7 +205,8 @@ def test_resume_guided_discovery_derives_and_queues_a_bounded_private_plan(
                     "keywords": "Backend Engineer",
                     "location": "Hyderabad",
                     "remote": True,
-                    "limit": 25,
+                    "limit": 5,
+                    "timeout_seconds": 30,
                 },
                 "idempotency_key_input": "resume-bundle-0001:linkedin",
             },
@@ -218,8 +219,9 @@ def test_resume_guided_discovery_derives_and_queues_a_bounded_private_plan(
                 "application_id_input": None,
                 "payload_input": {
                     "source_ids": ["telegram", "rss"],
-                    "limit": 120,
+                    "limit": 5,
                     "search_terms": data["plan"]["search_terms"],
+                    "timeout_seconds": 30,
                 },
                 "idempotency_key_input": "resume-bundle-0001:feeds",
             },

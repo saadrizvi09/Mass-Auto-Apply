@@ -102,7 +102,7 @@ class ProviderCredentialUpsert(StrictModel):
     """One tenant-owned provider credential accepted by the control plane.
 
     The route selects the provider from the URL.  ``project_id`` is required only
-    for Browserbase; Groq and Hunter reject it.  Secret fields are deliberately
+    for Browserbase; Groq rejects it.  Secret fields are deliberately
     omitted from model representations and validation errors are rendered by the
     application's non-reflecting validation handler.
     """
@@ -191,7 +191,7 @@ class ProfileUpdate(StrictModel):
 
 
 class UserSettingsUpdate(StrictModel):
-    daily_send_cap: int | None = Field(default=None, ge=0, le=25)
+    daily_send_cap: int | None = Field(default=None, ge=0, le=150)
     duplicate_window_days: int | None = Field(default=None, ge=1, le=90)
     require_review: bool | None = None
     timezone: str | None = Field(default=None, min_length=1, max_length=80)
@@ -322,6 +322,31 @@ class SendApplicationRequest(StrictModel):
     attach_resume: bool = True
 
 
+class SendApplicationBatchRequest(StrictModel):
+    """Queue a small, explicitly selected batch for the persistent Gmail worker."""
+
+    application_ids: list[UUID] = Field(min_length=1, max_length=30)
+    attach_resume: bool = True
+    idempotency_key: str = Field(
+        min_length=8, max_length=160, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$"
+    )
+
+    @field_validator("application_ids")
+    @classmethod
+    def unique_application_ids(cls, value: list[UUID]) -> list[UUID]:
+        if len(set(value)) != len(value):
+            raise ValueError("Choose each application only once")
+        return value
+
+
+class OutreachResearchPromptRequest(StrictModel):
+    """Optional overrides for the copy/paste external research brief."""
+
+    target_role: str | None = Field(default=None, max_length=160)
+    location: str | None = Field(default=None, max_length=160)
+    remote_only: bool = False
+
+
 class ApproveApplicationRequest(StrictModel):
     """Approve exactly the content revision the browser displayed to the user."""
 
@@ -339,6 +364,11 @@ class ResumeGuidedDiscoveryRequest(StrictModel):
     remote_only: bool = False
     linkedin_limit: int = Field(default=20, ge=1, le=25)
     feed_limit: int = Field(default=60, ge=1, le=200)
+    # These are intentionally optional for backwards compatibility with older
+    # clients. The deployed UI sends them explicitly so one run has a clear
+    # result budget and worker deadline.
+    max_jobs: int | None = Field(default=None, ge=2, le=50)
+    timeout_seconds: int | None = Field(default=None, ge=15, le=120)
     idempotency_key: str = Field(
         min_length=8, max_length=180, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$"
     )
@@ -347,6 +377,7 @@ class ResumeGuidedDiscoveryRequest(StrictModel):
 class PublicFeedDiscoveryRequest(StrictModel):
     source_ids: list[str] = Field(default_factory=list, max_length=30)
     limit: int = Field(default=60, ge=1, le=200)
+    timeout_seconds: int | None = Field(default=None, ge=15, le=120)
     idempotency_key: str = Field(
         min_length=8, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$"
     )
@@ -365,6 +396,7 @@ class LinkedInDiscoveryRequest(StrictModel):
     location: str | None = Field(default=None, max_length=120)
     remote_only: bool = False
     limit: int = Field(default=20, ge=1, le=25)
+    timeout_seconds: int | None = Field(default=None, ge=15, le=120)
     idempotency_key: str = Field(
         min_length=8, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$"
     )
@@ -389,6 +421,7 @@ class PublicAtsDiscoveryRequest(StrictModel):
 class PublicAtsBoardDiscoveryRequest(StrictModel):
     urls: list[str] = Field(min_length=1, max_length=8)
     limit: int = Field(default=100, ge=1, le=200)
+    timeout_seconds: int | None = Field(default=None, ge=15, le=120)
     idempotency_key: str = Field(
         min_length=8, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$"
     )

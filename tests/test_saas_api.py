@@ -2985,27 +2985,8 @@ def test_google_callback_and_refresh_use_the_bound_user_client(
             "user_google_oauth_clients": [custom_row],
         },
         rpc_results={
-            "reserve_application_send": [{"outcome": "pending_provider"}],
-            "finalize_application_send": [{"outcome": "sent"}],
+            "enqueue_email_send": [{"id": str(uuid4()), "kind": "send_email", "status": "queued"}],
         },
-    )
-    refresh_args: list[tuple[str, str, str]] = []
-    sent_tokens: list[str] = []
-
-    def refresh(token: str, selected_id: str, selected_secret: str) -> dict[str, Any]:
-        refresh_args.append((token, selected_id, selected_secret))
-        return {
-            "access_token": "fresh-access",
-            "refresh_token": token,
-            "expires_in": 3600,
-        }
-
-    monkeypatch.setattr(saas_main, "refresh_google_access_token", refresh)
-    monkeypatch.setattr(
-        saas_main,
-        "send_gmail_message",
-        lambda token, *_args, **_kwargs: sent_tokens.append(token)
-        or {"id": "message-id", "thread_id": "thread-id"},
     )
     send_response = TestClient(
         create_app(settings=settings, auth=FakeAuth(), store=send_store)
@@ -3013,9 +2994,8 @@ def test_google_callback_and_refresh_use_the_bound_user_client(
         f"/api/v1/applications/{application_id}/send",
         json={"idempotency_key": "send-request-123", "attach_resume": False},
     )
-    assert send_response.status_code == 200, send_response.text
-    assert refresh_args == [("refresh-token", client_id, client_secret)]
-    assert sent_tokens == ["fresh-access"]
+    assert send_response.status_code == 202, send_response.text
+    assert any(name == "enqueue_email_send" for name, _params in send_store.rpc_calls)
 
 
 def test_google_disconnect_uses_retryable_lifecycle_before_revocation(
@@ -3133,34 +3113,29 @@ def test_browserbase_byok_is_validated_without_a_session_and_encrypted_at_rest(
     }
 
 
-def test_stored_groq_and_hunter_keys_are_used_when_legacy_headers_are_absent(
+def test_stored_groq_key_is_used_when_legacy_headers_are_absent(
     monkeypatch: Any,
 ) -> None:
     encryption_key = Fernet.generate_key().decode()
     cipher = TokenCipher(encryption_key)
     groq_key = "gsk_stored_groq_secret"
-    hunter_key = "hunter_stored_secret"
-    rows = []
-    for provider, api_key in (("groq", groq_key), ("hunter", hunter_key)):
-        rows.append(
-            {
-                "user_id": str(USER_ID),
-                "provider": provider,
-                "credential_ciphertext": cipher.encrypt(
-                    json.dumps(
-                        {"api_key": api_key, "provider": provider, "version": 1},
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
-                ),
-                "verification_status": "verified",
-                "verification_code": None,
-                "verified_at": "2026-08-15T12:00:00Z",
-                "generation": 1,
-                "created_at": "2026-08-15T12:00:00Z",
-                "updated_at": "2026-08-15T12:00:00Z",
-            }
-        )
+    rows = [{
+        "user_id": str(USER_ID),
+        "provider": "groq",
+        "credential_ciphertext": cipher.encrypt(
+            json.dumps(
+                {"api_key": groq_key, "provider": "groq", "version": 1},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        ),
+        "verification_status": "verified",
+        "verification_code": None,
+        "verified_at": "2026-08-15T12:00:00Z",
+        "generation": 1,
+        "created_at": "2026-08-15T12:00:00Z",
+        "updated_at": "2026-08-15T12:00:00Z",
+    }]
     store = FakeStore(
         {
             "profiles": [{"user_id": str(USER_ID), "account_status": "active"}],
@@ -3173,24 +3148,15 @@ def test_stored_groq_and_hunter_keys_are_used_when_legacy_headers_are_absent(
         seen.append(("groq", api_key))
         return {"valid": True, "status": "ready"}
 
-    def validate_hunter(api_key: str) -> dict[str, Any]:
-        seen.append(("hunter", api_key))
-        return {"valid": True, "status": "ready"}
-
     monkeypatch.setattr(saas_main, "validate_groq_key", validate_groq)
-    monkeypatch.setattr(saas_main, "validate_hunter_key", validate_hunter)
     client = TestClient(
         create_app(settings=browser_settings(encryption_key), auth=FakeAuth(), store=store)
     )
 
     groq_response = client.post("/api/v1/groq/validate")
-    hunter_response = client.post("/api/v1/hunter/validate")
-
     assert groq_response.status_code == 200, groq_response.text
-    assert hunter_response.status_code == 200, hunter_response.text
-    assert seen == [("groq", groq_key), ("hunter", hunter_key)]
+    assert seen == [("groq", groq_key)]
     assert groq_key not in groq_response.text
-    assert hunter_key not in hunter_response.text
 
 
 def test_saved_groq_key_survives_a_fresh_app_and_client_without_a_header(
@@ -3258,9 +3224,7 @@ def test_saved_groq_key_survives_a_fresh_app_and_client_without_a_header(
     ("provider", "validation_code", "expected_status"),
     [
         ("groq", "groq_invalid_key", 422),
-        ("hunter", "hunter_invalid_key", 422),
         ("groq", "groq_unavailable", 503),
-        ("hunter", "hunter_unavailable", 503),
     ],
 )
 def test_failed_key_replacement_preserves_an_existing_verified_credential(
@@ -3303,9 +3267,6 @@ def test_failed_key_replacement_preserves_an_existing_verified_credential(
     }
     if provider == "groq":
         monkeypatch.setattr(saas_main, "validate_groq_key", lambda *_args: invalid)
-    else:
-        monkeypatch.setattr(saas_main, "validate_hunter_key", lambda *_args: invalid)
-
     response = TestClient(
         create_app(
             settings=browser_settings(encryption_key), auth=FakeAuth(), store=store

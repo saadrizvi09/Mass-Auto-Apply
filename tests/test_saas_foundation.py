@@ -44,6 +44,22 @@ def test_settings_validate_urls_and_never_publish_secrets() -> None:
         Settings.from_env({"OAUTH_STATE_TTL_SECONDS": "30"})
 
 
+def test_vercel_origin_replaces_loopback_oauth_defaults() -> None:
+    settings = Settings.from_env(
+        {
+            "SUPABASE_URL": "https://project.supabase.co",
+            "SUPABASE_PUBLISHABLE_KEY": "public-key",
+            "SITE_URL": "http://127.0.0.1:8000",
+            "GOOGLE_REDIRECT_URI": "http://127.0.0.1:8000/api/v1/oauth/google/callback",
+            "VERCEL_ENV": "production",
+            "VERCEL_PROJECT_PRODUCTION_URL": "app.example.com",
+        }
+    )
+
+    assert settings.site_url == "https://app.example.com"
+    assert settings.google_redirect_uri == "https://app.example.com/api/v1/oauth/google/callback"
+
+
 def test_gmail_readiness_distinguishes_platform_and_user_managed_oauth() -> None:
     key = Fernet.generate_key().decode()
     settings = Settings(

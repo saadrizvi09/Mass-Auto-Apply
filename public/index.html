@@ -13,8 +13,8 @@
       content="default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co; frame-src https://challenges.cloudflare.com; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
     />
     <title>AutoApply Cloud — Your job search, thoughtfully organized</title>
-    <link rel="stylesheet" href="/styles.css?v=20260815.4" />
-    <script type="module" src="/app.js?v=20260815.4"></script>
+    <link rel="stylesheet" href="/styles.css?v=20260905.1" />
+    <script type="module" src="/app.js?v=20260905.1"></script>
   </head>
   <body>
     <a id="skip-link" class="skip-link" href="#public-main">Skip to main content</a>
@@ -447,7 +447,7 @@
           </div>
           <div class="topbar-actions">
             <span id="api-health-badge" class="status-pill status-neutral">Checking service</span>
-            <button class="button button-primary button-small" type="button" data-view-target="jobs">Add a job</button>
+            <button class="button button-primary button-small" type="button" data-view-target="outreach">Build outreach</button>
           </div>
         </header>
 
@@ -725,7 +725,7 @@
                 </section>
 
                 <details class="search-settings">
-                  <summary><span>Search settings</span><small>Optional location and remote filter</small></summary>
+                  <summary><span>Search settings</span><small>Limit results and worker time</small></summary>
                   <div class="form-grid two-columns">
                     <div class="field">
                       <label for="discovery-location">Location</label>
@@ -735,6 +735,25 @@
                       <span class="field-label">Work arrangement</span>
                       <label class="check-row"><input id="discovery-remote-only" name="remote_only" type="checkbox" /><span>Remote-only results</span></label>
                     </div>
+                    <div class="field">
+                      <label for="discovery-max-jobs">Maximum jobs</label>
+                      <select id="discovery-max-jobs" name="max_jobs">
+                        <option value="5">5 total jobs</option>
+                        <option value="10" selected>10 total jobs</option>
+                        <option value="20">20 total jobs</option>
+                        <option value="40">40 total jobs</option>
+                      </select>
+                      <small>Shared across the LinkedIn and feed collectors.</small>
+                    </div>
+                    <div class="field">
+                      <label for="discovery-time-limit">Search time limit</label>
+                      <select id="discovery-time-limit" name="timeout_seconds">
+                        <option value="30">30 seconds</option>
+                        <option value="60" selected>60 seconds</option>
+                        <option value="120">2 minutes</option>
+                      </select>
+                      <small>The worker stops source collection at this limit.</small>
+                    </div>
                   </div>
                 </details>
 
@@ -742,10 +761,10 @@
                 <section id="resume-discovery-progress" class="discovery-run-progress" role="status" aria-live="polite" aria-busy="false" hidden>
                   <div class="discovery-run-progress-heading"><strong id="resume-discovery-progress-title">Searching public sources…</strong><span id="resume-discovery-progress-count">0 of 2</span></div>
                   <div id="resume-discovery-checkpoints" class="discovery-checkpoints" aria-label="Public-source collector checkpoints"></div>
-                  <p id="resume-discovery-progress-detail">LinkedIn, Telegram, and RSS results will appear here automatically.</p>
+                  <p id="resume-discovery-progress-detail">LinkedIn, Telegram, and RSS results will appear here automatically within your selected limit.</p>
                 </section>
                 <p id="resume-discovery-status" class="form-message" role="status" aria-live="polite"></p>
-                <small class="source-safety-note">Uses bounded public pages only: no LinkedIn login, private Telegram groups, or Easy Apply automation.</small>
+                <small class="source-safety-note">Uses bounded public pages only: no LinkedIn login, private Telegram groups, or Easy Apply automation. If the worker is not deployed, the run will stop with a diagnostic instead of loading indefinitely.</small>
               </form>
             </section>
 
@@ -760,18 +779,6 @@
               </summary>
 
               <div class="advanced-intake-grid">
-                <section class="advanced-intake-section" aria-labelledby="job-import-heading">
-                  <div class="panel-heading">
-                    <div><p class="eyebrow">Batch intake</p><h2 id="job-import-heading">Import jobs from CSV or Excel</h2></div>
-                    <span class="status-pill status-neutral">4 MB · 200 rows</span>
-                  </div>
-                  <form id="job-import-form" class="mini-upload-zone">
-                    <input id="job-import-file" class="file-input" type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required />
-                    <label for="job-import-file"><span class="upload-icon" aria-hidden="true">⇧</span><strong>Choose a CSV or XLSX</strong><small id="job-import-file-label">Title and company are required; common header names are accepted.</small></label>
-                    <button class="button button-primary button-small" type="submit">Import job list</button>
-                  </form>
-                </section>
-
                 <section class="advanced-intake-section" aria-labelledby="ats-link-heading">
                   <div class="panel-heading">
                     <div><p class="eyebrow">Application finder</p><h2 id="ats-link-heading">Save supported application links</h2></div>
@@ -986,53 +993,64 @@
             </button>
           </nav>
 
-          <section class="panel mass-email-key-panel" aria-labelledby="hunter-access-heading">
-            <div class="mass-email-key-intro">
-              <span class="hunter-access-stamp" aria-hidden="true">H</span>
+          <section class="panel mass-email-contact-panel public-contact-panel" aria-labelledby="public-contact-heading">
+            <div class="mass-email-contact-intro">
+              <span class="public-contact-stamp" aria-hidden="true">@</span>
               <div>
-                <p class="eyebrow">Account credential · Contact finder</p>
-                <h2 id="hunter-access-heading">Add or replace your Hunter key</h2>
-                <p>Your encrypted Hunter credential is shared across your signed-in devices and used only for validation or a contact search you start.</p>
+                <p class="eyebrow">Credential-free contact leads</p>
+                <h2 id="public-contact-heading">Use public contacts already in your job records</h2>
+                <p>AutoApply extracts addresses from public listings, referral text, imports, or a job’s saved contact field. It does not guess private addresses, probe mailboxes, or send verification mail.</p>
               </div>
-              <span id="hunter-key-status" class="status-pill status-neutral" role="status" aria-live="polite">Checking</span>
+              <span class="status-pill status-success" role="status">No contact API key required</span>
             </div>
-            <div class="hunter-setup-form hunter-setup-top">
-              <div id="hunter-saved-summary" class="secret-summary" hidden>
-                <span aria-hidden="true">●●●●</span><code id="hunter-masked-key"></code>
+            <p class="form-intro">If a role has no public address, leave it unselected or add the public address to the source workbook before importing again. Every candidate stays unverified until you review the draft and approve the final Gmail send.</p>
+          </section>
+
+          <section class="panel outreach-research-intake" aria-labelledby="outreach-research-heading">
+            <div class="panel-heading panel-heading-wrap">
+              <div><p class="eyebrow">External research handoff</p><h2 id="outreach-research-heading">Find hiring contacts with your preferred AI</h2></div>
+              <span class="status-pill status-info">Public sources only</span>
+            </div>
+            <p class="form-intro">Generate one evidence-first prompt, paste it into Claude, ChatGPT, or Gemini with web access, download the requested XLSX, then upload it here. The workbook's job description, source URL, and public email stay attached to each opportunity.</p>
+            <form id="outreach-research-form" class="research-prompt-controls">
+              <div class="form-grid three-columns">
+                <div class="field"><label for="outreach-target-role">Target role <span class="optional-label">optional</span></label><input id="outreach-target-role" maxlength="160" placeholder="Backend or AI engineer" /></div>
+                <div class="field"><label for="outreach-target-location">Location <span class="optional-label">optional</span></label><input id="outreach-target-location" maxlength="160" placeholder="India or Remote" /></div>
+                <label class="check-row research-remote-check"><input id="outreach-remote-only" type="checkbox" /><span>Remote roles only</span></label>
               </div>
-              <form id="hunter-setup-form" class="stack-form" data-provider-credential="hunter" autocomplete="off">
-                <div class="field">
-                  <label for="hunter-api-key">Hunter API key</label>
-                  <input id="hunter-api-key" name="api_key" type="password" maxlength="512" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="Paste a new or replacement Hunter key" required />
-                </div>
-                <div class="hunter-key-actions">
-                  <button id="hunter-validate" class="button button-primary button-small" type="submit">Save &amp; validate</button>
-                  <button id="hunter-delete" class="button button-danger-quiet button-small" type="button">Delete saved key</button>
-                  <button id="manage-hunter-credential" class="button button-ghost button-small" type="button">Open credential vault</button>
-                  <a class="button button-ghost button-small" href="https://hunter.io/api-keys" target="_blank" rel="noopener noreferrer">Get a Hunter key <span aria-hidden="true">↗</span></a>
-                </div>
-              </form>
-              <div class="hunter-quota-row"><span>Hunter search allowance</span><strong id="hunter-quota" aria-live="polite">Checking account credential</strong></div>
-              <p id="hunter-key-message" class="form-message hunter-key-message" role="status" aria-live="polite"></p>
+              <div class="button-row">
+                <button id="outreach-generate-prompt" class="button button-primary button-small" type="submit">Generate research prompt</button>
+                <button id="outreach-download-template" class="button button-ghost button-small" type="button">Download Excel columns</button>
+              </div>
+            </form>
+            <div id="outreach-prompt-output" class="research-prompt-output" hidden>
+              <div class="panel-heading panel-heading-wrap"><div><strong>Copy this prompt into Claude, ChatGPT, or Gemini</strong><small id="outreach-prompt-summary"></small></div><button id="outreach-copy-prompt" class="button button-ghost button-small" type="button">Copy prompt</button></div>
+              <textarea id="outreach-research-prompt" rows="12" readonly aria-label="External AI research prompt"></textarea>
             </div>
+            <form id="outreach-import-form" class="mini-upload-zone outreach-import-zone">
+              <input id="outreach-import-file" class="file-input" type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required />
+              <label for="outreach-import-file"><span class="upload-icon" aria-hidden="true">⇧</span><strong>Upload the completed CSV or XLSX</strong><small id="outreach-import-file-label">Required: company, role, JD, email, and source URL when available.</small></label>
+              <button id="outreach-import-submit" class="button button-primary button-small" type="submit">Import into outreach</button>
+            </form>
+            <p id="outreach-research-status" class="form-message" role="status" aria-live="polite"></p>
           </section>
 
           <section class="outreach-hero" aria-labelledby="outreach-hero-heading">
             <div>
               <p class="eyebrow">Review-gated mass cold email</p>
               <h2 id="outreach-hero-heading">Find the right contact. Draft carefully. Send after review.</h2>
-              <p>Select up to 10 saved jobs, find public professional contacts with Hunter, create grounded drafts with Groq, then review every message before Gmail can send it.</p>
+            <p>Select up to 30 imported roles in the order you want to process them, review public contact leads, create grounded drafts with Groq, then approve messages for the persistent Gmail queue.</p>
             </div>
             <ol class="outreach-route" aria-label="Mass cold email workflow stages">
               <li><span>1</span><strong>Relevant jobs</strong></li>
-              <li><span>2</span><strong>Hunter contacts</strong></li>
+              <li><span>2</span><strong>Public contacts</strong></li>
               <li><span>3</span><strong>Groq drafts</strong></li>
               <li><span>4</span><strong>Gmail send</strong></li>
             </ol>
           </section>
 
           <div id="outreach-prerequisites" class="notice outreach-prerequisites" role="status" aria-live="polite">
-            Checking your profile, active résumé, Groq key, Hunter key, and Gmail connection…
+            Checking your profile, active résumé, Groq key, and Gmail connection…
           </div>
 
           <div class="outreach-workflow">
@@ -1041,9 +1059,9 @@
               <div class="outreach-stage-content">
                 <div class="panel-heading panel-heading-wrap">
                   <div><p class="eyebrow">Choose deliberately</p><h2 id="outreach-stage-jobs-heading">Select relevant jobs</h2></div>
-                  <span id="outreach-selection-count" class="status-pill status-neutral" role="status" aria-live="polite">0 of 10 selected</span>
+                  <span id="outreach-selection-count" class="status-pill status-neutral" role="status" aria-live="polite">0 of 30 selected</span>
                 </div>
-                <p id="outreach-selection-note" class="form-intro">Choose no more than 10 roles whose requirements genuinely match your résumé. Mass Cold Email never applies or sends on selection.</p>
+                <p id="outreach-selection-note" class="form-intro">Select up to 30 roles. Selection order is preserved for drafting and queueing; nothing is sent until you approve each message.</p>
                 <div id="outreach-job-list" class="outreach-choice-list">
                   <div class="empty-state compact-empty-state">
                     <span class="empty-state-icon" aria-hidden="true">◇</span>
@@ -1058,20 +1076,20 @@
               <span class="outreach-stage-number" aria-hidden="true">2</span>
               <div class="outreach-stage-content">
                 <div class="panel-heading panel-heading-wrap">
-                  <div><p class="eyebrow">Public contact discovery</p><h2 id="outreach-stage-contacts-heading">Find recruiter emails with Hunter</h2></div>
+                  <div><p class="eyebrow">Public contact discovery</p><h2 id="outreach-stage-contacts-heading">Find public contact emails</h2></div>
                 </div>
-                <p class="form-intro">Search every selected company for public HR and recruiting contacts. A saved key is validated automatically when you start; each company may use one Hunter search credit. Contacts remain leads for review, not proof of a personal relationship.</p>
+                <p class="form-intro">Review addresses already present in each selected job's public listing or imported workbook. No mailbox is contacted; candidates are syntax-checked leads, not proof of a current address or personal relationship.</p>
 
                 <div class="outreach-stage-actions">
                   <button id="outreach-find-contacts" class="button button-primary" type="button" aria-describedby="outreach-selection-note">Find contacts for selected jobs</button>
-                  <span id="outreach-credit-estimate" class="outreach-credit-estimate" role="status">Select jobs to see the Hunter credit estimate.</span>
+                  <span id="outreach-credit-estimate" class="outreach-credit-estimate" role="status">Select jobs to scan their saved public contact data.</span>
                 </div>
                 <p id="outreach-contact-status" class="form-message" role="status" aria-live="polite"></p>
                 <div id="outreach-contact-results" class="outreach-result-list">
                   <div class="empty-state compact-empty-state">
                     <span class="empty-state-icon" aria-hidden="true">@</span>
                     <strong>No contacts searched yet</strong>
-                    <p>Validated results will show the person, role, company, confidence, and source for review.</p>
+                    <p>Candidate addresses will show their source and unverified status for review.</p>
                   </div>
                 </div>
               </div>
@@ -1147,97 +1165,10 @@
             </div>
           </section>
 
-          <section id="yc-application-desk" class="panel yc-application-desk" aria-labelledby="yc-application-desk-heading">
-            <div class="yc-desk-heading">
-              <div class="yc-desk-title">
-                <span class="yc-provider-mark" aria-hidden="true">Y</span>
-                <div>
-                  <p class="eyebrow">YC startup applications</p>
-                  <h2 id="yc-application-desk-heading">Bring one exact YC job to a reviewed application.</h2>
-                  <p>Sign in to YC inside your isolated browser, save the exact job you chose, then review every captured answer before one approved submission.</p>
-                </div>
-              </div>
-              <span id="yc-connection-status" class="status-pill status-neutral" role="status" aria-live="polite">Checking YC</span>
-            </div>
-
-            <ol class="yc-application-route" aria-label="YC application workflow">
-              <li id="yc-route-connect"><span>01</span><strong>Connect YC</strong><small>Your account + MFA</small></li>
-              <li id="yc-route-save"><span>02</span><strong>Save exact job</strong><small>No bulk scraping</small></li>
-              <li id="yc-route-review"><span>03</span><strong>Review answers</strong><small>Résumé-grounded</small></li>
-              <li id="yc-route-submit"><span>04</span><strong>Submit once</strong><small>Your approval</small></li>
-            </ol>
-
-            <div class="yc-desk-grid">
-              <aside class="yc-connection-card" aria-labelledby="yc-connection-heading">
-                <p class="eyebrow">Isolated account</p>
-                <h3 id="yc-connection-heading">YC login lives in your Browserbase context.</h3>
-                <p id="yc-connection-detail">Checking your YC and Browserbase setup…</p>
-                <div class="button-row">
-                  <button id="yc-connect" class="button button-primary button-small" type="button">Connect YC</button>
-                  <button id="yc-complete-login" class="button button-accent button-small" type="button" hidden>I completed login</button>
-                  <button id="yc-open-connections" class="button button-ghost button-small" type="button">Open Connections</button>
-                </div>
-              </aside>
-
-              <form id="yc-job-form" class="yc-job-form stack-form" autocomplete="off" novalidate>
-                <div class="yc-job-form-heading">
-                  <div><p class="eyebrow">Exact job intake</p><h3>Save and prepare a YC role</h3></div>
-                  <span class="status-pill status-info">Exact job only</span>
-                </div>
-                <div class="field">
-                  <label for="yc-job-url">Exact YC job URL</label>
-                  <input id="yc-job-url" name="apply_url" type="url" inputmode="url" maxlength="2048" required placeholder="https://www.ycombinator.com/companies/company/jobs/job-id-role" />
-                  <small>Use one individual <code>ycombinator.com/companies/…/jobs/…</code> page. Search, company, account, generic application, and legacy Work at a Startup URLs are rejected.</small>
-                </div>
-                <div class="form-grid two-columns">
-                  <div class="field"><label for="yc-job-title">Role title</label><input id="yc-job-title" name="title" maxlength="240" required placeholder="Software Engineer" /></div>
-                  <div class="field"><label for="yc-job-company">Startup</label><input id="yc-job-company" name="company" maxlength="240" required placeholder="Company name" /></div>
-                </div>
-                <div class="field"><label for="yc-job-location">Location <span class="optional-label">optional</span></label><input id="yc-job-location" name="location" maxlength="240" placeholder="Remote or city" /></div>
-                <div class="field">
-                  <label for="yc-job-description">Job description</label>
-                  <textarea id="yc-job-description" name="description" rows="6" minlength="20" maxlength="25000" required placeholder="Paste the role description so fit scoring and answers stay grounded in the real job."></textarea>
-                </div>
-                <button id="yc-save-and-prepare" class="button button-primary" type="submit">Save &amp; prepare application</button>
-                <p id="yc-job-status" class="form-message" role="status" aria-live="polite"></p>
-              </form>
-            </div>
-
-            <details class="yc-preferences-disclosure">
-              <summary><span><strong>Exact-job intake defaults</strong><small>Prefill blank role and location fields without fetching YC pages</small></span><span aria-hidden="true">+</span></summary>
-              <form id="yc-preferences-form" class="yc-preferences-form" autocomplete="off">
-                <div class="field"><label for="yc-preference-query">Default role title</label><input id="yc-preference-query" name="query" maxlength="120" placeholder="AI Engineer" /></div>
-                <label class="check-row"><input id="yc-preference-remote" name="remote_only" type="checkbox" /><span>Prefill blank locations as Remote</span></label>
-                <button class="button button-ghost button-small" type="submit">Save intake defaults</button>
-                <p id="yc-preferences-status" class="form-message" role="status" aria-live="polite"></p>
-              </form>
-              <p class="yc-preferences-note">These defaults only help complete the exact-job form above. They do not search, crawl, scrape, or submit YC applications in bulk.</p>
-            </details>
-          </section>
-
           <div class="content-grid jobs-layout">
-            <form id="job-form" class="panel form-panel job-form-panel">
-              <div class="panel-heading">
-                <div><p class="eyebrow">Manual opportunity</p><h2 id="job-form-title">Add a job</h2></div>
-              </div>
-              <input id="job-edit-id" type="hidden" />
-              <div class="form-grid two-columns">
-                <div class="field"><label for="job-title">Role title</label><input id="job-title" name="title" maxlength="240" required /></div>
-                <div class="field"><label for="job-company">Company</label><input id="job-company" name="company" maxlength="240" required /></div>
-                <div class="field"><label for="job-location">Location</label><input id="job-location" name="location" maxlength="240" /></div>
-                <div class="field"><label for="job-contact">Contact email</label><input id="job-contact" name="contact_email" type="email" maxlength="320" /></div>
-                <div class="field full-width"><label for="job-url">Application or job URL</label><input id="job-url" name="apply_url" type="url" inputmode="url" maxlength="2048" placeholder="https://…" /></div>
-                <div class="field full-width"><label for="job-description">Job description</label><textarea id="job-description" name="description" rows="8" minlength="20" maxlength="25000" required placeholder="Paste the full JD here. External content will be treated as text, never HTML."></textarea></div>
-              </div>
-              <div class="form-actions">
-                <button id="job-submit" class="button button-primary" type="submit">Save job</button>
-                <button id="job-cancel-edit" class="button button-ghost" type="button" hidden>Cancel edit</button>
-              </div>
-            </form>
-
             <section class="panel jobs-library-panel" aria-labelledby="job-list-heading">
               <div class="panel-heading panel-heading-wrap">
-                <div><p class="eyebrow">Opportunity library</p><h2 id="job-list-heading">Saved jobs</h2></div>
+                <div><p class="eyebrow">Opportunity library</p><h2 id="job-list-heading">Imported roles</h2><p class="form-intro">Roles arrive from Find jobs or your reviewed external-AI workbook. Correct the workbook and import it again when source data changes.</p></div>
                 <div class="list-tools">
                   <label class="search-field"><span class="sr-only">Search jobs</span><input id="job-search" type="search" placeholder="Search company or role" /></label>
                   <select id="job-status-filter" aria-label="Filter jobs by status">
@@ -1394,36 +1325,6 @@
                 </form>
                 <a class="credential-provider-link" href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer">Create a free Groq key <span aria-hidden="true">↗</span></a>
                 <p id="credential-groq-message" class="form-message" role="status"></p>
-              </article>
-
-              <article id="credential-card-hunter" class="credential-card" data-credential-provider="hunter">
-                <div class="credential-card-heading">
-                  <span class="credential-provider-mark is-hunter" aria-hidden="true">H</span>
-                  <div><p class="eyebrow">Contact discovery</p><h3>Hunter</h3></div>
-                  <span id="credential-hunter-status" class="status-pill status-neutral">Not connected</span>
-                </div>
-                <p>Public recruiting and HR contact searches for companies you explicitly select.</p>
-                <div id="credential-hunter-summary" class="credential-summary" hidden>
-                  <code id="credential-hunter-key-hint">••••</code>
-                  <small id="credential-hunter-verified-at">Validated</small>
-                  <small id="credential-hunter-quota">Search allowance available after validation</small>
-                  <div class="button-row">
-                    <button class="button button-ghost button-small" type="button" data-credential-edit="hunter">Replace</button>
-                    <button class="button button-danger-quiet button-small" type="button" data-credential-delete="hunter">Delete</button>
-                  </div>
-                </div>
-                <form id="credential-form-hunter" class="credential-form stack-form" data-provider-credential="hunter" autocomplete="off">
-                  <div class="field">
-                    <label for="credential-hunter-api-key">Hunter API key</label>
-                    <input id="credential-hunter-api-key" name="api_key" type="password" maxlength="512" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="Paste your Hunter key" required />
-                  </div>
-                  <div class="button-row">
-                    <button class="button button-primary button-small" type="submit">Save &amp; validate</button>
-                    <button class="button button-ghost button-small" type="button" data-credential-cancel="hunter" hidden>Cancel</button>
-                  </div>
-                </form>
-                <a class="credential-provider-link" href="https://hunter.io/api-keys" target="_blank" rel="noopener noreferrer">Create a free Hunter key <span aria-hidden="true">↗</span></a>
-                <p id="credential-hunter-message" class="form-message" role="status"></p>
               </article>
 
               <article id="credential-card-browserbase" class="credential-card is-browserbase" data-credential-provider="browserbase">
@@ -1628,7 +1529,7 @@
             <form id="settings-form" class="panel form-panel span-2">
               <div class="panel-heading"><div><p class="eyebrow">Safety controls</p><h2>Workspace settings</h2></div></div>
               <div class="form-grid two-columns">
-                <div class="field"><label for="settings-daily-cap">Daily Gmail send cap</label><input id="settings-daily-cap" name="daily_send_cap" type="number" min="0" max="25" required /></div>
+                <div class="field"><label for="settings-daily-cap">Daily Gmail send cap</label><input id="settings-daily-cap" name="daily_send_cap" type="number" min="0" max="150" required /><small>App safety maximum: 150/day. Gmail may apply a lower account limit.</small></div>
                 <div class="field"><label for="settings-duplicate-days">Duplicate-recipient window</label><div class="input-suffix"><input id="settings-duplicate-days" name="duplicate_window_days" type="number" min="1" max="90" required /><span>days</span></div></div>
                 <div class="field full-width"><label for="settings-timezone">Timezone</label><input id="settings-timezone" name="timezone" maxlength="80" placeholder="Asia/Kolkata" required /></div>
               </div>
@@ -1656,7 +1557,7 @@
                 <p>
                   This removes your profile, résumés, jobs, application history, saved connections,
                   encrypted provider credentials, and account. AutoApply will also remove older
-                  browser-only Groq or Hunter copies for this account and sign you out. This cannot
+                  browser-only Groq copies for this account and sign you out. This cannot
                   be undone.
                 </p>
               </div>

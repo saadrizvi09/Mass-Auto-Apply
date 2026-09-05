@@ -2,7 +2,6 @@ import { createClient } from "/vendor/supabase.js";
 
 const API_PREFIX = "/api/v1";
 const GROQ_STORAGE_PREFIX = "autoapply.groq_api_key.v2";
-const HUNTER_STORAGE_PREFIX = "autoapply.hunter_api_key.v1";
 const DISCOVERY_RUN_STORAGE_PREFIX = "autoapply.discovery_run.v1";
 const GMAIL_REVOCATION_WARNING_PREFIX = "autoapply.gmail_revocation_warning.v1";
 const UI_STORAGE_KEY = "autoapply.ui_preferences.v1";
@@ -10,13 +9,15 @@ const DEFAULT_RESUME_LIMIT = 6_291_456;
 const TURNSTILE_SCRIPT_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
 const TURNSTILE_FLEXIBLE_MIN_WIDTH = 300;
 const DISCOVERY_POLL_INTERVAL_MS = 2_000;
-const DISCOVERY_MONITOR_TIMEOUT_MS = 300_000;
+const DISCOVERY_MONITOR_TIMEOUT_MS = 120_000;
+const DISCOVERY_DEFAULT_TIMEOUT_SECONDS = 60;
+const DISCOVERY_QUEUE_REQUEST_TIMEOUT_MS = 55_000;
 const DISCOVERY_TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled", "needs_attention"]);
 const FORM_WORKFLOW_POLL_INTERVAL_MS = 2_000;
 const FORM_WORKFLOW_MONITOR_TIMEOUT_MS = 300_000;
 const BOOT_STEP_ORDER = ["service", "session", "workspace"];
 const WORKSPACE_OPEN_TIMEOUT_MS = 30_000;
-const PROVIDER_CREDENTIAL_NAMES = ["groq", "hunter", "browserbase"];
+const PROVIDER_CREDENTIAL_NAMES = ["groq", "browserbase"];
 
 const viewCopy = {
   overview: {
@@ -42,7 +43,7 @@ const viewCopy = {
   outreach: {
     kicker: "Step 4 · Reach the right people",
     title: "Mass Cold Email",
-    description: "Add your Hunter key, find recruiter emails, draft with Groq, and send only messages you approve through Gmail.",
+    description: "Review public contact leads, draft with Groq, and send only messages you approve through Gmail.",
   },
   jobs: {
     kicker: "Opportunity workspace",
@@ -88,7 +89,7 @@ const state = {
   googleOauthClient: {},
   googleOauthMode: null,
   googleOauthEditing: false,
-  providerCredentials: { groq: {}, hunter: {}, browserbase: {} },
+  providerCredentials: { groq: {}, browserbase: {} },
   providerCredentialEditing: new Set(),
   providerCredentialMigrationUserId: null,
   publicProviders: [],
@@ -96,12 +97,10 @@ const state = {
   discoverySources: [],
   googleForms: [],
   googleFormsTotal: 0,
-  ycPreferences: { query: "", remote_only: false, limit: 10 },
   resumeDiscoveryPlan: null,
   discoveryRun: null,
   discoveryMonitorPromise: null,
   workflowDockDismissedRunId: null,
-  hunterValidation: null,
   outreachSelectedJobIds: new Set(),
   outreachContacts: {},
   formRevisions: {},
@@ -394,7 +393,7 @@ function clearPrivateState() {
   state.googleOauthClient = {};
   state.googleOauthMode = null;
   state.googleOauthEditing = false;
-  state.providerCredentials = { groq: {}, hunter: {}, browserbase: {} };
+  state.providerCredentials = { groq: {}, browserbase: {} };
   state.providerCredentialEditing = new Set();
   state.providerCredentialMigrationUserId = null;
   // A typed-but-unsaved secret lives in the DOM, not application state. Clear
@@ -409,7 +408,6 @@ function clearPrivateState() {
   state.discoveryRun = null;
   state.discoveryMonitorPromise = null;
   state.workflowDockDismissedRunId = null;
-  state.hunterValidation = null;
   state.outreachSelectedJobIds = new Set();
   state.outreachContacts = {};
   state.formRevisions = {};
@@ -684,28 +682,6 @@ function deleteLegacyGroqKey(userId = state.identityUserId) {
   }
 }
 
-function hunterStorageKey(userId = state.identityUserId) {
-  return typeof userId === "string" && userId ? `${HUNTER_STORAGE_PREFIX}.${userId}` : null;
-}
-
-function getLegacyHunterKey(userId = state.identityUserId) {
-  try {
-    const storageKey = hunterStorageKey(userId);
-    return storageKey ? localStorage.getItem(storageKey) || "" : "";
-  } catch {
-    return "";
-  }
-}
-
-function deleteLegacyHunterKey(userId = state.identityUserId) {
-  try {
-    const storageKey = hunterStorageKey(userId);
-    if (storageKey) localStorage.removeItem(storageKey);
-  } catch {
-    throw new AppError("This browser blocked access to local storage.", "storage_unavailable");
-  }
-}
-
 function discoveryRunStorageKey(userId = state.identityUserId) {
   return typeof userId === "string" && userId ? `${DISCOVERY_RUN_STORAGE_PREFIX}.${userId}` : null;
 }
@@ -717,6 +693,9 @@ function saveDiscoveryRun(run, userId = state.identityUserId) {
     sessionStorage.setItem(storageKey, JSON.stringify({
       job_ids: run.jobIds,
       started_at: run.startedAt,
+      max_jobs: run.maxJobs,
+      timeout_seconds: run.timeoutSeconds,
+      timed_out: run.timedOut === true,
     }));
   } catch {
     // The live page can still monitor the run if session storage is unavailable.
@@ -733,7 +712,19 @@ function loadDiscoveryRun(userId = state.identityUserId) {
       : [];
     const startedAt = Number(parsed?.started_at);
     if (!jobIds.length || !Number.isFinite(startedAt) || startedAt <= 0) return null;
-    return { jobIds, startedAt, jobs: [], monitoring: false };
+    const timeoutSeconds = Number(parsed?.timeout_seconds);
+    const maxJobs = Number(parsed?.max_jobs);
+    return {
+      jobIds,
+      startedAt,
+      maxJobs: Number.isInteger(maxJobs) && maxJobs >= 2 && maxJobs <= 50 ? maxJobs : null,
+      timeoutSeconds: Number.isInteger(timeoutSeconds) && timeoutSeconds >= 15 && timeoutSeconds <= 120
+        ? timeoutSeconds
+        : DISCOVERY_DEFAULT_TIMEOUT_SECONDS,
+      timedOut: parsed?.timed_out === true,
+      jobs: [],
+      monitoring: false,
+    };
   } catch {
     return null;
   }
@@ -1289,7 +1280,6 @@ async function loadWorkspace(identity = identitySnapshot()) {
     loadAutomationJobs(true, identity),
     loadDiscoverySources(true, identity),
     loadGoogleForms(true, identity),
-    loadYcPreferences(true, identity),
   ]);
   if (loadId !== state.workspaceLoadId || !isCurrentIdentity(identity)) return;
   if (state.profile?.account_status === "deleting") {
@@ -1579,7 +1569,7 @@ async function loadSettings(quiet = false, identity = identitySnapshot()) {
 }
 
 function populateSettingsForm() {
-  byId("settings-daily-cap").value = String(state.settings.daily_send_cap ?? 10);
+  byId("settings-daily-cap").value = String(state.settings.daily_send_cap ?? 150);
   byId("settings-duplicate-days").value = String(state.settings.duplicate_window_days ?? 7);
   byId("settings-timezone").value = state.settings.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   byId("settings-review").checked = state.settings.require_review !== false;
@@ -1633,11 +1623,6 @@ async function finishDeletedAccount(identity, form = null) {
   let localKeyRemoved = true;
   try {
     deleteLegacyGroqKey(identity.userId);
-  } catch {
-    localKeyRemoved = false;
-  }
-  try {
-    deleteLegacyHunterKey(identity.userId);
   } catch {
     localKeyRemoved = false;
   }
@@ -2210,7 +2195,7 @@ function discoveryJobIsTerminal(job) {
 }
 
 function discoveryRunIsActive(run = state.discoveryRun) {
-  if (!run || run.finished) return false;
+  if (!run || run.finished || run.timedOut) return false;
   if (!Array.isArray(run.jobs) || !run.jobs.length) return Array.isArray(run.jobIds) && run.jobIds.length > 0;
   return run.jobs.some((job) => !discoveryJobIsTerminal(job));
 }
@@ -2235,6 +2220,7 @@ function recoverDiscoveryRunFromAutomationJobs() {
     jobIds: latest.jobs.map((job) => job.id).slice(0, 2),
     jobs: latest.jobs.slice(0, 2),
     startedAt: latest.startedAt || Date.now(),
+    timeoutSeconds: DISCOVERY_DEFAULT_TIMEOUT_SECONDS,
     monitoring: false,
   };
 }
@@ -2301,8 +2287,8 @@ function renderWorkflowDock(run, jobs, { running, failed } = {}) {
     setText("workflow-dock-title", failed ? "Search closed with a source warning" : "Search complete");
     setText("workflow-dock-detail", failed ? "Successful matches were kept. Open Activity for the source that needs review." : "Fresh jobs and forms are ready to review.");
   } else if (run.timedOut) {
-    setText("workflow-dock-title", "Search continues in the background");
-    setText("workflow-dock-detail", "Open Activity for the latest durable worker status.");
+    setText("workflow-dock-title", "Search time limit reached");
+    setText("workflow-dock-detail", "The bounded worker run has stopped. Open Activity for the source result and worker health details.");
   } else if (running) {
     setText("workflow-dock-title", "Collecting public job matches");
     setText("workflow-dock-detail", "You can keep using AutoApply while each source moves through its checkpoint.");
@@ -2334,6 +2320,8 @@ function renderResumeDiscoveryProgress(run = state.discoveryRun) {
   setAriaBusy(panel, !run.finished && !run.timedOut);
   if (run.finished) {
     setText("resume-discovery-progress-title", failed ? "Search finished with a source warning" : "Search complete");
+  } else if (run.timedOut) {
+    setText("resume-discovery-progress-title", "Search time limit reached");
   } else if (running) {
     setText("resume-discovery-progress-title", "Searching LinkedIn, Telegram, and RSS…");
   } else {
@@ -2342,10 +2330,10 @@ function renderResumeDiscoveryProgress(run = state.discoveryRun) {
   let detail = jobs.length
     ? jobs.map((job) => `${job.kind === "discover_linkedin_guest" ? "LinkedIn" : "Telegram + RSS"}: ${humanize(discoveryJobStatus(job))}`).join(" · ")
     : "Connecting to the background worker…";
-  if (!run.finished && allQueued && elapsed >= 15_000) {
+  if (run.timedOut) {
+    detail = `The worker was given ${run.timeoutSeconds || DISCOVERY_DEFAULT_TIMEOUT_SECONDS} seconds. Waiting stopped and cancellation was requested; any completed matches remain saved. Open Activity for diagnostics.`;
+  } else if (!run.finished && allQueued && elapsed >= 15_000) {
     detail = "Your search is safely queued. You can keep using AutoApply and open Activity for the latest worker status.";
-  } else if (run.timedOut) {
-    detail = "The search is still running in the background. Keep this page open or use Activity for diagnostics.";
   } else if (run.finished) {
     detail = "Fresh jobs and the Form Pilot inbox were refreshed automatically.";
   }
@@ -2372,6 +2360,14 @@ function waitForDiscoveryPoll() {
   return new Promise((resolve) => window.setTimeout(resolve, DISCOVERY_POLL_INTERVAL_MS));
 }
 
+async function requestDiscoveryCancellation(run, identity) {
+  if (!Array.isArray(run?.jobIds) || !run.jobIds.length) return;
+  await Promise.allSettled(run.jobIds.map((jobId) => apiRequest(
+    `/automation-jobs/${encodeURIComponent(jobId)}/cancel`,
+    { method: "POST", identity, retry: false },
+  )));
+}
+
 async function monitorResumeDiscoveryRun(run, identity = identitySnapshot()) {
   if (state.discoveryMonitorPromise) return state.discoveryMonitorPromise;
   state.discoveryRun = run;
@@ -2383,7 +2379,10 @@ async function monitorResumeDiscoveryRun(run, identity = identitySnapshot()) {
   const monitor = (async () => {
     let consecutiveErrors = 0;
     let firstPoll = true;
-    while (firstPoll || Date.now() - run.startedAt < DISCOVERY_MONITOR_TIMEOUT_MS) {
+    const timeoutMs = Number.isFinite(Number(run.timeoutSeconds))
+      ? Math.min(Math.max(Number(run.timeoutSeconds), 15), 120) * 1_000
+      : DISCOVERY_MONITOR_TIMEOUT_MS;
+    while (firstPoll || Date.now() - run.startedAt < timeoutMs) {
       firstPoll = false;
       assertCurrentIdentity(identity);
       try {
@@ -2427,8 +2426,10 @@ async function monitorResumeDiscoveryRun(run, identity = identitySnapshot()) {
     }
     run.timedOut = true;
     run.monitoring = false;
+    saveDiscoveryRun(run, identity.userId);
+    await requestDiscoveryCancellation(run, identity);
     renderResumeDiscoveryProgress(run);
-    showDiscoveryResult("The search is taking longer than usual and is still running in the background. Results will remain safe; Activity is available for diagnostics.", "warning");
+    showDiscoveryResult("The selected search time limit was reached. Waiting stopped and cancellation was requested; completed matches remain safe. Open Activity for diagnostics.", "warning");
     return run.jobs;
   })();
 
@@ -2451,6 +2452,11 @@ function resumeDiscoveryMonitoring(identity = identitySnapshot()) {
   const recovered = stored || recoverDiscoveryRunFromAutomationJobs();
   if (!recovered) return;
   state.discoveryRun = recovered;
+  if (recovered.timedOut) {
+    renderResumeDiscoveryProgress(recovered);
+    renderResumeDiscoveryPlan();
+    return;
+  }
   saveDiscoveryRun(recovered, identity.userId);
   monitorResumeDiscoveryRun(recovered, identity).catch((error) => {
     if (!isIdentityChanged(error)) {
@@ -2508,15 +2514,21 @@ async function submitResumeGuidedDiscovery(event) {
   }
   const identity = identitySnapshot();
   await withBusy(button, "Finding jobs…", async () => {
+    const requestController = new AbortController();
+    const requestTimeout = window.setTimeout(
+      () => requestController.abort(),
+      DISCOVERY_QUEUE_REQUEST_TIMEOUT_MS,
+    );
     try {
       const payload = await apiRequest("/discovery/resume-guided", {
         method: "POST",
         groq: true,
+        signal: requestController.signal,
         body: {
           location: byId("discovery-location")?.value.trim() || null,
           remote_only: Boolean(byId("discovery-remote-only")?.checked),
-          linkedin_limit: 20,
-          feed_limit: 60,
+          max_jobs: Number(byId("discovery-max-jobs")?.value || 10),
+          timeout_seconds: Number(byId("discovery-time-limit")?.value || DISCOVERY_DEFAULT_TIMEOUT_SECONDS),
           idempotency_key: discoveryRunKey("resume-search"),
         },
       });
@@ -2528,6 +2540,8 @@ async function submitResumeGuidedDiscovery(event) {
         jobIds: jobs.map((job) => job.id).slice(0, 2),
         jobs: jobs.slice(0, 2),
         startedAt: Date.now(),
+        maxJobs: Number(byId("discovery-max-jobs")?.value || 10),
+        timeoutSeconds: Number(byId("discovery-time-limit")?.value || DISCOVERY_DEFAULT_TIMEOUT_SECONDS),
         monitoring: false,
       };
       state.discoveryRun = run;
@@ -2536,8 +2550,16 @@ async function submitResumeGuidedDiscovery(event) {
       await monitorResumeDiscoveryRun(run, identity);
     } catch (error) {
       if (isIdentityChanged(error)) return;
+      if (error?.name === "AbortError") {
+        error = new AppError(
+          "The job search setup took too long to respond. Check the worker and Groq connection, then try again.",
+          "discovery_queue_timeout",
+        );
+      }
       setFormMessage("resume-discovery-status", errorMessage(error, "The résumé-guided search could not be queued."), "error");
       showDiscoveryResult(errorMessage(error, "The résumé-guided search could not be queued."), "error");
+    } finally {
+      window.clearTimeout(requestTimeout);
     }
   });
   renderResumeDiscoveryPlan();
@@ -2740,13 +2762,13 @@ async function ingestReferralDigest(event) {
 async function importJobFile(event) {
   event.preventDefault();
   const button = event.submitter;
-  const file = state.pendingJobImportFile || byId("job-import-file").files?.[0];
+  const file = state.pendingJobImportFile || byId("outreach-import-file").files?.[0];
   if (!file) {
-    showDiscoveryResult("Choose a CSV or XLSX file first.", "error");
+    setFormMessage("outreach-research-status", "Choose a CSV or XLSX file first.", "error");
     return;
   }
   if (file.size <= 0 || file.size > 4 * 1024 * 1024) {
-    showDiscoveryResult("The import file must be 4 MB or smaller.", "error");
+    setFormMessage("outreach-research-status", "The import file must be 4 MB or smaller.", "error");
     return;
   }
   await withBusy(button, "Importing…", async () => {
@@ -2755,15 +2777,64 @@ async function importJobFile(event) {
       body.append("file", file, file.name);
       const payload = await apiRequest("/discovery/import", { method: "POST", body });
       const count = importedCount(payload);
-      byId("job-import-form").reset();
+      byId("outreach-import-form").reset();
       state.pendingJobImportFile = null;
-      setText("job-import-file-label", "Title and company are required; common header names are accepted.");
+      setText("outreach-import-file-label", "Required: company, role, JD, email, and source URL when available.");
       await Promise.all([loadJobs(true), loadGoogleForms(true)]);
-      showDiscoveryResult(`${count} spreadsheet row${count === 1 ? "" : "s"} saved after normalization.`, "success");
+      setFormMessage("outreach-research-status", `${count} role${count === 1 ? "" : "s"} imported. Select them below to review contacts and draft emails.`, "success");
     } catch (error) {
-      showDiscoveryResult(errorMessage(error, "The spreadsheet could not be imported."), "error");
+      setFormMessage("outreach-research-status", errorMessage(error, "The spreadsheet could not be imported."), "error");
     }
   });
+}
+
+async function generateOutreachResearchPrompt(event) {
+  event.preventDefault();
+  const button = event.submitter || byId("outreach-generate-prompt");
+  await withBusy(button, "Preparing…", async () => {
+    try {
+      const payload = await apiRequest("/outreach/research-prompt", {
+        method: "POST",
+        body: {
+          target_role: byId("outreach-target-role").value.trim() || null,
+          location: byId("outreach-target-location").value.trim() || null,
+          remote_only: byId("outreach-remote-only").checked,
+        },
+      });
+      const data = unwrapData(payload) || {};
+      byId("outreach-research-prompt").value = data.prompt || "";
+      byId("outreach-prompt-output").hidden = !data.prompt;
+      const years = data.estimated_years_experience;
+      setText("outreach-prompt-summary", `Estimated experience: ${years == null ? "review dated roles" : `${years} years`} · ${Array.isArray(data.target_roles) && data.target_roles.length ? data.target_roles.join(", ") : "resume-derived roles"}`);
+      setFormMessage("outreach-research-status", "Prompt ready. Paste it into an AI tool with web/search access, then upload the completed workbook below.", "success");
+    } catch (error) {
+      setFormMessage("outreach-research-status", errorMessage(error, "The research prompt could not be generated."), "error");
+    }
+  });
+}
+
+async function copyOutreachResearchPrompt(button) {
+  const value = byId("outreach-research-prompt")?.value || "";
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    setFormMessage("outreach-research-status", "Prompt copied to your clipboard.", "success");
+  } catch {
+    byId("outreach-research-prompt").focus();
+    byId("outreach-research-prompt").select();
+    setFormMessage("outreach-research-status", "Select the prompt and copy it manually.", "info");
+  }
+}
+
+function downloadOutreachTemplate() {
+  const columns = ["company", "role", "person_name", "person_title", "email", "linkedin_url", "job_url", "jd", "experience_required", "source_url", "source_date", "contact_source"];
+  const csv = `${columns.join(",")}\n${columns.map(() => "").join(",")}\n`;
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const anchor = createElement("a", { attrs: { href: url, download: "autoapply-outreach-template.csv" } });
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
 }
 
 async function ingestAtsLinks(event) {
@@ -2868,77 +2939,7 @@ async function loadJobs(quiet = false, identity = identitySnapshot(), append = f
   renderOutreach();
   renderOverview();
   renderJobIntelligence();
-  renderYcDesk();
   return state.jobs;
-}
-
-function jobPayloadFromForm() {
-  const nullable = (id) => byId(id).value.trim() || null;
-  const description = byId("job-description").value.trim();
-  if (description.length < 20) throw new AppError("The job description must contain at least 20 characters.", "description_too_short");
-  return {
-    source: "manual",
-    apply_url: nullable("job-url"),
-    title: byId("job-title").value.trim(),
-    company: byId("job-company").value.trim(),
-    location: nullable("job-location"),
-    description,
-    contact_email: nullable("job-contact"),
-    metadata: {},
-  };
-}
-
-async function saveJob(event) {
-  event.preventDefault();
-  const button = event.submitter;
-  await withBusy(button, byId("job-edit-id").value ? "Updating…" : "Saving…", async () => {
-    try {
-      const full = jobPayloadFromForm();
-      const editing = byId("job-edit-id").value;
-      const body = editing
-        ? {
-            apply_url: full.apply_url,
-            title: full.title,
-            company: full.company,
-            location: full.location,
-            description: full.description,
-            contact_email: full.contact_email,
-          }
-        : full;
-      await apiRequest(editing ? `/jobs/${encodeURIComponent(editing)}` : "/jobs", {
-        method: editing ? "PATCH" : "POST",
-        body,
-      });
-      resetJobForm();
-      await loadJobs(true);
-      toast(editing ? "Job updated." : "Job added to your workspace.", "success");
-    } catch (error) {
-      toast(errorMessage(error, "The job could not be saved."), "error");
-    }
-  });
-}
-
-function resetJobForm() {
-  byId("job-form").reset();
-  byId("job-edit-id").value = "";
-  setText("job-form-title", "Add a job");
-  setText("job-submit", "Save job");
-  byId("job-cancel-edit").hidden = true;
-}
-
-function editJob(job) {
-  byId("job-edit-id").value = job.id;
-  byId("job-title").value = job.title || "";
-  byId("job-company").value = job.company || "";
-  byId("job-location").value = job.location || "";
-  byId("job-contact").value = job.contact_email || "";
-  byId("job-url").value = job.apply_url || "";
-  byId("job-description").value = job.description || "";
-  setText("job-form-title", "Edit job");
-  setText("job-submit", "Update job");
-  byId("job-cancel-edit").hidden = false;
-  byId("job-form").scrollIntoView({ behavior: "smooth", block: "start" });
-  byId("job-title").focus();
 }
 
 function filteredJobs() {
@@ -2981,339 +2982,6 @@ function exactYcJobUrl(value) {
   url.search = "";
   url.hash = "";
   return url.href;
-}
-
-function titleCaseSlug(value) {
-  return decodeURIComponent(String(value || ""))
-    .replace(/^[A-Za-z0-9]{5,64}-/, "")
-    .replace(/[-_]+/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase())
-    .trim();
-}
-
-function inferYcJobIdentity(rawUrl) {
-  const exact = exactYcJobUrl(rawUrl);
-  if (!exact) return { url: null, company: "", title: "", externalId: null };
-  const parts = new URL(exact).pathname.split("/").filter(Boolean);
-  const companySlug = parts[0] === "companies" ? parts[1] : "";
-  const jobSlug = parts.at(-1) || "";
-  return {
-    url: exact,
-    company: titleCaseSlug(companySlug),
-    title: titleCaseSlug(jobSlug),
-    externalId: jobSlug.slice(0, 255) || null,
-  };
-}
-
-function ycProvider() {
-  return mergedProviders().find(
-    (provider) => String(provider.id || provider.provider || "").toLowerCase() === "yc",
-  ) || null;
-}
-
-function ycConnectionReady() {
-  const provider = ycProvider();
-  return Boolean(provider && ["connected", "active"].includes(connectionStatus(provider)));
-}
-
-function ycJobForExactUrl(targetUrl, jobs = state.jobs) {
-  if (!targetUrl) return null;
-  return jobs.find((job) => exactYcJobUrl(job?.apply_url) === targetUrl) || null;
-}
-
-async function findSavedYcJob(targetUrl, identity = identitySnapshot()) {
-  const loaded = ycJobForExactUrl(targetUrl);
-  if (loaded) return loaded;
-  let offset = 0;
-  while (offset <= 10_000) {
-    const payload = await apiRequest(`/jobs?limit=50&offset=${offset}`, { identity });
-    const page = unwrapItems(payload, ["jobs"]);
-    const found = ycJobForExactUrl(targetUrl, page);
-    if (found) {
-      if (!state.jobs.some((job) => job.id === found.id)) state.jobs.push(found);
-      return found;
-    }
-    if (page.length < 50) break;
-    offset += page.length;
-  }
-  return null;
-}
-
-function applyYcIntakeDefaults(force = false) {
-  const form = byId("yc-job-form");
-  if (!form || (!force && form.contains(document.activeElement))) return;
-  const preferences = state.ycPreferences && typeof state.ycPreferences === "object"
-    ? state.ycPreferences
-    : { query: "", remote_only: false, limit: 10 };
-  const defaults = [
-    [byId("yc-job-title"), String(preferences.query || "").trim()],
-    [byId("yc-job-location"), preferences.remote_only === true ? "Remote" : ""],
-  ];
-  for (const [field, nextDefault] of defaults) {
-    if (!field) continue;
-    const previousDefault = field.dataset.ycIntakeDefault || "";
-    const currentValue = field.value.trim();
-    if (currentValue && currentValue !== previousDefault) {
-      delete field.dataset.ycIntakeDefault;
-      continue;
-    }
-    if (nextDefault) {
-      field.value = nextDefault;
-      field.dataset.ycIntakeDefault = nextDefault;
-    } else if (!currentValue || currentValue === previousDefault) {
-      field.value = "";
-      delete field.dataset.ycIntakeDefault;
-    }
-  }
-}
-
-function setYcRouteStep(id, { complete = false, current = false, attention = false } = {}) {
-  const step = byId(id);
-  if (!step) return;
-  step.classList.toggle("is-ready", complete);
-  step.classList.toggle("is-current", current);
-  step.classList.toggle("needs-attention", attention);
-  if (current) step.setAttribute("aria-current", "step");
-  else step.removeAttribute("aria-current");
-  const heading = step.querySelector("strong")?.textContent || "YC workflow step";
-  step.setAttribute("aria-label", `${heading}: ${complete ? "complete" : attention ? "needs attention" : current ? "current" : "not started"}`);
-}
-
-function renderYcRouteProgress({ connected = ycConnectionReady(), connectionNeedsAttention = false } = {}) {
-  const ycJobs = state.jobs.filter((job) => Boolean(exactYcJobUrl(job?.apply_url)));
-  const jobIds = new Set(ycJobs.map((job) => job.id));
-  const applications = state.formApplications.filter((application) => jobIds.has(application.job_id));
-  const applicationIds = new Set(applications.map((application) => application.id));
-  const revisions = applications.flatMap((application) => state.formRevisions[application.id] || []);
-  const submissionJobs = state.automationJobs.filter(
-    (job) => job.kind === "application_submit" && applicationIds.has(job.application_id),
-  );
-  const saved = ycJobs.length > 0;
-  const captured = applications.length > 0 || revisions.length > 0;
-  const reviewed = revisions.some(
-    (revision) => Boolean(revision.approved_at) || ["approved", "submitted"].includes(String(revision.status || "").toLowerCase()),
-  ) || applications.some((application) => ["approved", "queued", "sent", "applied"].includes(String(application.status || "").toLowerCase()));
-  const submitted = revisions.some(formRevisionSubmissionIsVerified) || submissionJobs.some(formSubmissionIsVerified);
-  const submissionNeedsAttention = submissionJobs.some(
-    (job) => ["failed", "needs_attention"].includes(String(job.status || "").toLowerCase()),
-  );
-
-  setYcRouteStep("yc-route-connect", {
-    complete: connected,
-    current: !connected,
-    attention: !connected && connectionNeedsAttention,
-  });
-  setYcRouteStep("yc-route-save", {
-    complete: saved,
-    current: connected && !saved,
-  });
-  setYcRouteStep("yc-route-review", {
-    complete: reviewed || submitted,
-    current: connected && saved && !reviewed,
-  });
-  setYcRouteStep("yc-route-submit", {
-    complete: submitted,
-    current: connected && saved && captured && reviewed && !submitted,
-    attention: submissionNeedsAttention && !submitted,
-  });
-}
-
-function renderYcDesk() {
-  if (!byId("yc-application-desk")) return;
-  const provider = ycProvider();
-  const status = provider ? connectionStatus(provider) : "unavailable";
-  const connected = ["connected", "active"].includes(status);
-  const pending = status === "pending";
-  const attention = status === "needs_attention";
-  const browserbaseReady = credentialConfigured("browserbase");
-  const capabilityReady = provider?.available !== false && provider?.can_connect !== false;
-  const pill = byId("yc-connection-status");
-  const connect = byId("yc-connect");
-  const complete = byId("yc-complete-login");
-  renderYcRouteProgress({ connected, connectionNeedsAttention: attention });
-  pill.className = `status-pill ${connected ? "status-success" : pending ? "status-info" : attention ? "status-warning" : "status-neutral"}`;
-  pill.textContent = connected ? "YC connected" : pending ? "Login waiting" : attention ? "YC needs attention" : provider ? "YC not connected" : "YC unavailable";
-  connect.hidden = connected || pending;
-  connect.disabled = !capabilityReady || !browserbaseReady;
-  complete.hidden = !pending;
-  setText(
-    "yc-connection-detail",
-    connected
-      ? "Your isolated YC browser context is ready. Saving this exact job can start its review-gated preparation."
-      : pending
-        ? "Finish YC sign-in and MFA in the opened Live View, then return here and mark login complete."
-        : !provider
-          ? "This deployment has not published YC application support yet."
-          : !browserbaseReady
-            ? "Add your Browserbase key and Project ID in Connections before opening YC login."
-            : attention
-              ? "The saved YC browser context needs a fresh login before another application can be prepared."
-              : "Open YC in your isolated browser. Your YC password is entered only on YC's own page.",
-  );
-
-  const preferences = state.ycPreferences && typeof state.ycPreferences === "object"
-    ? state.ycPreferences
-    : { query: "", remote_only: false, limit: 10 };
-  if (!byId("yc-preferences-form")?.contains(document.activeElement)) {
-    byId("yc-preference-query").value = preferences.query || "";
-    byId("yc-preference-remote").checked = preferences.remote_only === true;
-  }
-  applyYcIntakeDefaults();
-}
-
-async function loadYcPreferences(quiet = false, identity = identitySnapshot()) {
-  try {
-    const payload = await apiRequest("/providers/yc/preferences", { identity });
-    const preferences = unwrapData(payload);
-    state.ycPreferences = preferences && typeof preferences === "object"
-      ? preferences
-      : { query: "", remote_only: false, limit: 10 };
-    renderYcDesk();
-    return state.ycPreferences;
-  } catch (error) {
-    state.ycPreferences = { query: "", remote_only: false, limit: 10 };
-    renderYcDesk();
-    if (!quiet) throw error;
-    return state.ycPreferences;
-  }
-}
-
-async function saveYcPreferences(event) {
-  event.preventDefault();
-  const button = event.submitter;
-  const query = byId("yc-preference-query").value.trim();
-  const remoteOnly = byId("yc-preference-remote").checked;
-  setFormMessage("yc-preferences-status");
-  await withBusy(button, "Saving…", async () => {
-    try {
-      const payload = await apiRequest("/providers/yc/preferences", {
-        method: "PATCH",
-        body: { query: query || null, remote_only: remoteOnly, limit: 10 },
-      });
-      state.ycPreferences = unwrapData(payload) || { query, remote_only: remoteOnly, limit: 10 };
-      renderYcDesk();
-      applyYcIntakeDefaults(true);
-      setFormMessage("yc-preferences-status", "YC intake defaults saved. Blank role and location fields were updated; no YC pages were fetched.", "success");
-    } catch (error) {
-      setFormMessage("yc-preferences-status", errorMessage(error, "YC intake defaults could not be saved."), "error");
-    }
-  });
-}
-
-function inferYcFieldsFromUrl() {
-  const identity = inferYcJobIdentity(byId("yc-job-url").value.trim());
-  if (!identity.url) return;
-  if (!byId("yc-job-company").value.trim() && identity.company) byId("yc-job-company").value = identity.company;
-  const title = byId("yc-job-title");
-  if ((!title.value.trim() || title.value.trim() === title.dataset.ycIntakeDefault) && identity.title) {
-    title.value = identity.title;
-    delete title.dataset.ycIntakeDefault;
-  }
-}
-
-async function saveAndPrepareYcJob(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const button = event.submitter || byId("yc-save-and-prepare");
-  const jobIdentity = inferYcJobIdentity(byId("yc-job-url").value.trim());
-  const title = byId("yc-job-title").value.trim();
-  const company = byId("yc-job-company").value.trim();
-  const location = byId("yc-job-location").value.trim();
-  const description = byId("yc-job-description").value.trim();
-  setFormMessage("yc-job-status");
-  if (!jobIdentity.url) {
-    setFormMessage("yc-job-status", "Paste one exact YC job page—not a YC search, company, account, or application URL.", "error");
-    byId("yc-job-url").focus();
-    return;
-  }
-
-  let savedJob = null;
-  let reusedSavedJob = false;
-  const requestIdentity = identitySnapshot();
-  await withBusy(button, "Checking saved YC jobs…", async () => {
-    try {
-      savedJob = await findSavedYcJob(jobIdentity.url, requestIdentity);
-      if (savedJob?.id) {
-        reusedSavedJob = true;
-        setBusyLabel(button, "Reasserting exact YC target…");
-        const reboundPayload = await apiRequest(`/jobs/${encodeURIComponent(savedJob.id)}`, {
-          method: "PATCH",
-          body: { apply_url: jobIdentity.url },
-        });
-        savedJob = unwrapData(reboundPayload) || savedJob;
-        form.reset();
-        applyYcIntakeDefaults(true);
-        await loadFormApplications(true, requestIdentity);
-        renderJobs();
-        renderYcDesk();
-        setFormMessage("yc-job-status", "This exact YC job is already saved. Its strict target was revalidated and its existing preparation is reopening…", "success");
-        return;
-      }
-      if (!title || !company || description.length < 20) {
-        setFormMessage("yc-job-status", "For a new YC job, add the role, startup, and at least 20 characters of the real job description.", "error");
-        return;
-      }
-      setBusyLabel(button, "Saving YC job…");
-      const payload = await apiRequest("/jobs", {
-        method: "POST",
-        body: {
-          source: "yc_exact",
-          external_id: jobIdentity.externalId,
-          apply_url: jobIdentity.url,
-          title,
-          company,
-          location: location || null,
-          description,
-          contact_email: null,
-          metadata: { application_provider: "yc", intake: "exact_user_saved" },
-        },
-      });
-      savedJob = unwrapData(payload);
-      if (!savedJob?.id) throw new AppError("The YC job was saved without a reviewable identity.", "yc_job_save_incomplete");
-      form.reset();
-      applyYcIntakeDefaults(true);
-      await loadJobs(true, requestIdentity);
-      setFormMessage(
-        "yc-job-status",
-        ycConnectionReady()
-          ? "Exact YC job saved. Opening its application preparation now…"
-          : "Exact YC job saved. Connect YC here, then choose Scan application on the saved job.",
-        "success",
-      );
-    } catch (error) {
-      setFormMessage("yc-job-status", errorMessage(error, "The exact YC job could not be saved."), "error");
-    }
-  });
-  if (!savedJob?.id) return;
-  const existingFormApplication = state.formApplications.find(
-    (application) => application.job_id === savedJob.id && application.channel === "ats",
-  );
-  if (existingFormApplication?.id) {
-    setFormMessage(
-      "yc-job-status",
-      reusedSavedJob
-        ? "Existing YC job and prepared application found. Opening the same review desk—no duplicate was created."
-        : "A prepared application already exists for this YC job. Opening its review desk.",
-      "success",
-    );
-    await openFormApplicationReview(existingFormApplication.id);
-    return;
-  }
-  if (ycConnectionReady() && capabilityForProvider("yc")?.can_scan === true) {
-    await scanJobApplication(savedJob, "yc", button);
-  } else {
-    renderYcDesk();
-    byId("yc-connect")?.focus();
-  }
-}
-
-function openYcConnections() {
-  switchView("connections");
-  window.setTimeout(() => {
-    const card = document.querySelector('[data-provider-card="yc"]');
-    card?.scrollIntoView({ behavior: "smooth", block: "center" });
-    card?.querySelector("button:not(:disabled)")?.focus({ preventScroll: true });
-  }, 250);
 }
 
 function providerForJob(job) {
@@ -3370,7 +3038,7 @@ function renderJobs() {
   clearNode(container);
   const jobs = filteredJobs();
   if (!jobs.length) {
-    container.append(emptyState(state.jobs.length ? "No jobs match this filter" : "No jobs yet", state.jobs.length ? "Try a different search or status." : "Use the form to add your first opportunity.", "◇"));
+    container.append(emptyState(state.jobs.length ? "No roles match this filter" : "No imported roles yet", state.jobs.length ? "Try a different search or status." : "Import a reviewed workbook from Build campaign or run Find jobs.", "◇"));
     return;
   }
   for (const job of jobs) {
@@ -3387,11 +3055,7 @@ function renderJobs() {
     const actions = createElement("div", { className: "card-actions" });
     const aiDraft = createElement("button", { className: "button button-primary button-small", text: "Draft with Groq", type: "button" });
     aiDraft.addEventListener("click", () => draftJob(job, aiDraft));
-    const blankDraft = createElement("button", { className: "button button-ghost button-small", text: "Blank draft", type: "button" });
-    blankDraft.addEventListener("click", () => createBlankApplication(job, blankDraft));
-    const edit = createElement("button", { className: "link-button", text: "Edit", type: "button" });
-    edit.addEventListener("click", () => editJob(job));
-    actions.append(aiDraft, blankDraft);
+    actions.append(aiDraft);
     const applicationProvider = providerForJob(job);
     if (applicationProvider) {
       const capability = capabilityForProvider(applicationProvider);
@@ -3417,7 +3081,6 @@ function renderJobs() {
       }
       actions.append(scan);
     }
-    actions.append(edit);
     if (safeHttpUrl(job.apply_url)) {
       const open = createElement("button", { className: "link-button", text: "Open job ↗", type: "button" });
       open.addEventListener("click", () => openExternal(job.apply_url));
@@ -3458,30 +3121,6 @@ async function draftJob(job, button) {
   });
 }
 
-async function createBlankApplication(job, button) {
-  await withBusy(button, "Creating…", async () => {
-    try {
-      const payload = await apiRequest("/applications", {
-        method: "POST",
-        body: {
-          job_id: job.id,
-          channel: "email",
-          recipient: job.contact_email || null,
-          subject: null,
-          body: null,
-          metadata: {},
-        },
-      });
-      const application = unwrapData(payload);
-      await loadApplications(true);
-      if (application?.id) await openApplicationReview(application.id);
-      toast("Blank draft created for review.", "success");
-    } catch (error) {
-      toast(errorMessage(error, "A blank application could not be created."), "error");
-    }
-  });
-}
-
 function outreachJobScore(job) {
   return job?.fit?.evaluated && Number.isFinite(job.fit.score) ? job.fit.score : -1;
 }
@@ -3493,12 +3132,12 @@ function outreachJobs() {
       const scoreDifference = outreachJobScore(right) - outreachJobScore(left);
       return scoreDifference || new Date(right.created_at || 0) - new Date(left.created_at || 0);
     })
-    .slice(0, 20);
+    .slice(0, 50);
 }
 
 function selectedOutreachJobs() {
   const byJobId = new Map(outreachJobs().map((job) => [job.id, job]));
-  return [...state.outreachSelectedJobIds].map((id) => byJobId.get(id)).filter(Boolean).slice(0, 10);
+  return [...state.outreachSelectedJobIds].map((id) => byJobId.get(id)).filter(Boolean).slice(0, 30);
 }
 
 function applicationForOutreachJob(jobId) {
@@ -3507,32 +3146,9 @@ function applicationForOutreachJob(jobId) {
     .sort((left, right) => new Date(right.updated_at || right.created_at || 0) - new Date(left.updated_at || left.created_at || 0))[0] || null;
 }
 
-function renderHunterState() {
-  const pill = byId("hunter-key-status");
-  const quota = byId("hunter-quota");
-  const deleteButton = byId("hunter-delete");
-  const summary = byId("hunter-saved-summary");
-  if (!pill || !quota || !deleteButton || !summary) return;
-  const credential = providerCredential("hunter");
-  const saved = credential.configured === true;
-  const ready = credentialConfigured("hunter");
-  summary.hidden = !saved;
-  setText("hunter-masked-key", saved ? credentialHint("hunter") : "");
-  pill.className = `status-pill ${ready ? credential.verified_at ? "status-success" : "status-info" : saved ? "status-warning" : "status-neutral"}`;
-  pill.textContent = ready ? credential.verified_at ? "Hunter ready" : "Saved · check pending" : saved ? "Replace required" : "Not connected";
-  deleteButton.disabled = !saved;
-  if (!saved) {
-    quota.textContent = "Add a free Hunter key to search HR and recruiting contacts only when you request it.";
-  } else if (!ready) {
-    quota.textContent = "The saved Hunter credential did not validate. Paste a replacement above.";
-  } else {
-    quota.textContent = `${hunterCredentialQuotaCopy(credential)}.`;
-  }
-}
-
 function toggleOutreachJob(jobId, checked) {
-  if (checked && !state.outreachSelectedJobIds.has(jobId) && state.outreachSelectedJobIds.size >= 10) {
-    toast("Choose at most 10 jobs for one cold-email batch.", "error");
+  if (checked && !state.outreachSelectedJobIds.has(jobId) && state.outreachSelectedJobIds.size >= 30) {
+    toast("Choose at most 30 roles for one outreach batch.", "error");
     renderOutreachJobs();
     return;
   }
@@ -3548,7 +3164,6 @@ function renderOutreachPrerequisites() {
   const checks = [
     [Boolean(activeParsedResume()), "Résumé parsed", "Profile"],
     [credentialConfigured("groq"), "Groq key", "Profile or Connections"],
-    [credentialConfigured("hunter"), "Hunter key", "This page or Connections"],
     [isGmailConnected(), "Gmail connected", "Connections"],
   ];
   for (const [ready, label, location] of checks) {
@@ -3568,9 +3183,9 @@ function renderOutreachJobs() {
   for (const id of [...state.outreachSelectedJobIds]) {
     if (!validIds.has(id)) state.outreachSelectedJobIds.delete(id);
   }
-  setText("outreach-selection-count", `${state.outreachSelectedJobIds.size} / 10 selected`);
+  setText("outreach-selection-count", `${state.outreachSelectedJobIds.size} / 30 selected`);
   if (!candidates.length) {
-    container.append(emptyState("No relevant jobs to contact yet", "Run Find jobs first, or add a job with a company and description.", "1"));
+    container.append(emptyState("No imported roles to contact yet", "Generate a research prompt or import a reviewed workbook first.", "1"));
     return;
   }
   for (const job of candidates) {
@@ -3580,8 +3195,10 @@ function renderOutreachJobs() {
     checkbox.addEventListener("change", () => toggleOutreachJob(job.id, checkbox.checked));
     const score = outreachJobScore(job);
     const application = applicationForOutreachJob(job.id);
+    const order = [...state.outreachSelectedJobIds].indexOf(job.id);
     row.append(
       checkbox,
+      createElement("span", { className: "outreach-selection-order", text: order >= 0 ? String(order + 1).padStart(2, "0") : "·" }),
       createElement("span", { className: "outreach-job-copy" }, [
         createElement("strong", { text: job.title || "Untitled role" }),
         createElement("small", { text: `${job.company}${job.location ? ` · ${job.location}` : ""}` }),
@@ -3605,7 +3222,7 @@ function renderOutreachContacts() {
   clearNode(container);
   const jobs = selectedOutreachJobs();
   if (!jobs.length) {
-    container.append(emptyState("Select jobs first", "Choose the strongest résumé matches before spending any Hunter search credits.", "2"));
+    container.append(emptyState("Select jobs first", "Choose the strongest résumé matches before reviewing their public contact data.", "2"));
     return;
   }
   for (const job of jobs) {
@@ -3614,14 +3231,14 @@ function renderOutreachContacts() {
     const row = createElement("article", { className: "outreach-result-item" });
     const copy = createElement("div", {}, [
       createElement("strong", { text: job.company }),
-      createElement("small", { text: result.error || (contacts.length ? `${contacts.length} recruiting contact${contacts.length === 1 ? "" : "s"} found${result.domain ? ` at ${result.domain}` : ""}.` : job.contact_email ? "Using the saved job contact." : "Search not run yet.") }),
+      createElement("small", { text: result.error || (contacts.length ? `${contacts.length} public contact lead${contacts.length === 1 ? "" : "s"} found${result.domain ? ` at ${result.domain}` : ""}.` : job.contact_email ? "Using the saved job contact." : "Search not run yet.") }),
     ]);
     if (contacts.length) {
       const select = createElement("select", { attrs: { "aria-label": `Recruiter contact for ${job.company}` } });
       select.append(createElement("option", { text: "Choose a contact", attrs: { value: "" } }));
       for (const contact of contacts) {
         const option = createElement("option", {
-          text: `${contact.name || "Recruiting contact"} · ${contact.email}${contact.position ? ` · ${contact.position}` : ""} · ${contact.confidence ?? 0}% confidence`,
+          text: `${contact.name || "Public listing contact"} · ${contact.email}${contact.position ? ` · ${contact.position}` : ""}${contact.verification_status ? ` · ${contact.verification_status.replaceAll("_", " ")}` : ""}`,
           attrs: { value: contact.email },
         });
         option.selected = result.selected === contact.email;
@@ -3645,41 +3262,14 @@ async function findOutreachContacts(button) {
     setFormMessage("outreach-contact-status", "Select at least one relevant job first.", "error");
     return;
   }
-  if (!credentialConfigured("hunter")) {
-    setFormMessage("outreach-contact-status", "Add your Hunter key above or in Connections, then start the search again.", "error");
-    byId("hunter-api-key")?.focus();
-    return;
-  }
-  await withBusy(button, "Checking Hunter key…", async () => {
-    if (state.hunterValidation?.valid !== true) {
-      try {
-        const validation = await apiRequest("/hunter/validate", { method: "POST", hunter: true });
-        state.hunterValidation = validation && typeof validation === "object" ? validation : null;
-        renderHunterState();
-        renderOutreachPrerequisites();
-        if (state.hunterValidation?.valid !== true) {
-          setFormMessage(
-            "outreach-contact-status",
-            state.hunterValidation?.message || "Hunter rejected this key. Replace it above or in Connections.",
-            "error",
-          );
-          return;
-        }
-      } catch (error) {
-        state.hunterValidation = null;
-        renderHunterState();
-        setFormMessage("outreach-contact-status", errorMessage(error, "Hunter could not validate this key."), "error");
-        return;
-      }
-    }
-
+  await withBusy(button, "Reviewing public records…", async () => {
     let found = 0;
     let failed = 0;
     for (let index = 0; index < jobs.length; index += 1) {
       const job = jobs[index];
-      setBusyLabel(button, `Searching ${index + 1} / ${jobs.length}…`);
+      setBusyLabel(button, `Reviewing ${index + 1} / ${jobs.length}…`);
       try {
-        const payload = await apiRequest(`/jobs/${encodeURIComponent(job.id)}/contacts/hunter?limit=5`, { method: "POST", hunter: true });
+        const payload = await apiRequest(`/jobs/${encodeURIComponent(job.id)}/contacts/public`, { method: "POST" });
         const data = unwrapData(payload) || {};
         const contacts = Array.isArray(data.contacts) ? data.contacts : [];
         state.outreachContacts[job.id] = {
@@ -3688,7 +3278,7 @@ async function findOutreachContacts(button) {
           selected: contacts.some((contact) => contact.email === job.contact_email)
             ? job.contact_email
             : null,
-          error: contacts.length ? null : "Hunter found no HR contacts for this company.",
+          error: contacts.length ? null : "No public contact address is present in this imported role.",
         };
         found += contacts.length ? 1 : 0;
       } catch (error) {
@@ -3696,13 +3286,12 @@ async function findOutreachContacts(button) {
         state.outreachContacts[job.id] = {
           contacts: [],
           selected: job.contact_email || null,
-          error: errorMessage(error, "Hunter contact search failed."),
+        error: errorMessage(error, "The public contact record could not be loaded."),
         };
-        if (error?.code === "hunter_quota_exhausted") break;
       }
       renderOutreachContacts();
     }
-    setFormMessage("outreach-contact-status", `${found} compan${found === 1 ? "y has" : "ies have"} a selected recruiting contact${failed ? `; ${failed} search${failed === 1 ? " needs" : "es need"} attention` : ""}.`, failed ? "error" : "success");
+    setFormMessage("outreach-contact-status", `${found} compan${found === 1 ? "y has" : "ies have"} a public contact lead${failed ? `; ${failed} record${failed === 1 ? " needs" : "s need"} attention` : ""}. Review every address before drafting.`, failed ? "error" : "success");
     renderOutreach();
   });
 }
@@ -3776,7 +3365,7 @@ async function sendApprovedOutreach(button) {
   const approved = selectedOutreachJobs()
     .map((job) => ({ job, application: applicationForOutreachJob(job.id) }))
     .filter(({ application }) => application?.status === "approved" && application.recipient)
-    .slice(0, 10);
+    .slice(0, 30);
   if (!approved.length) {
     setFormMessage("outreach-send-status", "Review and approve at least one selected draft first.", "error");
     return;
@@ -3790,37 +3379,37 @@ async function sendApprovedOutreach(button) {
   if (!await confirmAction({
     eyebrow: "Final Gmail handoff",
     title: `Send ${approved.length} approved cold email${approved.length === 1 ? "" : "s"}?`,
-    message: `Gmail will send the individually reviewed messages with your active résumé attached.\nRecipients: ${companies}.`,
-    confirmLabel: `Send ${approved.length} email${approved.length === 1 ? "" : "s"}`,
+    message: `The persistent worker will queue the individually reviewed messages with your active résumé attached.\nRecipients: ${companies}.\nThe app safety cap is 150 Gmail sends per day.`,
+    confirmLabel: `Queue ${approved.length} email${approved.length === 1 ? "" : "s"}`,
     cancelLabel: "Review again",
     tone: "caution",
     ticketLabel: "Approved batch",
     symbol: String(approved.length),
   })) return;
-  await withBusy(button, `Sending 0 / ${approved.length}…`, async () => {
-    let sent = 0;
-    const failures = [];
-    for (let index = 0; index < approved.length; index += 1) {
-      const { job, application } = approved[index];
-      setBusyLabel(button, `Sending ${index + 1} / ${approved.length}…`);
-      try {
-        await apiRequest(`/applications/${encodeURIComponent(application.id)}/send`, {
-          method: "POST",
-          body: {
-            idempotency_key: `outreach-send-${application.id}-${crypto.randomUUID()}`,
-            attach_resume: true,
-          },
-        });
-        sent += 1;
-      } catch (error) {
-        failures.push(`${job.company}: ${errorMessage(error, "send failed")}`);
-        if (["daily_send_cap_reached", "provider_daily_send_cap_reached", "gmail_reauthorization_required"].includes(error?.code)) break;
-      }
+  await withBusy(button, `Queueing 0 / ${approved.length}…`, async () => {
+    let queued = 0;
+    let failures = [];
+    try {
+      setBusyLabel(button, `Queueing ${approved.length} approved…`);
+      const payload = await apiRequest("/applications/send-batch", {
+        method: "POST",
+        body: {
+          application_ids: approved.map(({ application }) => application.id),
+          idempotency_key: `outreach-batch-${crypto.randomUUID()}`,
+          attach_resume: true,
+        },
+      });
+      queued = Number(payload?.count || 0);
+      failures = Array.isArray(payload?.rejected)
+        ? payload.rejected.map((item) => `${item.application_id}: ${item.message || "queue rejected"}`)
+        : [];
+    } catch (error) {
+      failures = [errorMessage(error, "The email batch could not be queued.")];
     }
     await loadApplications(true);
     setFormMessage(
       "outreach-send-status",
-      `${sent} approved message${sent === 1 ? " was" : "s were"} accepted by Gmail${failures.length ? `. ${failures.slice(0, 2).join(" · ")}` : "."}`,
+      `${queued} approved message${queued === 1 ? " was" : "s were"} queued for the persistent Gmail worker${failures.length ? `. ${failures.slice(0, 2).join(" · ")}` : "."}`,
       failures.length ? "error" : "success",
     );
     renderOutreach();
@@ -3830,7 +3419,6 @@ async function sendApprovedOutreach(button) {
 function renderOutreach() {
   if (!byId("outreach-job-list")) return;
   renderOutreachPrerequisites();
-  renderHunterState();
   renderOutreachJobs();
   renderOutreachContacts();
   renderOutreachDrafts();
@@ -3840,29 +3428,17 @@ function renderOutreach() {
   const findButton = byId("outreach-find-contacts");
   const draftButton = byId("outreach-create-drafts");
   const sendButton = byId("outreach-send-approved");
-  const hunterKey = credentialConfigured("hunter");
   setText(
     "outreach-credit-estimate",
     selected.length
-      ? `${selected.length} selected compan${selected.length === 1 ? "y" : "ies"} · up to ${selected.length} Hunter search credit${selected.length === 1 ? "" : "s"}`
-      : "Select jobs to see the Hunter credit estimate.",
+      ? `${selected.length} selected compan${selected.length === 1 ? "y" : "ies"} · no contact API credits used`
+      : "Select jobs to scan their saved public contact data.",
   );
   if (findButton) {
-    findButton.disabled = !selected.length || !hunterKey;
+    findButton.disabled = !selected.length;
     findButton.title = !selected.length
       ? "Select at least one company first."
-      : !hunterKey
-        ? "Add your Hunter API key above or in Connections."
-        : state.hunterValidation?.valid === true
-          ? `Search ${selected.length} selected compan${selected.length === 1 ? "y" : "ies"}.`
-          : "Your saved Hunter key will be validated automatically before this search.";
-  }
-  if (selected.length && hunterKey && state.hunterValidation == null) {
-    setFormMessage("outreach-contact-status", "Ready. Hunter will validate the saved key automatically, then search every selected company.");
-  } else if (selected.length && state.hunterValidation?.valid === false) {
-    setFormMessage("outreach-contact-status", state.hunterValidation.message || "Hunter rejected this key. Replace or validate it above.", "error");
-  } else if (selected.length && !hunterKey) {
-    setFormMessage("outreach-contact-status", "Add your Hunter key above or in Connections to unlock contact search.", "error");
+      : `Review public contact data for ${selected.length} selected compan${selected.length === 1 ? "y" : "ies"}.`;
   }
   if (draftButton) draftButton.disabled = !selected.length || withContacts.length !== selected.length || !credentialConfigured("groq");
   if (sendButton) sendButton.disabled = !approved.length || !isGmailConnected();
@@ -3957,7 +3533,6 @@ async function loadFormApplications(quiet = false, identity = identitySnapshot()
     clearFormApplicationReview();
   }
   renderOverview();
-  renderYcDesk();
   return state.formApplications;
 }
 
@@ -4164,7 +3739,6 @@ function populateFormApplicationReview(application) {
   const pill = byId("form-application-status-pill");
   pill.className = `status-pill ${statusClass(application.status)}`;
   pill.textContent = humanize(application.status || "draft_pending");
-  renderYcDesk();
 }
 
 function clearFormApplicationReview(clearSelection = true) {
@@ -4184,7 +3758,6 @@ function clearFormApplicationReview(clearSelection = true) {
   pill.textContent = "Choose a prepared form";
   renderFormRevision(null);
   setFormMessage("form-revision-message");
-  renderYcDesk();
 }
 
 function populateApplicationEditor(application) {
@@ -4423,7 +3996,6 @@ function rememberAutomationJob(job) {
     const revisionId = job.form_revision_id || job.payload?.form_revision_id || job.result?.form_revision_id;
     if (revisionId) state.formSubmissionJobs.set(revisionId, job);
   }
-  renderYcDesk();
 }
 
 async function monitorFormWorkflowJob(jobId, identity = identitySnapshot(), onUpdate = null) {
@@ -4573,7 +4145,6 @@ async function loadApplicationFormRevisions(
   state.selectedFormRevisionId = latest?.id || null;
   renderFormRevision(latest);
   if (latest && autoSuggest) await maybeSuggestFormAnswers(applicationId, latest);
-  renderYcDesk();
   return state.formRevisions[applicationId];
 }
 
@@ -5524,25 +5095,27 @@ async function sendApplication(button) {
   const attachmentCopy = attachResume ? " with your active résumé attached" : " without a résumé attachment";
   if (!await confirmAction({
     eyebrow: "Approved Gmail message",
-    title: "Send this email?",
-    message: `Gmail will send the exact approved message${attachmentCopy}. Sending cannot be reversed from AutoApply.`,
-    confirmLabel: "Send email",
+    title: "Queue this email?",
+    message: `The persistent worker will send the exact approved message${attachmentCopy}. Sending cannot be reversed from AutoApply.`,
+    confirmLabel: "Queue email",
     cancelLabel: "Review message",
     tone: "caution",
     ticketLabel: "Final send",
     symbol: "@",
   })) return;
-  await withBusy(button, "Sending…", async () => {
+  await withBusy(button, "Queueing…", async () => {
     try {
-      const payload = await apiRequest(`/applications/${encodeURIComponent(id)}/send`, {
+      const payload = await apiRequest("/applications/send-batch", {
         method: "POST",
-        body: { idempotency_key: `send-${id}-${crypto.randomUUID()}`, attach_resume: attachResume },
+        body: { application_ids: [id], idempotency_key: `send-${id}-${crypto.randomUUID()}`, attach_resume: attachResume },
       });
-      const sent = unwrapData(payload);
+      if (!Number(payload?.count)) {
+        throw new AppError(payload?.rejected?.[0]?.message || "The email was not queued.", payload?.rejected?.[0]?.code || "email_queue_rejected");
+      }
       await loadApplications(true);
-      if (sent?.id) selectApplication(sent.id);
-      setFormMessage("application-editor-message", "Gmail accepted the reviewed message.", "success");
-      toast("Message sent once through Gmail.", "success");
+      selectApplication(id);
+      setFormMessage("application-editor-message", "Queued for the persistent Gmail worker. Follow delivery in Activity.", "success");
+      toast("Message queued for Gmail delivery.", "success");
     } catch (error) {
       setFormMessage("application-editor-message", errorMessage(error, "The message could not be sent."), "error");
     }
@@ -5565,7 +5138,6 @@ async function loadConnections(quiet = false, identity = identitySnapshot()) {
   updateApplicationActionState();
   renderOverview();
   renderOutreach();
-  renderYcDesk();
   return state.connections;
 }
 
@@ -5613,7 +5185,6 @@ function replaceProviderCredentialState(provider, payload) {
 
 function removeLegacyProviderKey(provider, userId) {
   if (provider === "groq") deleteLegacyGroqKey(userId);
-  if (provider === "hunter") deleteLegacyHunterKey(userId);
 }
 
 async function migrateLegacyProviderCredentials(identity = identitySnapshot()) {
@@ -5621,7 +5192,6 @@ async function migrateLegacyProviderCredentials(identity = identitySnapshot()) {
   state.providerCredentialMigrationUserId = identity.userId;
   const candidates = [
     ["groq", getLegacyGroqKey(identity.userId)],
-    ["hunter", getLegacyHunterKey(identity.userId)],
   ];
   let imported = 0;
   const failures = [];
@@ -5676,14 +5246,8 @@ async function loadProviderCredentials(quiet = false, identity = identitySnapsho
     provider,
     normalizedProviderCredential(provider, data),
   ]));
-  state.hunterValidation = credentialConfigured("hunter")
-    ? { ...providerCredential("hunter"), valid: true }
-    : null;
   await migrateLegacyProviderCredentials(identity);
   assertCurrentIdentity(identity);
-  state.hunterValidation = credentialConfigured("hunter")
-    ? { ...providerCredential("hunter"), valid: true }
-    : null;
   renderProviderCredentials();
   return state.providerCredentials;
 }
@@ -5696,21 +5260,8 @@ function providerCredentialVerifiedCopy(credential) {
       : "Validated and stored securely";
 }
 
-function hunterCredentialQuotaCopy(credential = providerCredential("hunter")) {
-  const quota = credential.quota && typeof credential.quota === "object" ? credential.quota : credential;
-  const requests = quota.requests && typeof quota.requests === "object" ? quota.requests : {};
-  const bucket = requests.searches || requests.credits || {};
-  const remaining = Number.isFinite(bucket.remaining)
-    ? bucket.remaining
-    : Number.isFinite(quota.remaining)
-      ? quota.remaining
-      : null;
-  const plan = quota.plan_name || credential.plan_name || "Hunter";
-  return `${plan} plan${remaining == null ? " connected" : ` · ${remaining} search credit${remaining === 1 ? "" : "s"} remaining`}${quota.reset_date ? ` · resets ${quota.reset_date}` : ""}`;
-}
-
 function setCredentialMessage(provider, message = "", type = "") {
-  for (const id of [`credential-${provider}-message`, provider === "groq" ? "groq-message" : provider === "hunter" ? "hunter-key-message" : null]) {
+  for (const id of [`credential-${provider}-message`, provider === "groq" ? "groq-message" : null]) {
     if (id && byId(id)) setFormMessage(id, message, type);
   }
 }
@@ -5743,7 +5294,6 @@ function renderProviderCredentials() {
     }
     setText(`credential-${provider}-key-hint`, configured ? credentialHint(provider) : "");
     setText(`credential-${provider}-verified-at`, configured ? providerCredentialVerifiedCopy(credential) : "");
-    if (provider === "hunter") setText("credential-hunter-quota", configured ? hunterCredentialQuotaCopy(credential) : "");
     if (provider === "browserbase") {
       const project = credential.project_name || credential.project_id_hint || "Project connected";
       setText("credential-browserbase-project", project);
@@ -5755,8 +5305,6 @@ function renderProviderCredentials() {
     vaultStatus.textContent = `${configuredCount} of ${PROVIDER_CREDENTIAL_NAMES.length} ready`;
   }
   renderGroqState();
-  renderHunterState();
-  renderYcDesk();
 }
 
 function editProviderCredential(provider, { focus = true } = {}) {
@@ -5802,9 +5350,6 @@ async function saveProviderCredential(event) {
       replaceProviderCredentialState(provider, payload);
       state.providerCredentialEditing.delete(provider);
       form.reset();
-      if (provider === "hunter") {
-        state.hunterValidation = { ...providerCredential("hunter"), valid: true };
-      }
       renderProviderCredentials();
       const credential = providerCredential(provider);
       const verification = payload?.verification && typeof payload.verification === "object" ? payload.verification : {};
@@ -5841,7 +5386,7 @@ async function deleteProviderCredential(provider, trigger = null) {
     cancelLabel: "Keep credential",
     tone: "danger",
     ticketLabel: "Encrypted secret",
-    symbol: provider === "browserbase" ? "B" : provider === "hunter" ? "H" : "AI",
+    symbol: provider === "browserbase" ? "B" : "AI",
   });
   if (!confirmed) return;
   await withBusy(trigger, "Deleting…", async () => {
@@ -5849,10 +5394,6 @@ async function deleteProviderCredential(provider, trigger = null) {
       await apiRequest(`/provider-credentials/${encodeURIComponent(provider)}`, { method: "DELETE" });
       state.providerCredentials = { ...state.providerCredentials, [provider]: {} };
       state.providerCredentialEditing.delete(provider);
-      if (provider === "hunter") {
-        state.hunterValidation = null;
-        state.outreachContacts = {};
-      }
       renderProviderCredentials();
       setCredentialMessage(provider, `${humanize(provider)} was removed from your account.`, "success");
       toast(`${humanize(provider)} credential deleted.`, "success");
@@ -6140,14 +5681,6 @@ function renderConnections() {
         const check = createElement("button", { className: "button button-ghost button-small", text: id === "yc" ? "Check YC session" : "Queue health check", type: "button" });
         check.addEventListener("click", () => queueConnectionCheck(id, check));
         actions.append(check);
-        if (id === "yc") {
-          const use = createElement("button", { className: "button button-primary button-small", text: "Open YC application desk", type: "button" });
-          use.addEventListener("click", () => {
-            switchView("jobs");
-            window.setTimeout(() => byId("yc-application-desk")?.scrollIntoView({ behavior: "smooth", block: "start" }), 200);
-          });
-          actions.append(use);
-        }
       } else if (provider.can_connect === false) {
         const use = createElement("button", { className: "button button-ghost button-small", text: provider.available === false ? "Not enabled" : "No login required", type: "button" });
         use.disabled = provider.available === false;
@@ -6434,7 +5967,6 @@ async function loadAutomationJobs(quiet = false, identity = identitySnapshot()) 
   if (selectedRevision && selectedSubmission) renderFormSubmissionJob(selectedRevision, selectedSubmission);
   const selectedFormApplicationId = byId("form-application-id")?.value || state.selectedFormApplicationId || "";
   if (selectedFormApplicationId && !selectedRevision) renderFormRevision(null);
-  renderYcDesk();
   return state.automationJobs;
 }
 
@@ -6864,15 +6396,6 @@ function bindWorkspaceEvents() {
   byId("delete-groq").addEventListener("click", (event) => deleteProviderCredential("groq", event.currentTarget));
   byId("manage-groq-credential").addEventListener("click", () => focusProviderCredential("groq"));
 
-  byId("job-form").addEventListener("submit", saveJob);
-  byId("job-cancel-edit").addEventListener("click", resetJobForm);
-  byId("yc-job-form").addEventListener("submit", saveAndPrepareYcJob);
-  byId("yc-job-url").addEventListener("change", inferYcFieldsFromUrl);
-  byId("yc-job-url").addEventListener("blur", inferYcFieldsFromUrl);
-  byId("yc-preferences-form").addEventListener("submit", saveYcPreferences);
-  byId("yc-connect").addEventListener("click", (event) => startBrowserConnection("yc", event.currentTarget));
-  byId("yc-complete-login").addEventListener("click", (event) => completeBrowserConnection("yc", event.currentTarget));
-  byId("yc-open-connections").addEventListener("click", openYcConnections);
   byId("job-search").addEventListener("input", renderJobs);
   byId("job-status-filter").addEventListener("change", renderJobs);
   byId("job-sort").addEventListener("change", renderJobs);
@@ -6898,10 +6421,13 @@ function bindWorkspaceEvents() {
   byId("jobs-open-profile").addEventListener("click", () => switchView("profile"));
 
   byId("resume-discovery-form").addEventListener("submit", submitResumeGuidedDiscovery);
-  byId("job-import-form").addEventListener("submit", importJobFile);
-  byId("job-import-file").addEventListener("change", (event) => {
+  byId("outreach-research-form").addEventListener("submit", generateOutreachResearchPrompt);
+  byId("outreach-copy-prompt").addEventListener("click", (event) => copyOutreachResearchPrompt(event.currentTarget));
+  byId("outreach-download-template").addEventListener("click", downloadOutreachTemplate);
+  byId("outreach-import-form").addEventListener("submit", importJobFile);
+  byId("outreach-import-file").addEventListener("change", (event) => {
     state.pendingJobImportFile = event.target.files?.[0] || null;
-    setText("job-import-file-label", state.pendingJobImportFile ? `${state.pendingJobImportFile.name} · ${formatBytes(state.pendingJobImportFile.size)}` : "Title and company are required; common header names are accepted.");
+    setText("outreach-import-file-label", state.pendingJobImportFile ? `${state.pendingJobImportFile.name} · ${formatBytes(state.pendingJobImportFile.size)}` : "Required: company, role, JD, email, and source URL when available.");
   });
   byId("ats-link-form").addEventListener("submit", ingestAtsLinks);
   byId("ats-board-form").addEventListener("submit", queueAtsBoardDiscovery);
@@ -6933,8 +6459,6 @@ function bindWorkspaceEvents() {
     await scanJobApplication(job, providerForJob(job) || "google_forms", event.currentTarget);
   });
 
-  byId("hunter-delete").addEventListener("click", (event) => deleteProviderCredential("hunter", event.currentTarget));
-  byId("manage-hunter-credential").addEventListener("click", () => focusProviderCredential("hunter"));
   byId("outreach-find-contacts").addEventListener("click", (event) => findOutreachContacts(event.currentTarget));
   byId("outreach-create-drafts").addEventListener("click", (event) => createOutreachDrafts(event.currentTarget));
   byId("outreach-send-approved").addEventListener("click", (event) => sendApprovedOutreach(event.currentTarget));

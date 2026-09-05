@@ -252,12 +252,13 @@ def test_discovery_and_exact_form_review_are_wired_into_workspace() -> None:
         "resume-discovery-progress",
         "resume-discovery-status",
         "discovery-remote-only",
+        "discovery-max-jobs",
+        "discovery-time-limit",
         "google-form-intake-form",
         "google-form-url",
         "google-form-intake-status",
         "google-form-queue",
         "google-form-queue-refresh",
-        "job-import-form",
         "ats-link-form",
         "ats-board-form",
         "ats-board-links",
@@ -309,6 +310,8 @@ def test_discovery_and_exact_form_review_are_wired_into_workspace() -> None:
         "Telegram",
         "RSS",
         "Find matching jobs",
+        "Maximum jobs",
+        "Search time limit",
         "Form Pilot",
         "Paste referral alert",
         "Ready for preparation",
@@ -376,6 +379,13 @@ def test_discovery_and_exact_form_review_are_wired_into_workspace() -> None:
 
 def test_resume_discovery_is_one_click_and_refreshes_results_automatically() -> None:
     assert "DISCOVERY_POLL_INTERVAL_MS = 2_000" in APP_JS
+    assert "DISCOVERY_MONITOR_TIMEOUT_MS = 120_000" in APP_JS
+    assert "DISCOVERY_QUEUE_REQUEST_TIMEOUT_MS = 55_000" in APP_JS
+    assert "max_jobs: Number(byId(\"discovery-max-jobs\")?.value || 10)" in APP_JS
+    assert "timeout_seconds: Number(byId(\"discovery-time-limit\")?.value || DISCOVERY_DEFAULT_TIMEOUT_SECONDS)" in APP_JS
+    assert "requestDiscoveryCancellation" in APP_JS
+    assert "run.timedOut = true" in APP_JS
+    assert "Search time limit reached" in APP_JS
     assert "DISCOVERY_TERMINAL_STATUSES" in APP_JS
     assert "monitorResumeDiscoveryRun" in APP_JS
     assert "resumeDiscoveryMonitoring(identity)" in APP_JS
@@ -401,10 +411,7 @@ def test_outreach_is_a_bounded_review_gated_workflow() -> None:
     for identifier in (
         "view-outreach",
         "outreach-prerequisites",
-        "hunter-setup-form",
-        "hunter-api-key",
-        "hunter-validate",
-        "hunter-quota",
+        "public-contact-heading",
         "outreach-job-list",
         "outreach-selection-count",
         "outreach-find-contacts",
@@ -420,27 +427,28 @@ def test_outreach_is_a_bounded_review_gated_workflow() -> None:
     )[0]
     for step in (
         "Select relevant jobs",
-        "Find recruiter emails with Hunter",
+        "Find public contact emails",
         "Create drafts with Groq, then review",
         "Send only approved messages",
     ):
         assert step in outreach_view
     assert "Mass Cold Email" in INDEX_HTML
-    assert "Add or replace your Hunter key" in outreach_view
-    assert 'id="hunter-key-message"' in outreach_view
-    assert outreach_view.index('id="hunter-setup-form"') < outreach_view.index('id="outreach-hero-heading"')
-    assert outreach_view.index('id="hunter-setup-form"') < outreach_view.index('id="outreach-job-list"')
-    assert "Select up to 10 saved jobs" in outreach_view
+    assert "No contact API key required" in outreach_view
+    assert "does not guess private addresses" in outreach_view
+    assert "Select up to 30 imported roles" in outreach_view
     assert "Nothing is sent automatically" in outreach_view
+    assert 'id="outreach-research-form"' in outreach_view
+    assert 'id="outreach-research-prompt"' in outreach_view
+    assert 'id="outreach-import-form"' in outreach_view
+    assert 'id="outreach-generate-prompt"' in outreach_view
 
     assert 'headers.set("X-Hunter-Api-Key", key)' not in APP_JS
     assert 'title: "Mass Cold Email"' in APP_JS
     assert 'id="referral-ingest-form"' not in outreach_view
     assert 'id="referral-digest"' not in outreach_view
-    assert '"hunter-key-message"' in APP_JS
     assert 'apiRequest(`/provider-credentials/${encodeURIComponent(provider)}`' in APP_JS
-    assert '/contacts/hunter?limit=5' in APP_JS
-    assert "state.outreachSelectedJobIds.size >= 10" in APP_JS
+    assert '/contacts/public' in APP_JS
+    assert "state.outreachSelectedJobIds.size >= 30" in APP_JS
     assert "selected: contacts[0]?.email" not in APP_JS
     assert "contacts.some((contact) => contact.email === job.contact_email)" in APP_JS
     assert 'application?.status === "approved"' in APP_JS
@@ -449,15 +457,15 @@ def test_outreach_is_a_bounded_review_gated_workflow() -> None:
     )[0]
     assert "await confirmAction({" in send_batch
     assert "Final Gmail handoff" in send_batch
-    hunter_search = APP_JS.split("async function findOutreachContacts", 1)[1].split(
+    public_contact_lookup = APP_JS.split("async function findOutreachContacts", 1)[1].split(
         "function renderOutreachDrafts", 1
     )[0]
-    assert "confirmAction" not in hunter_search
-    assert 'apiRequest("/hunter/validate", { method: "POST", hunter: true })' in hunter_search
-    assert "Hunter will validate the saved key automatically" in APP_JS
-    assert "findButton.disabled = !selected.length || !hunterKey" in APP_JS
+    assert "confirmAction" not in public_contact_lookup
+    assert 'apiRequest(`/jobs/${encodeURIComponent(job.id)}/contacts/public`' in public_contact_lookup
+    assert "No mailbox is contacted" in INDEX_HTML
+    assert "findButton.disabled = !selected.length" in APP_JS
     assert 'id="outreach-credit-estimate"' in outreach_view
-    assert 'idempotency_key: `outreach-send-${application.id}-${crypto.randomUUID()}`' in APP_JS
+    assert 'idempotency_key: `outreach-batch-${crypto.randomUUID()}`' in APP_JS
 
 
 def test_mass_cold_email_contains_build_and_review_subtabs() -> None:
@@ -480,7 +488,7 @@ def test_mass_cold_email_contains_build_and_review_subtabs() -> None:
     assert '["ArrowLeft", "ArrowRight", "Home", "End"]' in APP_JS
 
 
-def test_native_confirmations_use_accessible_modal_and_hunter_search_runs_directly() -> None:
+def test_native_confirmations_use_accessible_modal_and_public_contact_search_runs_directly() -> None:
     for identifier in (
         "action-dialog",
         "action-dialog-title",
@@ -503,10 +511,10 @@ def test_native_confirmations_use_accessible_modal_and_hunter_search_runs_direct
     assert "trigger?.isConnected" in APP_JS
     assert ".action-dialog::backdrop" in STYLES_CSS
     assert '.action-dialog[data-tone="danger"]' in STYLES_CSS
-    hunter_search = APP_JS.split("async function findOutreachContacts", 1)[1].split(
+    public_contact_search = APP_JS.split("async function findOutreachContacts", 1)[1].split(
         "function renderOutreachDrafts", 1
     )[0]
-    assert "confirmAction" not in hunter_search
+    assert "confirmAction" not in public_contact_search
 
 
 def test_jobs_fit_desk_uses_both_columns_and_resume_profile_controls() -> None:
@@ -570,10 +578,9 @@ def test_resume_and_groq_setup_are_consolidated_on_profile() -> None:
     assert 'if (view === "assets") view = "profile";' in APP_JS
     assert ".profile-source-grid" in STYLES_CSS
     for selector in (
-        ".mass-email-key-panel",
-        ".mass-email-key-intro",
-        ".hunter-access-stamp",
-        ".hunter-key-message",
+        ".mass-email-contact-panel",
+        ".mass-email-contact-intro",
+        ".public-contact-stamp",
     ):
         assert selector in STYLES_CSS
 
@@ -589,7 +596,7 @@ def test_groq_validation_displays_the_provider_status_instead_of_a_generic_error
     assert '"Groq did not accept this key."' not in APP_JS
 
 
-def test_account_credential_vault_supports_groq_hunter_and_browserbase_byok() -> None:
+def test_account_credential_vault_supports_groq_and_browserbase_byok() -> None:
     connections_view = INDEX_HTML.split('id="view-connections"', 1)[1].split(
         'id="view-automation"', 1
     )[0]
@@ -598,8 +605,6 @@ def test_account_credential_vault_supports_groq_hunter_and_browserbase_byok() ->
         "credential-vault-status",
         "credential-card-groq",
         "credential-groq-api-key",
-        "credential-card-hunter",
-        "credential-hunter-api-key",
         "credential-card-browserbase",
         "credential-browserbase-api-key",
         "credential-browserbase-project-id",
@@ -657,11 +662,11 @@ def test_account_credential_vault_supports_groq_hunter_and_browserbase_byok() ->
     clear_private = APP_JS.split("function clearPrivateState", 1)[1].split(
         "function setSession", 1
     )[0]
-    assert "state.providerCredentials = { groq: {}, hunter: {}, browserbase: {} }" in clear_private
+    assert "state.providerCredentials = { groq: {}, browserbase: {} }" in clear_private
     assert "state.providerCredentialMigrationUserId = null" in clear_private
 
 
-def test_contextual_groq_and_hunter_forms_use_the_same_account_vault_api() -> None:
+def test_contextual_groq_form_and_public_contact_lookup_use_the_active_flow() -> None:
     profile_view = INDEX_HTML.split('id="view-profile"', 1)[1].split(
         'id="view-discovery"', 1
     )[0]
@@ -672,15 +677,12 @@ def test_contextual_groq_and_hunter_forms_use_the_same_account_vault_api() -> No
     assert 'data-provider-credential="groq"' in profile_view
     assert 'id="groq-key"' in profile_view
     assert 'Add or replace your Groq key' in profile_view
-    assert 'id="hunter-setup-form"' in outreach_view
-    assert 'data-provider-credential="hunter"' in outreach_view
-    assert 'id="hunter-api-key"' in outreach_view
-    assert 'id="hunter-saved-summary"' in outreach_view
-    assert 'id="hunter-masked-key"' in outreach_view
-    assert 'Add or replace your Hunter key' in outreach_view
+    assert 'id="public-contact-heading"' in outreach_view
+    assert 'id="hunter-setup-form"' not in outreach_view
+    assert 'data-provider-credential="hunter"' not in outreach_view
     assert 'all("[data-provider-credential]").forEach' in APP_JS
     assert "saveGroqKey" not in APP_JS
-    assert "saveHunterKey" not in APP_JS
+    assert '/contacts/hunter' not in APP_JS
     assert "localStorage.setItem(storageKey, value)" not in APP_JS
 
 
@@ -714,7 +716,7 @@ def test_legacy_browser_keys_migrate_once_and_are_removed_only_after_server_save
     )[0]
     assert "state.providerCredentialMigrationUserId === identity.userId" in migration
     assert "getLegacyGroqKey(identity.userId)" in migration
-    assert "getLegacyHunterKey(identity.userId)" in migration
+    assert "getLegacyHunterKey(identity.userId)" not in migration
     assert 'method: "PUT"' in migration
     assert migration.index('await apiRequest(`/provider-credentials/${encodeURIComponent(provider)}`') < migration.index(
         "removeLegacyProviderKey(provider, identity.userId);",
@@ -725,8 +727,8 @@ def test_legacy_browser_keys_migrate_once_and_are_removed_only_after_server_save
 
 
 def test_local_frontend_assets_are_versioned_to_avoid_stale_validation_code() -> None:
-    assert 'href="/styles.css?v=20260815.4"' in INDEX_HTML
-    assert 'src="/app.js?v=20260815.4"' in INDEX_HTML
+    assert 'href="/styles.css?v=20260905.1"' in INDEX_HTML
+    assert 'src="/app.js?v=20260905.1"' in INDEX_HTML
 
 
 def test_ziprecruiter_is_not_presented_in_hosted_frontend() -> None:
@@ -910,63 +912,13 @@ def test_form_pilot_merges_server_profile_answers_without_an_extra_resume_input(
     assert 'byId("suggest-form-answers").addEventListener' not in APP_JS
 
 
-def test_yc_exact_job_desk_uses_connection_review_and_one_submit_flow() -> None:
+def test_jobs_library_removes_duplicate_manual_editor_but_keeps_form_pilot() -> None:
     jobs_view = INDEX_HTML.split('id="view-jobs"', 1)[1].split(
         'id="view-applications"', 1
     )[0]
-    for identifier in (
-        "yc-application-desk",
-        "yc-connection-status",
-        "yc-connect",
-        "yc-complete-login",
-        "yc-job-form",
-        "yc-job-url",
-        "yc-job-title",
-        "yc-job-company",
-        "yc-job-description",
-        "yc-preferences-form",
-        "yc-preference-query",
-        "yc-preference-remote",
-        "yc-route-save",
-        "yc-route-review",
-        "yc-route-submit",
-    ):
-        assert f'id="{identifier}"' in jobs_view
-    assert 'id="yc-preference-limit"' not in jobs_view
-    assert "Bring one exact YC job to a reviewed application." in jobs_view
-    assert "No bulk scraping" in jobs_view
-    assert "Submit once" in jobs_view
-    assert "They do not search, crawl, scrape, or submit YC applications in bulk." in jobs_view
-    assert 'apiRequest("/providers/yc/preferences"' in APP_JS
-    assert 'method: "PATCH"' in APP_JS
-    assert 'body: { query: query || null, remote_only: remoteOnly, limit: 10 }' in APP_JS
-    assert 'source: "yc_exact"' in APP_JS
-    assert 'intake: "exact_user_saved"' in APP_JS
-    assert 'parts[0] === "companies"' in APP_JS
-    assert 'parts[2] === "jobs"' in APP_JS
-    assert 'url.protocol !== "https:" || url.port || url.username || url.password' in APP_JS
-    assert 'url.search = ""' in APP_JS
-    assert 'url.hash = ""' in APP_JS
-    assert "currentJobSlug" in APP_JS
-    assert "legacyJobSlug" not in APP_JS
-    assert '"workatastartup.com"' not in APP_JS
-    assert "findSavedYcJob" in APP_JS
-    assert "This exact YC job is already saved" in APP_JS
-    assert 'setBusyLabel(button, "Reasserting exact YC target…")' in APP_JS
-    assert 'body: { apply_url: jobIdentity.url }' in APP_JS
-    assert "Its strict target was revalidated" in APP_JS
-    assert "Existing YC job and prepared application found" in APP_JS
-    assert "applyYcIntakeDefaults" in APP_JS
-    assert 'preferences.remote_only === true ? "Remote" : ""' in APP_JS
-    assert 'startBrowserConnection("yc"' in APP_JS
-    assert 'completeBrowserConnection("yc"' in APP_JS
-    assert 'scanJobApplication(savedJob, "yc", button)' in APP_JS
-    assert 'text: existingFormApplication ? "Review application"' in APP_JS
-    assert 'id="form-application-target-url"' in INDEX_HTML
-    assert 'id="form-application-target-link"' in INDEX_HTML
-    assert 'targetLink.href = exactTarget' in APP_JS
-    assert "renderYcRouteProgress" in APP_JS
-    assert ".yc-application-route li.is-current" in STYLES_CSS
-    assert ".yc-application-route li.needs-attention" in STYLES_CSS
-    assert ".yc-application-desk" in STYLES_CSS
+    assert 'id="job-form"' not in jobs_view
+    assert 'id="yc-application-desk"' not in jobs_view
+    assert "Imported roles" in jobs_view
+    assert "Draft with Groq" in APP_JS
+    assert "scanJobApplication" in APP_JS
     assert ".yc-application-route" in STYLES_CSS

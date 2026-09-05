@@ -24,6 +24,7 @@ COPY --chown=autoapply:autoapply \
     app/saas/config.py \
     app/saas/crypto.py \
     app/saas/errors.py \
+    app/saas/gmail.py \
     app/saas/store.py \
     app/saas/providers.py \
     ./app/saas/
@@ -43,6 +44,7 @@ COPY --chown=autoapply:autoapply \
     worker/__init__.py \
     worker/main.py \
     worker/handlers.py \
+    worker/email_runtime.py \
     worker/browser_runtime.py \
     worker/discovery_runtime.py \
     ./worker/

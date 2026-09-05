@@ -42,13 +42,34 @@ HEADER_SYNONYMS: dict[str, frozenset[str]] = {
         "description", "job description", "job_description", "jd", "details", "requirements"
     }),
     "apply_url": frozenset({
-        "apply_url", "apply url", "apply link", "application url", "application link", "link", "url", "apply"
+        "apply_url", "apply url", "apply link", "application url", "application link",
+        "job url", "job_url", "link", "url", "apply"
     }),
     "external_id": frozenset({"external id", "external_id", "job id", "job_id", "requisition id", "req id"}),
     "source": frozenset({"source", "job source", "board", "platform"}),
     "domain": frozenset({"domain", "website", "site", "company website", "url domain"}),
     "salary": frozenset({"salary", "ctc", "compensation", "pay", "package", "stipend", "lpa"}),
     "verified": frozenset({"verified", "is verified", "trusted", "confirmed"}),
+    # External-AI research workbooks use these fields to carry contact
+    # provenance and the exact JD into the review-gated outreach flow.
+    "contact_name": frozenset({
+        "contact name", "contact_name", "person name", "person_name", "recruiter name",
+        "recruiter_name", "hiring manager", "hiring_manager", "recipient name",
+    }),
+    "contact_title": frozenset({
+        "contact title", "contact_title", "person title", "person_title", "recruiter title",
+        "recruiter_title", "job title at company", "contact role",
+    }),
+    "linkedin_url": frozenset({
+        "linkedin", "linkedin url", "linkedin_url", "person linkedin", "person_linkedin",
+    }),
+    "source_url": frozenset({"source url", "source_url", "evidence url", "evidence_url"}),
+    "source_date": frozenset({"source date", "source_date", "evidence date", "evidence_date"}),
+    "contact_source": frozenset({"contact source", "contact_source", "email source", "email_source"}),
+    "experience_required": frozenset({
+        "experience required", "experience_required", "years required", "years_required",
+        "required experience", "required_experience", "minimum experience", "minimum_experience",
+    }),
 }
 
 
@@ -148,6 +169,14 @@ def _matrix_to_jobs(matrix: list[list[Any]], *, max_rows: int) -> list[Normalize
                     "compensation": salary,
                     "verified": _norm_header(_value(row, mapping, "verified"))
                     in {"1", "true", "yes", "y", "verified", "trusted"},
+                    "contact_name": _value(row, mapping, "contact_name")[:160] or None,
+                    "contact_title": _value(row, mapping, "contact_title")[:160] or None,
+                    "linkedin_url": safe_http_url(_value(row, mapping, "linkedin_url")),
+                    "source_url": safe_http_url(_value(row, mapping, "source_url")),
+                    "source_date": _value(row, mapping, "source_date")[:40] or None,
+                    "contact_source": _value(row, mapping, "contact_source")[:240] or None,
+                    "experience_required": _value(row, mapping, "experience_required")[:160] or None,
+                    "external_research": True,
                 },
             )
         )
@@ -207,7 +236,12 @@ def _validate_xlsx_archive(payload: bytes) -> None:
 
 
 def parse_xlsx_bytes(data: bytes, *, max_rows: int = MAX_IMPORT_ROWS) -> list[NormalizedJob]:
-    """Parse the first worksheet in an XLSX file without formulas or filesystem writes."""
+    """Parse the first recognizable worksheet without formulas or filesystem writes.
+
+    External AI tools often put an instructions/README sheet before the data
+    sheet.  Selecting by recognized headers keeps that harmless sheet from
+    making an otherwise valid workbook look empty or malformed.
+    """
 
     payload = _bounded_data(data)
     if not payload:
@@ -224,21 +258,28 @@ def parse_xlsx_bytes(data: bytes, *, max_rows: int = MAX_IMPORT_ROWS) -> list[No
     except Exception as exc:  # noqa: BLE001 - openpyxl exposes several format errors
         raise ValueError("XLSX workbook could not be parsed") from exc
     try:
-        worksheet = workbook.active
         bounded_rows = max(1, min(int(max_rows), MAX_IMPORT_ROWS))
-        if (worksheet.max_column or 1) > MAX_IMPORT_COLUMNS:
-            raise ValueError("XLSX worksheet has too many columns")
-        matrix = [
-            list(row)
-            for row in worksheet.iter_rows(
-                min_row=1,
-                max_row=min(worksheet.max_row or 1, bounded_rows + 50),
-                max_col=min(worksheet.max_column or 1, MAX_IMPORT_COLUMNS),
-                values_only=True,
-            )
-        ]
+        matrix: list[list[Any]] | None = None
+        worksheets = list(workbook.worksheets)[:10]
+        for worksheet in worksheets:
+            if (worksheet.max_column or 1) > MAX_IMPORT_COLUMNS:
+                raise ValueError("XLSX worksheet has too many columns")
+            candidate = [
+                list(row)
+                for row in worksheet.iter_rows(
+                    min_row=1,
+                    max_row=min(worksheet.max_row or 1, bounded_rows + 50),
+                    max_col=min(worksheet.max_column or 1, MAX_IMPORT_COLUMNS),
+                    values_only=True,
+                )
+            ]
+            if any(_header_map(row) for row in candidate[:50]):
+                matrix = candidate
+                break
     finally:
         workbook.close()
+    if matrix is None:
+        raise ValueError("No worksheet with recognized job columns was found")
     return _matrix_to_jobs(matrix, max_rows=bounded_rows)
 
 

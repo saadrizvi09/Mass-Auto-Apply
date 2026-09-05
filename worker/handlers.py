@@ -270,6 +270,7 @@ SUPPORTED_JOB_KINDS: tuple[str, ...] = (
     "discover_public_feeds",
     "discover_linkedin_guest",
     "discover_public_ats",
+    "send_email",
 )
 
 

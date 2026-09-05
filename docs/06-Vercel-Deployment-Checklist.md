@@ -43,6 +43,10 @@ origin for `SITE_URL` and Gmail OAuth.
 
 - Vercel Functions are stateless and request-bounded. Do not store files, OAuth state,
   sessions, or worker state on the Vercel filesystem.
+- This repository sets the FastAPI function's `maxDuration` to 60 seconds in
+  `vercel.json`, which is compatible with the Hobby plan's non-Fluid-Compute ceiling.
+  The résumé-guided endpoint returns a 202 after planning; public-source fetching is
+  never held open in that Vercel request.
 - Vercel Function request and response bodies are limited to 4.5 MB. The résumé flow
   already uploads directly from the browser to private Supabase Storage, so do not
   change it to proxy PDFs through FastAPI.
@@ -118,7 +122,7 @@ Do not reuse the pasted values.
 
 Do not casually rotate or lose `TOKEN_ENCRYPTION_KEY` after launch. Existing encrypted
 Gmail tokens, user-owned Google client secrets, managed-browser context identifiers,
-and account-scoped Groq/Hunter/Browserbase credentials would become unreadable. Users
+and account-scoped Groq/Browserbase credentials would become unreadable. Users
 would need to reconnect and re-enter provider credentials.
 
 Reference: [Vercel secret rotation](https://vercel.com/docs/environment-variables/rotating-secrets).
@@ -136,10 +140,12 @@ supabase db lint --linked --level warning
 ```
 
 - [ ] Confirm every migration through
-      `202608150003_yc_exact_job_automation.sql` was applied in filename order.
+      `202609050001_outreach_email_queue.sql` was applied in filename order.
 - [ ] Confirm `user_provider_credentials` has RLS enabled, no browser policy or
-      `public`/`anon`/`authenticated` grant, and only `service_role` access. Its allowed
-      providers must be exactly `groq`, `hunter`, and `browserbase`.
+      `public`/`anon`/`authenticated` grant, and only `service_role` access. The active
+      UI and API use only `groq` and `browserbase`; no Hunter credential or endpoint is
+      part of the active deployment. Existing legacy rows are not read or deleted by
+      this migration.
 - [ ] Confirm save/delete RPCs increment credential generations, write only secret-free
       audit metadata, cascade on account deletion, and block Browserbase replacement or
       deletion while owned browser jobs/contexts are active.
@@ -193,10 +199,11 @@ Reference: [Supabase production checklist](https://supabase.com/docs/guides/depl
 
 Supabase Dashboard → Authentication → URL Configuration:
 
-- [ ] Set **Site URL** to the exact canonical origin:
+- [ ] Set **Site URL** to the exact canonical origin (`https://autoapply-cloud.vercel.app`
+      for the current deployment):
 
   ```text
-  https://app.example.com
+  https://autoapply-cloud.vercel.app
   ```
 
 - [ ] Add the production return URL(s) to **Redirect URLs**. The current UI returns to
@@ -204,7 +211,7 @@ Supabase Dashboard → Authentication → URL Configuration:
       allowlist entry can be:
 
   ```text
-  https://app.example.com/**
+  https://autoapply-cloud.vercel.app/**
   ```
 
 - [ ] Keep local development as an additional entry, not as the Site URL:
@@ -348,7 +355,9 @@ Reference: [Supabase custom SMTP](https://supabase.com/docs/guides/auth/auth-smt
 - [ ] Add and verify the canonical custom domain.
 - [ ] Keep frontend and API on the same Vercel origin. The current app intentionally has
       no cross-origin API configuration.
-- [ ] Confirm Fluid Compute is enabled for upstream calls that may take tens of seconds.
+- [ ] If the project plan offers Fluid Compute, enable it for upstream calls that may take
+      tens of seconds. The current `vercel.json` cap is 60 seconds and remains compatible
+      with Hobby's non-Fluid ceiling; Fluid Compute does not replace the persistent worker.
 - [ ] Add HSTS only after the final HTTPS domain and subdomain policy are stable.
 
 Reference: [Vercel custom domains](https://vercel.com/docs/domains/set-up-custom-domain).
@@ -370,6 +379,12 @@ paste secret values into a shell command that will be saved in history.
 | `TOKEN_ENCRYPTION_KEY` | New backed-up Fernet key | Yes | Must exactly match the worker |
 | `GOOGLE_REDIRECT_URI` | `https://app.example.com/api/v1/oauth/google/callback` | No | Exact fixed Gmail callback |
 
+If a local `.env` value is accidentally copied into Vercel, the API replaces loopback
+`SITE_URL` and `GOOGLE_REDIRECT_URI` values with Vercel's deployment origin. Treat this
+as a safety net, not as the canonical setup: set both variables explicitly to the
+stable production domain and redeploy. OAuth providers still require that exact domain
+in their own redirect allowlists.
+
 ### Gmail platform client
 
 | Variable | Secret? | Notes |
@@ -386,7 +401,7 @@ left empty only if the product intentionally supports user-owned Google clients 
 | --- | --- | --- |
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | No |
 | `MAX_RESUME_BYTES` | `6291456` | No |
-| `DEFAULT_DAILY_SEND_CAP` | `10` | No |
+| `DEFAULT_DAILY_SEND_CAP` | `150` | No |
 | `OAUTH_STATE_TTL_SECONDS` | `600` | No |
 | `SUPABASE_HTTP_TIMEOUT_SECONDS` | `15` | No |
 | `BROWSERBASE_API_KEY` | Rotated Browserbase key | Yes |
@@ -409,8 +424,8 @@ Do not configure these in Vercel:
 
 - `GROQ_API_KEY`: each user supplies a key encrypted in their service-role-only account
   credential row.
-- `HUNTER_API_KEY`: each user supplies a key encrypted in the same account-scoped
-  store; contact search resolves it only for the authenticated owned request.
+- Hunter credentials: not used by the active deployment; public contact extraction
+  needs no contact-provider key.
 - `SUPABASE_JWKS_URL`: the application does not consume it.
 - Turnstile secret: it belongs in Supabase Auth.
 - Supabase Google-login secret: it belongs in Supabase Auth.
@@ -520,6 +535,10 @@ WORKER_HEARTBEAT_SECONDS=20
 WORKER_LOG_LEVEL=INFO
 
 TOKEN_ENCRYPTION_KEY=SAME_FERNET_KEY_AS_VERCEL
+# Required here when using the platform-managed Gmail OAuth client. Omit only when
+# every Gmail user configures the advanced user-managed OAuth client in the app.
+GOOGLE_CLIENT_ID=SAME_GOOGLE_CLIENT_ID_AS_VERCEL
+GOOGLE_CLIENT_SECRET=SAME_GOOGLE_CLIENT_SECRET_AS_VERCEL
 # Optional platform fallback; omit both when relying exclusively on user BYOK.
 BROWSERBASE_API_KEY=ROTATED_BROWSERBASE_KEY
 BROWSERBASE_PROJECT_ID=YOUR_BROWSERBASE_PROJECT_ID
@@ -610,11 +629,11 @@ References: [Browserbase pricing](https://www.browserbase.com/pricing) and
       `/api/openapi.json` return expected responses.
 - [ ] `/api/v1/profile` without a bearer token returns 401.
 - [ ] `/api/v1/config` contains the exact production Site URL and no secret, OAuth token,
-      encryption key, user Groq/Hunter/Browserbase secret, project ID, or ciphertext.
+      encryption key, user Groq/Browserbase secret, project ID, or ciphertext.
 - [ ] Confirm provider-credential request bodies, decrypted envelopes, ciphertext,
       Browserbase CDP URLs, and provider headers are absent from function, worker,
-      proxy, analytics, and observability logs; no user Groq/Hunter key is configured in
-      Vercel or the worker host.
+      proxy, analytics, and observability logs; no user Groq or contact-provider key is
+      configured in Vercel or the worker host.
 - [ ] Confirm CSP, referrer, permissions, nosniff, and frame-deny headers on public pages.
 - [ ] Confirm API responses are `private, no-store`.
 - [ ] Inspect every `/api/v1/health` check. `status=ready` alone does not prove Gmail,
@@ -726,22 +745,19 @@ References: [Browserbase pricing](https://www.browserbase.com/pricing) and
       platform fallback, never mixes credential sources, closes the session immediately
       on every terminal path, and enforces the 90-second stall cap. The UI explains
       that each created session is billed for at least one minute.
-- [ ] A user's Hunter key validates through
-      `PUT /api/v1/provider-credentials/hunter`, persists only as encrypted ciphertext,
-      and is resolved only for owned `POST /api/v1/jobs/{id}/contacts/hunter` requests;
-      no plaintext/ciphertext appears in browser storage, responses, logs, Vercel, or
-      the worker environment.
 - [ ] **Mass Cold Email** is the only related sidebar item and exposes **Build campaign**
-      and **Review & send** as subtabs. Build campaign enforces a ten-job maximum, shows
-      projected Hunter credit use inline before the explicit lookup, and requires the
-      user to choose a contact before Groq drafting. Both subtabs list email-channel
-      applications only; no ATS/form revision or form-answer editor appears there.
+      and **Review & send** as subtabs. Build campaign generates the external-AI prompt,
+      imports a bounded CSV/XLSX workbook, enforces a 30-role maximum, calls the owned
+      `POST /api/v1/jobs/{id}/contacts/public` endpoint without a contact-provider key,
+      and requires the user to choose a public contact lead before Groq drafting. Both
+      subtabs list email-channel applications only; no ATS/form revision or form-answer
+      editor appears there.
 - [ ] In the second **Review & send** subtab, every exact draft is approved individually;
       edits invalidate approval, and a separate final confirmation precedes sending.
-- [ ] Approved outreach sends run sequentially through the existing Gmail endpoint;
-      daily-cap, duplicate-recipient, and idempotency gates remain authoritative, and a
-      retry cannot create a second message.
-- [ ] Product copy and behavior never represent the reviewed max-ten workflow as
+- [ ] Approved outreach sends create durable `send_email` rows and are delivered by the
+      persistent worker after the browser closes; daily-cap, duplicate-recipient, and
+      idempotency gates remain authoritative, and a retry cannot create a second message.
+- [ ] Product copy and behavior never represent the reviewed max-30 workflow as
       autonomous or unreviewed bulk cold email.
 - [ ] Gmail connect, reviewed send, disconnect, and Google-side revocation work.
 - [ ] CSV/XLSX/referral/ATS imports work within their documented limits.
@@ -757,9 +773,9 @@ Recommended order:
 1. Rotate credentials and save the encryption key.
 2. Commit/review the deployment branch and legal pages.
 3. Apply/lint Supabase migrations through
-   `202608150003_yc_exact_job_automation.sql`; verify the provider-credential
-   no-browser-access contract and YC exact-target/service-role guards before deploying
-   the corresponding API/worker code.
+   `202609050001_outreach_email_queue.sql`; verify the provider-credential
+   no-browser-access contract, YC exact-target/service-role guards, and durable
+   `send_email` queue contract before deploying the corresponding API/worker code.
 4. Configure Supabase Site URL, redirects, Google provider, SMTP, and Turnstile.
 5. Configure Google identity and Gmail clients.
 6. Deploy the stable staging Vercel build.
@@ -783,7 +799,7 @@ If cutover fails:
   connections/provider credentials and requiring every user to reconnect or re-enter
   keys.
 
-For an upgrade from the prior browser-local Groq/Hunter design, deploy and verify the
+For an upgrade from the prior browser-local Groq design, deploy and verify the
 table/API before the new frontend. On a user's first authenticated load, the frontend
 imports only that user's namespaced legacy values through the normal validated PUT
 endpoints. It deletes each browser copy only after a successful encrypted account save

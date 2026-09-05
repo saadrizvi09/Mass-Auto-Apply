@@ -399,12 +399,18 @@ def test_csv_import_supports_flexible_headers_and_deduplicates() -> None:
     _assert_job_contract(jobs)
 
 
-def test_xlsx_import_is_in_memory_and_uses_first_nonempty_header() -> None:
+def test_xlsx_import_is_in_memory_and_skips_an_external_ai_readme_sheet() -> None:
     workbook = openpyxl.Workbook()
-    sheet = workbook.active
-    sheet.append([])
-    sheet.append(["Employer", "Position", "Application URL", "Location"])
-    sheet.append(["Cobalt", "Frontend Engineer", "https://jobs.ashbyhq.com/cobalt/42", "Pune"])
+    readme = workbook.active
+    readme.title = "README"
+    readme.append(["This workbook was created from public sources."])
+    sheet = workbook.create_sheet("Roles")
+    sheet.append(["Company", "Role", "Email", "Job URL", "JD", "Source URL"])
+    sheet.append([
+        "Cobalt", "Frontend Engineer", "recruiting@cobalt.example",
+        "https://jobs.ashbyhq.com/cobalt/42", "Build accessible products.",
+        "https://cobalt.example/careers/42",
+    ])
     buffer = BytesIO()
     workbook.save(buffer)
     workbook.close()
@@ -412,7 +418,8 @@ def test_xlsx_import_is_in_memory_and_uses_first_nonempty_header() -> None:
     jobs = parse_xlsx_bytes(buffer.getvalue())
     assert jobs[0]["company"] == "Cobalt"
     assert jobs[0]["title"] == "Frontend Engineer"
-    assert jobs[0]["metadata"]["import_row"] == 3
+    assert jobs[0]["apply_url"] == "https://jobs.ashbyhq.com/cobalt/42"
+    assert jobs[0]["metadata"]["source_url"] == "https://cobalt.example/careers/42"
     _assert_job_contract(jobs)
 
 

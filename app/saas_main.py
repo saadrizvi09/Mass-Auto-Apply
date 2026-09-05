@@ -5,6 +5,7 @@ SQLite, scheduler, desktop OAuth, or Playwright application.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -45,9 +46,7 @@ from app.saas.gmail import (
     build_google_authorization_url,
     exchange_google_code,
     get_google_userinfo,
-    refresh_google_access_token,
     revoke_google_token,
-    send_gmail_message,
 )
 from app.saas.groq import (
     GroqProviderError,
@@ -57,11 +56,6 @@ from app.saas.groq import (
     profile_form_answers,
     validate_groq_key,
 )
-from app.saas.hunter import (
-    HunterProviderError,
-    search_hunter_contacts,
-    validate_hunter_key,
-)
 from app.saas.matching import enrich_jobs_with_fit, recommended_roles
 from app.saas.providers import (
     browser_provider_allowed,
@@ -69,6 +63,8 @@ from app.saas.providers import (
     get_provider,
     provider_catalog,
 )
+from app.saas.public_contacts import public_contact_candidates
+from app.saas.outreach_prompt import build_research_prompt
 from app.saas.resume import ResumeParseError, extract_pdf_text, profile_suggestions
 from app.saas.schemas import (
     AccountDeletionRequest,
@@ -95,6 +91,8 @@ from app.saas.schemas import (
     ProfileUpdate,
     ResumeRegister,
     SendApplicationRequest,
+    SendApplicationBatchRequest,
+    OutreachResearchPromptRequest,
     UserSettingsUpdate,
     YcApplicationPreferencesUpdate,
     normalized_http_url,
@@ -105,6 +103,7 @@ from app.saas.store import StoreClient, SupabaseStore
 VERSION = "2.0.0"
 PUBLIC_DIR = Path(__file__).resolve().parent.parent / "public"
 RESUME_BUCKET = "resumes"
+RESUME_ANALYSIS_TIMEOUT_SECONDS = 50
 STORAGE_LIST_PAGE_SIZE = 1000
 MAX_ACCOUNT_STORAGE_ENTRIES = 20_000
 MAX_JOB_IMPORT_BYTES = 4 * 1024 * 1024
@@ -139,10 +138,9 @@ ACCOUNT_DELETION_CLOCK_SKEW = timedelta(minutes=2)
 # released as soon as the user completes login; this is only a hard ceiling for
 # abandoned tabs so they cannot consume five full minutes per attempt.
 MANAGED_BROWSER_LOGIN_TIMEOUT_SECONDS = 180
-STORED_PROVIDER_IDS = ("groq", "hunter", "browserbase")
+STORED_PROVIDER_IDS = ("groq", "browserbase")
 PROVIDER_CREDENTIAL_LINKS: dict[str, dict[str, str]] = {
     "groq": {"key_url": "https://console.groq.com/keys"},
-    "hunter": {"key_url": "https://hunter.io/api-keys"},
     "browserbase": {
         "key_url": "https://www.browserbase.com/settings",
         "signup_url": "https://www.browserbase.com/sign-up",
@@ -165,7 +163,7 @@ class GoogleOAuthCredentials:
 class StoredProviderCredential:
     """A decrypted tenant credential that never crosses an API response boundary."""
 
-    provider: Literal["groq", "hunter", "browserbase"]
+    provider: Literal["groq", "browserbase"]
     api_key: str
     project_id: str | None
     verification_status: Literal["verified", "unverified", "invalid"]
@@ -572,20 +570,6 @@ def _groq_error(error: GroqProviderError) -> ApiError:
     return ApiError(status_code, error.code, str(error))
 
 
-def _hunter_error(error: HunterProviderError) -> ApiError:
-    if error.code in {"hunter_missing_key", "hunter_invalid_key"}:
-        status_code = 400
-    elif error.code in {"hunter_quota_exhausted"}:
-        status_code = 429
-    elif error.code in {"hunter_unavailable", "hunter_timeout"}:
-        status_code = 503
-    elif error.code in {"hunter_forbidden"}:
-        status_code = 403
-    else:
-        status_code = 422
-    return ApiError(status_code, error.code, str(error))
-
-
 def _google_error(error: GoogleProviderError) -> ApiError:
     if error.code in {"google_rate_limited", "gmail_rate_limited"}:
         status_code = 429
@@ -648,7 +632,7 @@ def _google_client_id_hint(value: str) -> str:
     return f"{masked_stem}{suffix}" if value.endswith(suffix) else masked_stem
 
 
-def _provider_id(value: str) -> Literal["groq", "hunter", "browserbase"]:
+def _provider_id(value: str) -> Literal["groq", "browserbase"]:
     clean = value.strip().lower() if isinstance(value, str) else ""
     if clean not in STORED_PROVIDER_IDS:
         raise ApiError(404, "provider_credential_unknown", "Choose a supported credential provider.")
@@ -656,7 +640,7 @@ def _provider_id(value: str) -> Literal["groq", "hunter", "browserbase"]:
 
 
 def _validated_provider_body(
-    provider: Literal["groq", "hunter", "browserbase"],
+    provider: Literal["groq", "browserbase"],
     body: ProviderCredentialUpsert,
 ) -> ProviderCredentialUpsert:
     if provider == "browserbase":
@@ -676,7 +660,7 @@ def _validated_provider_body(
 
 
 def _provider_credential_plaintext(
-    provider: Literal["groq", "hunter", "browserbase"],
+    provider: Literal["groq", "browserbase"],
     body: ProviderCredentialUpsert,
 ) -> str:
     envelope: dict[str, Any] = {
@@ -923,7 +907,7 @@ def create_app(
 
     async def load_user_provider_credential(
         user_id: UUID | str,
-        provider: Literal["groq", "hunter", "browserbase"],
+        provider: Literal["groq", "browserbase"],
         *,
         required: bool = False,
     ) -> StoredProviderCredential | None:
@@ -1039,7 +1023,7 @@ def create_app(
         except ValueError as exc:
             raise ApiError(
                 400,
-                f"{provider}_key_required" if provider == "groq" else "hunter_missing_key",
+                f"{provider}_key_required",
                 f"Enter a valid {provider.title()} API key.",
             ) from exc
 
@@ -1055,21 +1039,6 @@ def create_app(
                 409,
                 "groq_credential_reconfiguration_required",
                 "The saved Groq key was rejected. Replace it before continuing.",
-            )
-        return stored.api_key
-
-    async def resolve_hunter_key(value: str | None, user: AuthUser) -> str:
-        header_key = validated_header_key(value, "hunter")
-        if header_key is not None:
-            return header_key
-        stored = await load_user_provider_credential(user.user_id, "hunter")
-        if stored is None:
-            raise ApiError(400, "hunter_missing_key", "Save a valid Hunter API key first.")
-        if stored.verification_status == "invalid":
-            raise ApiError(
-                409,
-                "hunter_credential_reconfiguration_required",
-                "The saved Hunter key was rejected. Replace it before continuing.",
             )
         return stored.api_key
 
@@ -1806,7 +1775,15 @@ def create_app(
             kind="discover_public_ats",
             provider="public_ats",
             application_id=None,
-            payload={"board_urls": canonical_urls, "limit": body.limit},
+            payload={
+                "board_urls": canonical_urls,
+                "limit": body.limit,
+                **(
+                    {"timeout_seconds": body.timeout_seconds}
+                    if body.timeout_seconds is not None
+                    else {}
+                ),
+            },
             idempotency_key=body.idempotency_key,
         )
         return _data(row)
@@ -1828,7 +1805,15 @@ def create_app(
             kind="discover_public_feeds",
             provider="public_feeds",
             application_id=None,
-            payload={"source_ids": requested, "limit": body.limit},
+            payload={
+                "source_ids": requested,
+                "limit": body.limit,
+                **(
+                    {"timeout_seconds": body.timeout_seconds}
+                    if body.timeout_seconds is not None
+                    else {}
+                ),
+            },
             idempotency_key=body.idempotency_key,
         )
         return _data(row)
@@ -1852,6 +1837,11 @@ def create_app(
                 "location": body.location or "India",
                 "remote": body.remote_only,
                 "limit": body.limit,
+                **(
+                    {"timeout_seconds": body.timeout_seconds}
+                    if body.timeout_seconds is not None
+                    else {}
+                ),
             },
             idempotency_key=body.idempotency_key,
         )
@@ -1900,12 +1890,22 @@ def create_app(
 
         await client.rpc("reserve_groq_request", {"operation_input": "generate"})
         try:
-            analysis = await run_in_threadpool(
-                analyze_resume_profile,
-                groq_key,
-                runtime_settings.groq_model,
-                resume["parsed_text"],
+            analysis = await asyncio.wait_for(
+                run_in_threadpool(
+                    analyze_resume_profile,
+                    groq_key,
+                    runtime_settings.groq_model,
+                    resume["parsed_text"],
+                ),
+                timeout=RESUME_ANALYSIS_TIMEOUT_SECONDS,
             )
+        except asyncio.TimeoutError as exc:
+            raise _groq_error(
+                GroqProviderError(
+                    "groq_timeout",
+                    "Groq took too long to analyze the résumé. Try again later.",
+                )
+            ) from exc
         except GroqProviderError as exc:
             raise _groq_error(exc) from exc
 
@@ -1956,6 +1956,20 @@ def create_app(
             or "India"
         )
         linkedin_query = roles[0][:100]
+        linkedin_limit = body.linkedin_limit
+        feed_limit = body.feed_limit
+        if body.max_jobs is not None:
+            # Keep the combined two-collector run within the user's requested
+            # result budget while giving both public sources a chance to return
+            # matches. The minimum of two jobs is intentional because the run
+            # always dispatches LinkedIn and feeds separately.
+            linkedin_limit = min(25, (body.max_jobs + 1) // 2)
+            feed_limit = max(1, body.max_jobs - linkedin_limit)
+        timeout_payload = (
+            {"timeout_seconds": body.timeout_seconds}
+            if body.timeout_seconds is not None
+            else {}
+        )
         linkedin_job = await enqueue_job(
             user=user,
             kind="discover_linkedin_guest",
@@ -1965,7 +1979,8 @@ def create_app(
                 "keywords": linkedin_query,
                 "location": location,
                 "remote": body.remote_only,
-                "limit": body.linkedin_limit,
+                "limit": linkedin_limit,
+                **timeout_payload,
             },
             idempotency_key=f"{body.idempotency_key}:linkedin",
         )
@@ -1976,8 +1991,9 @@ def create_app(
             application_id=None,
             payload={
                 "source_ids": ["telegram", "rss"],
-                "limit": body.feed_limit,
+                "limit": feed_limit,
                 "search_terms": search_terms,
+                **timeout_payload,
             },
             idempotency_key=f"{body.idempotency_key}:feeds",
         )
@@ -2623,8 +2639,6 @@ def create_app(
                 verification = await run_in_threadpool(
                     validate_groq_key, validated.api_key, runtime_settings.groq_model
                 )
-        elif provider == "hunter":
-            verification = await run_in_threadpool(validate_hunter_key, validated.api_key)
         else:
             try:
                 verification = await run_in_threadpool(
@@ -2666,8 +2680,6 @@ def create_app(
         if valid:
             verification_status: Literal["verified", "unverified", "invalid"] = "verified"
         elif provider == "groq" and verification_code == "groq_invalid_key":
-            verification_status = "invalid"
-        elif provider == "hunter" and verification_code == "hunter_invalid_key":
             verification_status = "invalid"
         elif provider == "browserbase" and verification_code not in {
             "browserbase_timeout",
@@ -2856,14 +2868,6 @@ def create_app(
             validate_groq_key, groq_key, runtime_settings.groq_model
         )
 
-    @application.post("/api/v1/hunter/validate", tags=["hunter"])
-    async def validate_hunter(
-        hunter_key: str | None = Header(default=None, alias="X-Hunter-Api-Key"),
-        user: AuthUser = Depends(current_user),
-    ) -> dict[str, Any]:
-        hunter_key = await resolve_hunter_key(hunter_key, user)
-        return await run_in_threadpool(validate_hunter_key, hunter_key)
-
     @application.get("/api/v1/jobs", tags=["jobs"])
     async def list_jobs(
         job_status: str | None = Query(default=None, alias="status", max_length=40),
@@ -2949,41 +2953,62 @@ def create_app(
     async def get_job(job_id: UUID, user: AuthUser = Depends(current_user)) -> dict[str, Any]:
         return _data(await _required_row(store_service.user(user.access_token), "jobs", user, job_id))
 
-    @application.post("/api/v1/jobs/{job_id}/contacts/hunter", tags=["jobs", "hunter"])
-    async def find_job_contacts_with_hunter(
-        job_id: UUID,
-        limit: int = Query(default=5, ge=1, le=10),
-        hunter_key: str | None = Header(default=None, alias="X-Hunter-Api-Key"),
-        user: AuthUser = Depends(current_user),
+    @application.post("/api/v1/jobs/{job_id}/contacts/public", tags=["jobs"])
+    async def find_job_public_contacts(
+        job_id: UUID, user: AuthUser = Depends(current_user)
     ) -> dict[str, Any]:
-        hunter_key = await resolve_hunter_key(hunter_key, user)
+        """Extract contact leads already present in the owned job record.
+
+        This is intentionally a zero-credential operation. It never crawls an
+        arbitrary site, guesses a person from a domain, sends a verification email,
+        or performs SMTP probing. Public/user-supplied candidates remain explicitly
+        unverified until the user reviews them.
+        """
+
         job = await _required_row(
             store_service.user(user.access_token), "jobs", user, job_id
         )
-        company = job.get("company")
-        if not isinstance(company, str) or not company.strip():
-            raise ApiError(
-                422,
-                "hunter_company_required",
-                "Add the company name before searching for contacts.",
-            )
-        try:
-            result = await run_in_threadpool(
-                search_hunter_contacts,
-                hunter_key,
-                company=company,
-                limit=limit,
-            )
-        except HunterProviderError as exc:
-            raise _hunter_error(exc) from exc
+        contacts = public_contact_candidates(job)
         return _data(
             {
                 "job_id": str(job_id),
-                "company": company,
-                "domain": result.get("domain"),
-                "contacts": result.get("contacts", []),
+                "company": job.get("company"),
+                "contacts": contacts,
+                "verification": {
+                    "status": "syntax_only",
+                    "message": (
+                        "No email was sent. Candidates come only from the saved job "
+                        "record and require your review before drafting or sending."
+                    ),
+                },
             }
         )
+
+    @application.post("/api/v1/outreach/research-prompt", tags=["outreach", "resumes"])
+    async def create_outreach_research_prompt(
+        body: OutreachResearchPromptRequest,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        """Create a bounded brief for a user-run external AI web search."""
+
+        client = store_service.user(user.access_token)
+        profile = await client.fetch_one("profiles", filters={"user_id": str(user.user_id)}) or {}
+        resume = await client.fetch_one(
+            "resumes",
+            columns="parse_status,parsed_text",
+            filters={"user_id": str(user.user_id), "is_active": True},
+        )
+        resume_text = resume.get("parsed_text") if isinstance(resume, Mapping) else None
+        if not isinstance(resume_text, str) or not resume_text.strip() or resume.get("parse_status") != "parsed":
+            raise ApiError(409, "resume_not_parsed", "Upload and parse an active résumé before generating the research prompt.")
+        result = build_research_prompt(
+            profile,
+            resume_text,
+            target_role=body.target_role,
+            location=body.location,
+            remote_only=body.remote_only,
+        )
+        return _data(result)
 
     @application.patch("/api/v1/jobs/{job_id}", tags=["jobs"])
     async def patch_job(
@@ -3259,6 +3284,57 @@ def create_app(
         if row is None:
             raise ApiError(503, "data_store_invalid_response", "The application could not be saved.")
         return _data(row)
+
+    @application.post(
+        "/api/v1/applications/send-batch",
+        status_code=status.HTTP_202_ACCEPTED,
+        tags=["applications", "automation"],
+    )
+    async def queue_application_send_batch(
+        body: SendApplicationBatchRequest,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        """Reserve and queue up to 30 reviewed emails for the persistent worker.
+
+        The database function performs the approval, duplicate, Gmail-account, and
+        daily-cap checks transactionally with the queue insert.  No Gmail call is
+        made from this Vercel request.
+        """
+
+        client = store_service.user(user.access_token)
+        queued: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for application_id in body.application_ids:
+            item_key = f"{body.idempotency_key}-{application_id.hex[:24]}"
+            try:
+                row = _first(
+                    await client.rpc(
+                        "enqueue_email_send",
+                        {
+                            "application_id_input": str(application_id),
+                            "idempotency_key_input": item_key,
+                            "attach_resume_input": body.attach_resume,
+                        },
+                    )
+                )
+                if row is None:
+                    raise ApiError(503, "email_queue_unavailable", "The email could not be queued.")
+                queued.append(row)
+            except ApiError as exc:
+                rejected.append(
+                    {
+                        "application_id": str(application_id),
+                        "code": exc.code,
+                        "message": str(exc),
+                    }
+                )
+        return {
+            "queued": queued,
+            "rejected": rejected,
+            "count": len(queued),
+            "requested": len(body.application_ids),
+            "daily_app_cap": 150,
+        }
 
     @application.get("/api/v1/applications/{application_id}", tags=["applications"])
     async def get_application(
@@ -3793,300 +3869,36 @@ def create_app(
         row = await _required_row(client, "applications", user, application_id)
         return {"data": row, "send_event": event}
 
-    async def finalize_send(
-        application_id: UUID,
-        idempotency_key: str,
-        outcome: str,
-        *,
-        provider_message_id: str | None = None,
-        provider_thread_id: str | None = None,
-        error_code: str | None = None,
-    ) -> dict[str, Any] | None:
-        result = await store_service.secret().rpc(
-            "finalize_application_send",
-            {
-                "application_id": str(application_id),
-                "idempotency_key": idempotency_key,
-                "outcome": outcome,
-                "provider_message_id": provider_message_id,
-                "provider_thread_id": provider_thread_id,
-                "error_code": error_code,
-            },
-        )
-        return _first(result)
-
-    async def prepare_gmail_send(
-        client: StoreClient,
-        user: AuthUser,
-        *,
-        attach_resume: bool,
-    ) -> dict[str, Any]:
-        """Prepare provider inputs without dispatching an externally meaningful send."""
-
-        connection = await client.fetch_one(
-            "connections",
-            filters={"user_id": str(user.user_id), "provider": "gmail", "status": "connected"},
-        )
-        if connection is None:
-            raise ApiError(409, "gmail_not_connected", "Connect Gmail before sending.")
-
-        server = store_service.secret()
-        secret_row = await server.fetch_one(
-            "connection_secrets",
-            filters={
-                "connection_id": connection["id"],
-                "user_id": str(user.user_id),
-            },
-        )
-        if secret_row is None:
-            raise ApiError(
-                409, "gmail_reauthorization_required", "Reconnect Gmail before sending."
-            )
-
-        cipher = _cipher(runtime_settings)
-        try:
-            access_token = cipher.decrypt_optional(secret_row.get("access_token_ciphertext"))
-            refresh_token = cipher.decrypt_optional(secret_row.get("refresh_token_ciphertext"))
-        except TokenCipherError as exc:
-            raise ApiError(
-                409, "gmail_reauthorization_required", "Reconnect Gmail before sending."
-            ) from exc
-
-        expires_at = _parse_timestamp(connection.get("expires_at"))
-        if not access_token or (
-            expires_at is not None and expires_at <= _now() + timedelta(seconds=90)
-        ):
-            if not refresh_token:
-                raise ApiError(
-                    409, "gmail_reauthorization_required", "Reconnect Gmail before sending."
-                )
-            metadata = connection.get("metadata")
-            metadata = metadata if isinstance(metadata, Mapping) else {}
-            credential_source = metadata.get("oauth_client_source", "platform")
-            credential_generation = (
-                _positive_integer(metadata.get("oauth_client_generation"))
-                if credential_source == "user"
-                else None
-            )
-            if credential_source == "user" and credential_generation is None:
-                raise ApiError(
-                    409,
-                    "gmail_reauthorization_required",
-                    "Reconnect Gmail before sending.",
-                )
-            try:
-                oauth_credentials = await resolve_google_oauth_credentials(
-                    str(credential_source),
-                    user.user_id,
-                    expected_generation=credential_generation,
-                )
-            except ApiError as exc:
-                raise ApiError(
-                    409,
-                    "gmail_reauthorization_required",
-                    "Reconnect Gmail before sending.",
-                ) from exc
-            refreshed = await run_in_threadpool(
-                refresh_google_access_token,
-                refresh_token,
-                oauth_credentials.client_id,
-                oauth_credentials.client_secret,
-            )
-            access_token = refreshed["access_token"]
-            refresh_token = refreshed.get("refresh_token", refresh_token)
-            try:
-                secret_updates: dict[str, Any] = {
-                    "access_token_ciphertext": cipher.encrypt(access_token),
-                    "refresh_token_ciphertext": cipher.encrypt(refresh_token),
-                    "token_type": refreshed.get("token_type", "Bearer"),
-                }
-            except TokenCipherError as exc:
-                raise ApiError(
-                    503,
-                    "token_encryption_unavailable",
-                    "Provider connections are not configured.",
-                ) from exc
-            await server.update(
-                "connection_secrets",
-                secret_updates,
-                filters={
-                    "connection_id": connection["id"],
-                    "user_id": str(user.user_id),
-                },
-                returning=False,
-            )
-            expires_in = refreshed.get("expires_in")
-            if isinstance(expires_in, int):
-                expires_at = _now() + timedelta(seconds=max(0, expires_in))
-                await server.update(
-                    "connections",
-                    {"expires_at": _iso(expires_at), "last_verified_at": _iso(_now())},
-                    filters={"id": connection["id"], "user_id": str(user.user_id)},
-                    returning=False,
-                )
-
-        pdf_bytes: bytes | None = None
-        pdf_filename = "resume.pdf"
-        if attach_resume:
-            resume = await client.fetch_one(
-                "resumes", filters={"user_id": str(user.user_id), "is_active": True}
-            )
-            if resume is None:
-                raise ApiError(409, "resume_required", "Select an active résumé before sending.")
-            pdf_bytes = await client.download_object(RESUME_BUCKET, resume["storage_path"])
-            if (
-                len(pdf_bytes) > runtime_settings.max_resume_bytes
-                or not pdf_bytes.lstrip().startswith(b"%PDF-")
-            ):
-                raise ApiError(422, "resume_invalid_pdf", "The active résumé is not a valid PDF.")
-            pdf_filename = resume.get("original_name") or "resume.pdf"
-
-        return {
-            "access_token": access_token,
-            "sender": connection.get("display_name"),
-            "pdf_bytes": pdf_bytes,
-            "pdf_filename": pdf_filename,
-        }
-
-    @application.post("/api/v1/applications/{application_id}/send", tags=["applications"])
+    @application.post(
+        "/api/v1/applications/{application_id}/send",
+        status_code=status.HTTP_202_ACCEPTED,
+        tags=["applications", "automation"],
+    )
     async def send_application(
         application_id: UUID,
         body: SendApplicationRequest,
         user: AuthUser = Depends(current_user),
     ) -> dict[str, Any]:
-        client = store_service.user(user.access_token)
-        app_row = await _required_row(client, "applications", user, application_id)
-        if app_row.get("status") == "sent":
-            return _data(app_row)
-        if app_row.get("status") != "approved":
-            raise ApiError(409, "application_not_approved", "Approve this exact draft before sending.")
+        """Queue one approved email; delivery happens in the persistent worker.
 
-        reservation = _first(
+        Keep this compatibility endpoint asynchronous too. Older clients used
+        this route directly and must not bring the Gmail request back into a
+        Vercel function just because they have not adopted the batch endpoint.
+        """
+        client = store_service.user(user.access_token)
+        queued = _first(
             await client.rpc(
-                "reserve_application_send",
+                "enqueue_email_send",
                 {
-                    "application_id": str(application_id),
-                    "idempotency_key": body.idempotency_key,
+                    "application_id_input": str(application_id),
+                    "idempotency_key_input": body.idempotency_key,
+                    "attach_resume_input": body.attach_resume,
                 },
             )
         )
-        if reservation is None:
-            raise ApiError(409, "send_not_reserved", "The send could not be reserved.")
-        if reservation.get("outcome") == "sent":
-            return _data(await _required_row(client, "applications", user, application_id))
-        if reservation.get("outcome") != "pending_provider":
-            raise ApiError(409, "idempotency_key_consumed", "Use a new send request identifier.")
-
-        try:
-            prepared = await prepare_gmail_send(
-                client, user, attach_resume=body.attach_resume
-            )
-        except (ApiError, GoogleProviderError) as exc:
-            error_code = exc.code
-            try:
-                await finalize_send(
-                    application_id,
-                    body.idempotency_key,
-                    "failed",
-                    error_code=error_code,
-                )
-            except ApiError as finalize_error:
-                raise ApiError(
-                    503,
-                    "send_cleanup_unavailable",
-                    "The send was not dispatched, but its reservation could not be released. Reconcile it later.",
-                ) from finalize_error
-            if isinstance(exc, GoogleProviderError):
-                raise _google_error(exc) from exc
-            raise
-        except Exception as exc:
-            try:
-                await finalize_send(
-                    application_id,
-                    body.idempotency_key,
-                    "failed",
-                    error_code="send_preparation_failed",
-                )
-            except ApiError as finalize_error:
-                raise ApiError(
-                    503,
-                    "send_cleanup_unavailable",
-                    "The send was not dispatched, but its reservation could not be released. Reconcile it later.",
-                ) from finalize_error
-            raise ApiError(
-                503,
-                "send_preparation_failed",
-                "The message could not be prepared and was not sent.",
-            ) from exc
-
-        try:
-            sent = await run_in_threadpool(
-                send_gmail_message,
-                prepared["access_token"],
-                app_row["recipient"],
-                app_row["subject"],
-                app_row["body"],
-                sender=prepared["sender"],
-                pdf_bytes=prepared["pdf_bytes"],
-                pdf_filename=prepared["pdf_filename"],
-            )
-        except GoogleProviderError as exc:
-            ambiguous = exc.code == "gmail_send_ambiguous"
-            try:
-                await finalize_send(
-                    application_id,
-                    body.idempotency_key,
-                    "needs_attention" if ambiguous else "failed",
-                    error_code=exc.code,
-                )
-            except ApiError as finalize_error:
-                raise ApiError(
-                    409,
-                    "send_confirmation_missing",
-                    "Gmail did not produce a durable confirmation. Reconcile this send before any retry.",
-                ) from finalize_error
-            raise _google_error(exc) from exc
-        except Exception as exc:
-            try:
-                await finalize_send(
-                    application_id,
-                    body.idempotency_key,
-                    "needs_attention",
-                    error_code="gmail_send_unconfirmed",
-                )
-            except ApiError as finalize_error:
-                raise ApiError(
-                    409,
-                    "send_confirmation_missing",
-                    "Gmail did not produce a durable confirmation. Reconcile this send before any retry.",
-                ) from finalize_error
-            raise ApiError(
-                409,
-                "gmail_send_ambiguous",
-                "Gmail did not confirm the send. Check message status before retrying.",
-            ) from exc
-
-        try:
-            finalized = await finalize_send(
-                application_id,
-                body.idempotency_key,
-                "sent",
-                provider_message_id=sent["id"],
-                provider_thread_id=sent.get("thread_id"),
-            )
-        except ApiError as exc:
-            raise ApiError(
-                409,
-                "send_confirmation_missing",
-                "Gmail accepted the message but it was not durably finalized. Reconcile before any retry.",
-            ) from exc
-        if finalized is None:
-            raise ApiError(
-                409,
-                "send_confirmation_missing",
-                "Gmail accepted the message but the application needs reconciliation.",
-            )
-        return _data(await _required_row(client, "applications", user, application_id))
+        if queued is None:
+            raise ApiError(503, "email_queue_unavailable", "The email could not be queued.")
+        return {"data": queued, "queued": True, "worker": "persistent"}
 
     @application.get("/api/v1/connections", tags=["connections"])
     async def list_connections(user: AuthUser = Depends(current_user)) -> dict[str, Any]:

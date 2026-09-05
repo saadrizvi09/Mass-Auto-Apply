@@ -13,6 +13,7 @@ from app.saas.schemas import (
     PublicAtsDiscoveryRequest,
     ResumeGuidedDiscoveryRequest,
     ResumeRegister,
+    SendApplicationBatchRequest,
     SendApplicationRequest,
     UserSettingsUpdate,
     normalized_http_url,
@@ -128,11 +129,30 @@ def test_job_requires_real_http_url_and_description() -> None:
 
 
 def test_user_send_cap_and_idempotency_are_bounded() -> None:
-    assert UserSettingsUpdate(daily_send_cap=25).daily_send_cap == 25
+    assert UserSettingsUpdate(daily_send_cap=150).daily_send_cap == 150
     with pytest.raises(ValidationError):
-        UserSettingsUpdate(daily_send_cap=26)
+        UserSettingsUpdate(daily_send_cap=151)
     with pytest.raises(ValidationError):
         SendApplicationRequest(idempotency_key="short")
+
+
+def test_email_batch_selection_is_unique_and_capped_at_thirty() -> None:
+    ids = [f"11111111-1111-4111-8111-{index:012d}" for index in range(30)]
+    request = SendApplicationBatchRequest(
+        application_ids=ids,
+        idempotency_key="batch-request-123",
+    )
+    assert len(request.application_ids) == 30
+    with pytest.raises(ValidationError):
+        SendApplicationBatchRequest(
+            application_ids=ids + ["22222222-2222-4222-8222-222222222222"],
+            idempotency_key="batch-request-123",
+        )
+    with pytest.raises(ValidationError):
+        SendApplicationBatchRequest(
+            application_ids=[ids[0], ids[0]],
+            idempotency_key="batch-request-123",
+        )
 
 
 def test_worker_kind_is_allowlisted() -> None:

@@ -1,6 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "regions": ["bom1"],
+  "functions": {
+    "app/saas_main.py": {
+      "maxDuration": 60
+    }
+  },
   "headers": [
     {
       "source": "/app.js",

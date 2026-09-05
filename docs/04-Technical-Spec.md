@@ -19,7 +19,8 @@
 │       ├── schemas.py               # public request/response models
 │       ├── crypto.py                # provider credential/token encryption
 │       ├── groq.py                  # account-scoped Groq adapter
-│       ├── hunter.py                # account-scoped Hunter validation/HR contacts
+│       ├── hunter.py                # legacy provider adapter retained for compatibility
+│       ├── public_contacts.py       # credential-free owned-record contact candidates
 │       ├── gmail.py                 # web OAuth and Gmail send adapter
 │       ├── browser.py               # managed-browser control adapter
 │       ├── providers.py             # capability catalog/allowlist
@@ -81,7 +82,7 @@ GOOGLE_CLIENT_SECRET=...
 
 GROQ_MODEL=openai/gpt-oss-120b
 MAX_RESUME_BYTES=6291456
-DEFAULT_DAILY_SEND_CAP=10
+DEFAULT_DAILY_SEND_CAP=150
 
 # Optional platform fallback for managed-browser application features.
 # A validated account-scoped Browserbase credential takes priority.
@@ -97,7 +98,7 @@ WORKER_LEASE_SECONDS=120
 The Supabase secret key, encryption key, platform Google client secret, user-managed
 Google client credentials, provider tokens, and browser connection URLs must never be
 returned by `/config`, embedded in JavaScript, stored in browser storage, or logged.
-User-supplied Groq, Hunter, and Browserbase credentials are submitted once through the
+User-supplied Groq and Browserbase credentials are submitted once through the
 authenticated provider-credential API, encrypted as versioned JSON with
 `TOKEN_ENCRYPTION_KEY`, and persisted only in the service-role-only
 `user_provider_credentials` table. API responses expose only provider status, safe
@@ -137,16 +138,17 @@ job boards themselves inside Browserbase Live View. The Google Forms connection 
 optional: ordinary public forms continue to use an ephemeral browser, while a scanned
 form containing a signed-in résumé/CV upload returns `provider_login_required` until
 that tenant has connected an isolated Google browser context. Gmail OAuth tokens do
-not provide browser cookies and cannot satisfy this requirement. Groq and Hunter are
-also account-scoped encrypted credentials rather than worker environment variables;
-there is no deployment-wide `GROQ_API_KEY` or `HUNTER_API_KEY`. Hunter contact lookup
-remains a foreground, user-initiated API call.
+not provide browser cookies and cannot satisfy this requirement. Groq is an
+account-scoped encrypted credential rather than a worker environment variable; there
+is no deployment-wide `GROQ_API_KEY` or contact-provider key. Public contact lookup
+remains a foreground, user-initiated extraction from the owned job record.
 
 ## 3. Database schema
 
 The canonical executable schema is the ordered Supabase migrations. Deployments must
-apply through `202608150003_yc_exact_job_automation.sql`. That migration installs the
-exact-current-YC-job target contract, tenant-only YC preferences, provider/job binding,
+apply through `202609050001_outreach_email_queue.sql`. The final migration installs the
+durable reviewed Gmail queue in addition to the exact-current-YC-job target contract,
+tenant-only YC preferences, provider/job binding,
 and service-role guards without enabling YC discovery. In particular,
 `202608130001_google_forms_manual_submit.sql` is a temporary fail-closed state;
 `202608130002_google_forms_approved_submit.sql` is the required forward migration that
@@ -193,7 +195,7 @@ private path, an expiring signed URL, or a link inferred from the uploaded PDF.
 
 ```sql
 user_id uuid primary key references auth.users(id) on delete cascade,
-daily_send_cap integer not null default 10 check (daily_send_cap between 0 and 25),
+daily_send_cap integer not null default 150 check (daily_send_cap between 0 and 150),
 duplicate_window_days integer not null default 7,
 require_review boolean not null default true,
 timezone text not null default 'UTC',
@@ -364,7 +366,7 @@ leaves this separate client configuration until the user deletes it.
 
 ### `user_provider_credentials`
 
-Server-only encrypted BYOK credentials for `groq`, `hunter`, and `browserbase`. RLS is
+Server-only encrypted BYOK credentials for `groq`, legacy `hunter`, and `browserbase`. RLS is
 enabled with no browser policy; privileges are revoked from `public`, `anon`, and
 `authenticated`, and the service role is the only database role with access:
 
@@ -382,7 +384,7 @@ primary key (user_id, provider)
 ```
 
 The ciphertext is a versioned JSON envelope encrypted with `TOKEN_ENCRYPTION_KEY`.
-Groq and Hunter contain one provider key; Browserbase contains both the API key and
+Groq and the legacy Hunter adapter contain one provider key; Browserbase contains both the API key and
 Project ID. Save/delete RPCs use an account/provider advisory lock, increment the
 generation on replacement, write a secret-free audit event, and cascade on account
 deletion. Replacing or deleting Browserbase BYOK is rejected while that account has an
@@ -582,11 +584,11 @@ All routes are under `/api/v1`. Private routes require a Supabase bearer JWT.
 
 | Method | Path | Result |
 |---|---|---|
-| GET | `/api/v1/provider-credentials` | list safe status/hints for the caller's Groq, Hunter, and Browserbase credentials |
-| PUT | `/api/v1/provider-credentials/{provider}` | validate, encrypt, and create/replace one owned credential; `provider` is `groq`, `hunter`, or `browserbase` |
+| GET | `/api/v1/provider-credentials` | list safe status/hints for the caller's Groq and Browserbase credentials |
+| PUT | `/api/v1/provider-credentials/{provider}` | validate, encrypt, and create/replace one owned credential; active UI providers are `groq` and `browserbase` |
 | DELETE | `/api/v1/provider-credentials/{provider}` | delete one owned encrypted credential after lifecycle guards pass |
 
-The PUT body is `{ "api_key": "..." }` for Groq/Hunter and
+The PUT body is `{ "api_key": "..." }` for Groq (and the retained legacy Hunter adapter) and
 `{ "api_key": "...", "project_id": "..." }` for Browserbase. It validates before
 persistence and then discards the request plaintext. Browserbase validation calls
 `GET https://api.browserbase.com/v1/projects/{project_id}` with `X-BB-API-Key`, requires
@@ -610,18 +612,18 @@ Groq generation routes resolve and decrypt the authenticated user's verified cre
 just in time. No key header, query parameter, queue payload, or provider key appears in
 the response.
 
-### Hunter
+### Public contact leads
 
 | Method | Path | Result |
 |---|---|---|
-| POST | `/api/v1/jobs/{id}/contacts/hunter?limit=1..10` | search bounded HR contacts for the owned job's company |
+| POST | `/api/v1/jobs/{id}/contacts/public` | extract bounded contact candidates from the owned job record |
 
-The endpoint resolves the authenticated user's verified encrypted Hunter credential.
-The adapter uses Hunter's `X-API-Key` provider header, never a query parameter; applies
-fixed timeouts; does not cache/log/return the key or provider error body; and returns
-only bounded domain, email, name, position, confidence, and verification status fields.
-The endpoint loads the owned job before provider lookup and requires its company name.
-It exposes no durable Hunter job or unattended company search.
+The endpoint requires no credential and does not crawl arbitrary sites, infer a person's
+address from a domain, probe SMTP, or send verification email. It extracts addresses
+already present in the saved contact field or job description, returns source provenance
+and `public_source_unverified`, and leaves selection to the user. The existing Groq
+draft, exact review, final confirmation, Gmail send, daily-cap, duplicate-recipient, and
+idempotency gates remain authoritative.
 
 ### Jobs/applications
 
@@ -689,7 +691,12 @@ unofficial, page/result bounded, has no account context, and cannot create an
 application-submit job.
 
 The résumé-guided request body accepts optional location (120 characters),
-`remote_only`, `linkedin_limit` 1–25, `feed_limit` 1–200, and a caller idempotency key.
+`remote_only`, legacy per-source limits (`linkedin_limit` 1–25 and `feed_limit` 1–200),
+an optional shared `max_jobs` budget of 2–50, an optional `timeout_seconds` budget of
+15–120 seconds, and a caller idempotency key. The active UI sends the shared budget
+and deadline. The worker runs selected public collectors concurrently, enforces the
+deadline, persists completed bounded results, and reports source timeouts instead of
+leaving a run spinning indefinitely.
 It requires an owned active résumé with `parse_status=parsed`, reserves one Groq
 generation, derives at most 5 roles, 12 keywords, and 20 combined search terms, and
 chooses request location → saved discovery location → profile location → `India`.
@@ -827,7 +834,7 @@ message content are never returned in errors.
 API and every worker. Provider tokens and credentials are encrypted using authenticated
 encryption (Fernet in the initial Python implementation). Token/context ciphertext is
 stored only in `connection_secrets`; user Web OAuth client-ID/client-secret ciphertext
-is stored only in `user_google_oauth_clients`; Groq, Hunter, and Browserbase encrypted
+is stored only in `user_google_oauth_clients`; Groq and Browserbase encrypted
 JSON envelopes are stored only in `user_provider_credentials`. All three tables are
 service-role-only.
 
@@ -839,33 +846,34 @@ worker.
 
 ## 9. Gmail send algorithm
 
-1. Authenticate user and load owned application/job/resume/Gmail connection.
-2. Require `status=approved`, non-empty recipient/subject/body, and active résumé when
-   attachment is requested.
-3. Atomically reserve `(user_id, idempotency_key)` and enforce daily/duplicate limits.
-   The same transaction locks the pseudonymous Gmail-account hash, enforces a hard
-   provider-account ceiling of 25 reservations per rolling 24 hours across recreated
-   accounts, and inserts a maximum-90-day provider-ledger row.
-4. Refresh Google access token if needed with the credential source/generation saved on
-   the connection; never fall back to a different client. Preserve the stored refresh
-   token when Google omits a replacement.
-5. Construct RFC-compliant MIME, attach PDF, base64url encode, and call
-   `users.messages.send`.
-6. Persist provider IDs and terminal `sent` status.
-7. On an ambiguous timeout, mark `needs_attention` and reconcile; do not blindly resend.
+1. Authenticate the user and call `enqueue_email_send` for an approved email application.
+2. In one transaction, require the exact approved revision, connected Gmail account,
+   non-empty recipient/subject/body, active résumé when requested, and a new
+   idempotency key. Enforce the tenant cap and a hard 150-message rolling provider cap.
+3. Insert a `send_email` automation row whose payload contains only `attach_resume`.
+   Never put Gmail tokens, résumé bytes, or message content in the queue row.
+4. The persistent worker claims the row, refreshes the token with the connection's
+   credential source/generation, loads the résumé/application server-side, and calls
+   `users.messages.send` outside Vercel.
+5. Persist provider IDs and terminal `sent` status through the service RPC. A confirmed
+   Gmail 429 is retried with bounded worker backoff; an ambiguous timeout becomes
+   `needs_attention` and must be reconciled before another send.
 
 ### 9.1 Reviewed outreach client orchestration
 
-The browser provides convenience orchestration without creating a bulk-send API:
+The browser provides convenience orchestration around a durable, review-gated queue:
 
-1. Build an in-memory selection of at most 10 owned, non-archived jobs.
-2. Require a parsed active résumé, verified account-scoped Groq/Hunter credentials, and a connected
-   Gmail account. Show projected Hunter credit use inline before the user explicitly
-   starts the search; no additional confirmation dialog is required for that lookup.
-3. For each selected job, call the owned Hunter contact endpoint sequentially with
-   `limit=5`; stop visibly on quota exhaustion. Let the user choose one returned
-   contact and persist only that chosen email on the job.
-4. For each chosen contact, call the existing Groq draft endpoint sequentially. The
+1. Generate a bounded résumé-bound external-AI research prompt. The user runs it in
+   Claude, ChatGPT, or Gemini with web/search access and uploads the resulting workbook.
+   The workbook must contain the exact JD, job URL, source URL, contact provenance, and
+   only publicly listed emails; unknown values stay blank and no mailbox is probed.
+2. Parse CSV/XLSX in memory, select a recognizable data sheet (README sheets are
+   ignored), validate public URLs and email syntax, and ingest no more than 200 rows.
+3. Build an in-memory selection of at most 30 owned, non-archived jobs in user order.
+4. Require a parsed active résumé, a verified account-scoped Groq credential, and a
+   connected Gmail account. No contact-provider credential is required. For each
+   selected job, expose only saved public-source candidates and let the user choose.
+5. For each chosen contact, call the existing Groq draft endpoint sequentially. The
    resulting application remains editable and unapproved.
 5. Open the second **Review & send** subtab inside the **Mass Cold Email** destination.
    The sidebar exposes no separate review item. Editing content invalidates prior
@@ -874,16 +882,17 @@ The browser provides convenience orchestration without creating a bulk-send API:
    Pilot keeps ATS/form revisions, answer controls, approval-bound submit progress,
    verified confirmation, and any needs-attention Live View fallback inside its own
    destination.
-6. Gather at most 10 selected applications that are currently approved and have a
+6. Gather at most 30 selected applications that are currently approved and have a
    recipient, display an irreversible-action confirmation listing the targets, then
-   call `POST /api/v1/applications/{id}/send` sequentially with a unique idempotency key
-   and `attach_resume=true`.
-7. Report each result and stop safely on daily/provider cap or Gmail reauthorization
-   errors. The API remains authoritative for ownership, approval, recipient duplicate,
-   daily/provider quota, and idempotency enforcement on every call.
+   call `POST /api/v1/applications/send-batch` once with per-application idempotency
+   keys and `attach_resume=true`.
+7. Report queued/rejected items. The API remains authoritative for ownership, approval,
+   recipient duplicate, daily/provider quota, and idempotency enforcement; the worker
+   continues delivery after the browser closes.
 
-Selections and Hunter candidates are browser memory only. There is no autonomous send
-scheduler, batch provider call, inherited approval, or unreviewed bulk cold-email path.
+Selections and public-contact candidates are browser memory only. The durable queue is
+not an approval shortcut: every message still has an individually approved exact
+revision, a separate final confirmation, and a 150/day ceiling.
 
 ## 10. Provider catalog
 
@@ -998,7 +1007,7 @@ allowlist.
 
 Application-owned browser storage contains only non-secret interface preferences such
 as `autoapply.ui_preferences.v1`; Supabase Auth manages its own namespaced session
-values. Groq, Hunter, and Browserbase keys/project IDs must not be written to
+values. Groq and Browserbase keys/project IDs must not be written to
 `localStorage`, `sessionStorage`, IndexedDB, cookies, URLs, DOM HTML, or analytics.
 Credential inputs use `type=password` where appropriate, are posted once over HTTPS to
 the authenticated provider-credential endpoint, and are cleared immediately after the
@@ -1006,12 +1015,12 @@ request. Subsequent views use only safe status/hints from
 `GET /api/v1/provider-credentials`. Outreach selection/contact candidates remain
 in-memory UI state and reset with the authenticated workspace state.
 
-The sole transition exception is a one-time authenticated import of namespaced legacy
-Groq/Hunter values created by the previous release. The client submits each value to
-the normal validated PUT endpoint and deletes the legacy copy only after successful
-encrypted save (or when that provider is already configured). A failed import retains
-the copy and shows a retry warning; it must never fall back to a key header. New saves
-never write provider credentials to browser storage.
+The sole transition exception is a one-time authenticated import of the namespaced
+legacy Groq value created by the previous release. The client submits it to the normal
+validated PUT endpoint and deletes the legacy copy only after successful encrypted save
+(or when the provider is already configured). A failed import retains the copy and
+shows a retry warning; it must never fall back to a key header. New saves never write
+provider credentials to browser storage.
 
 All imported/provider text is rendered through DOM `textContent`, not HTML templates,
 to prevent stored XSS.
@@ -1039,15 +1048,16 @@ to prevent stored XSS.
   redaction, fixed redirect, and disconnect-before-replace/delete behavior.
 - Resume path/MIME/size/PDF tests.
 - Five-slot Storage quota and concurrent transactional registration tests.
-- Provider-credential API/migration tests covering Groq/Hunter/Browserbase validation,
+- Provider-credential API/migration tests covering Groq/Browserbase validation,
   authenticated ownership, versioned encryption, service-role-only persistence, safe
   hints/status, replacement generation, deletion guards, and account cascade.
-- Frontend tests proving new Groq, Hunter, and Browserbase secrets never enter browser
-  storage, credential inputs are cleared after save, and legacy Groq/Hunter import
+- Frontend tests proving new Groq and Browserbase secrets never enter browser
+  storage, credential inputs are cleared after save, and legacy Groq import
   removes a namespaced browser copy only after successful encrypted persistence while
   retaining it with a warning on failure.
-- Hunter adapter/API tests covering stored-key secrecy, account-quota allowlisting,
-  HR-only 1–10 contact bounds, safe provider failures, and tenant ownership.
+- Public-contact API tests covering stored-record extraction, syntax-only status,
+  bounded candidates, safe no-result behavior, and tenant ownership. The retained
+  Hunter adapter has separate compatibility tests and is not part of the active UI.
 - Send approval/idempotency/tenant and persistent provider-ledger quota tests.
 - OAuth-generation callback/reconnect/disconnect race and revocation-failure tests.
 - OAuth credential-source/generation binding tests proving stale callbacks and refreshes
@@ -1058,8 +1068,8 @@ to prevent stored XSS.
 - Résumé-guided API/privacy/failure tests, public-feed search-term filtering, and
   tenant-scoped Google Forms queue deduplication/application-link/pagination tests.
 - LinkedIn guest page/result/throttle bounds and explicit Easy Apply exclusion tests.
-- Frontend max-10 selection and staging checks for inline projected Hunter credit use,
-  an explicit search click, contact choice, per-application exact approval, final
+- Frontend max-10 selection and staging checks for an explicit public-contact lookup,
+  contact choice, per-application exact approval, final
   confirmation, and sequential reuse of the gated Gmail single-send endpoint.
 - Exact immutable form-revision, stale hash/answers, supersession, ownership, and
   service-RPC lease-binding tests.

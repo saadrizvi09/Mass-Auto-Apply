@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import worker.discovery_runtime as discovery_runtime
 from worker.discovery_runtime import DiscoveryJobHandler
 from worker.handlers import AutomationJob, handle_job
 
@@ -312,6 +313,38 @@ def test_linkedin_source_failure_is_needs_attention_not_empty_success() -> None:
 
     assert outcome.status == "needs_attention"
     assert outcome.code == "discovery_source_unavailable"
+    assert repository.calls == []
+
+
+def test_linkedin_time_limit_is_needs_attention_without_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def time_limited(*_args: Any, **_kwargs: Any) -> Any:
+        raise discovery_runtime.DiscoveryTimeLimitExceeded
+
+    monkeypatch.setattr(discovery_runtime, "_run_with_deadline", time_limited)
+    repository = FakeRepository()
+    handler = DiscoveryJobHandler(
+        repository,
+        worker_id="worker-1",
+        fallback=handle_job,
+        linkedin_discovery=lambda *_args, **_kwargs: [],
+    )
+    job = AutomationJob.from_record(
+        _record(
+            "discover_linkedin_guest",
+            "linkedin",
+            {
+                "keywords": "backend engineer",
+                "location": "India",
+                "limit": 5,
+                "timeout_seconds": 15,
+            },
+        )
+    )
+
+    outcome = asyncio.run(handler(job))
+
+    assert outcome.status == "needs_attention"
+    assert outcome.code == "discovery_time_limit"
     assert repository.calls == []
 
 

@@ -531,6 +531,11 @@ def build_job_handler(
             allowed_providers=settings.allowed_browser_providers,
             fallback=handler,
         )
+    from worker.email_runtime import build_email_job_handler
+
+    handler = build_email_job_handler(
+        store.repository, settings=settings, fallback=handler
+    )
     from worker.discovery_runtime import DiscoveryJobHandler
 
     return DiscoveryJobHandler(

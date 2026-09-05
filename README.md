@@ -2,8 +2,8 @@
 
 AutoApply Cloud is a multi-user job-application workspace designed for Vercel and
 Supabase. Each user signs in, uploads a private PDF résumé, maintains their own profile
-and job pipeline, derives bounded public-job searches from that résumé, finds a
-recruiting contact with an account-scoped Hunter key, drafts tailored outreach with an
+and job pipeline, derives bounded public-job searches from that résumé, extracts public
+contact leads already present in job records, drafts tailored outreach with an
 account-scoped Groq key, connects Gmail through OAuth, reviews every message, and tracks
 applications. User-supplied provider credentials are encrypted before service-role-only
 persistence, so they follow the account across browsers without becoming browser data.
@@ -33,11 +33,11 @@ unavailable, [open the source MP4](./docs/demo/autoapply-complete-product-demo.m
 | Tenant isolation | Every user-owned database row and résumé object is protected by Supabase RLS |
 | Résumés and profile facts | Up to five fixed private Storage slots, atomic registration/activation, PDF parsing, and conservative profile suggestions. A user-supplied public HTTPS résumé URL is stored separately from the private PDF; common graduation/passout questions use `graduation_year`, while recognized résumé/CV URL questions use only that public URL. |
 | Groq | A per-user key is validated, encrypted with `TOKEN_ENCRYPTION_KEY`, and stored in the service-role-only `user_provider_credentials` table. API responses expose only safe status/hints; the key supports résumé-guided search planning, reviewed email drafts, and one automatic grounded suggestion request when an eligible Form Pilot revision loads. |
-| Hunter | An optional per-user key uses the same encrypted account-scoped credential store. It is decrypted only for an explicit validation/contact search and is never returned to the browser; no deployment-level Hunter key is required. |
+| Public contact leads | Contact discovery requires no provider key. It extracts syntactically valid addresses already present in public listings, referral text, CSV/XLSX imports, or a user-saved job record, and labels every candidate unverified. It never guesses addresses, probes SMTP/mailboxes, or sends verification mail. |
 | Browserbase | A user may bring a Browserbase API key and Project ID. AutoApply validates the pair without creating a session, stores the encrypted pair per account, and prefers it for that user's browser work. Trusted deployment credentials are an optional platform fallback. |
 | Discovery | Résumé-guided Groq terms for bounded Telegram/RSS filtering and LinkedIn guest search, full referral-digest parsing, CSV/XLSX imports, individual ATS URL detection, a review queue for discovered Google Forms, and bounded public-board enumeration |
-| Jobs | Review/deduplicate discovered roles, save job descriptions and URLs, edit/archive records, and create tailored drafts |
-| Applications | Form Pilot owns Google Form scan, answer review, and one explicit **Approve & submit in background** action. The worker submits only the exact approved revision and reports success only after fresh provider confirmation; Browserbase Live View appears only when a run needs attention. Mass Cold Email separately handles only email drafts, exact approval, sequential Gmail sending, and status/history. |
+| Jobs | Read-only library for imported/discovered roles, résumé-fit signals, URLs, archive/restore, and grounded draft actions. The duplicate manual job editor is removed. |
+| Applications | Form Pilot owns Google Form scan, answer review, and one explicit **Approve & submit in background** action. The worker submits only the exact approved revision and reports success only after fresh provider confirmation; Browserbase Live View appears only when a run needs attention. Mass Cold Email separately handles external-AI workbook import, public-source contact review, Groq drafts, exact approval, and durable Gmail delivery. |
 | Gmail | Google Web OAuth with `openid email profile gmail.send`; platform-managed by default, with an advanced per-user Web OAuth client option; encrypted credentials/tokens and disconnect/revoke |
 | LinkedIn | Bounded unofficial guest-page discovery plus manual handoff; Easy Apply remains excluded unless an official candidate-apply partnership is obtained |
 | Browser application work | One-page Google Forms use scan → exact answer review → explicit approval-bound background submit → verified confirmation. Unknown required fields, login/MFA/CAPTCHA, changed schema, or uncertain confirmation stop as `needs_attention`, with Live View offered only as a fallback. Greenhouse has an aligned managed-browser handler. Lever and Ashby mappings passed read-only live scan canaries but remain disabled pending controlled submit tests; Wellfound still needs its signed-in canary. YC has a finished exact-job state machine: the user saves one current public YC job URL, signs in through a tenant-isolated persistent Browserbase BYOK context, reviews résumé/Groq-grounded answers, and authorizes one sealed submit whose success must be provider-verified. It remains operator-allowlist gated until its signed-in canary passes. The generic exact-host company-form adapter remains an internal canary. Cutshort and Instahyre remain connection-only. |
@@ -75,19 +75,17 @@ Email**. The final destination contains two ordered subtabs: **Build campaign �
    those sealed values and reports success only after it observes a fresh Google Forms
    confirmation. Live View is exposed only when the run stops at `needs_attention`;
    parsing, scanning, and suggestion generation never approve or submit by themselves.
-4. **Mass Cold Email — Build campaign:** add and validate an encrypted account-scoped Hunter key at
-   the top of the view, select at most 10 saved jobs, review the projected Hunter credit
-   use shown inline, start the lookup, choose one returned recruiting contact per job,
-   and ask Groq to create editable drafts.
-   `POST /api/v1/hunter/validate` and
-   `POST /api/v1/jobs/{id}/contacts/hunter` resolve the owned encrypted credential
-   server-side and never return it.
-   Open the second **Review & send** subtab to review and approve the exact content of
-   every application individually, then confirm the final send. The browser invokes
-   the existing one-message Gmail endpoint sequentially for at most 10 approved
-   applications, so daily caps, duplicate-recipient checks, and idempotency
-   reservations still apply to each send. This subtab lists email drafts only; Google
-   Form revisions and answers remain in Form Pilot.
+4. **Mass Cold Email — Build campaign:** generate the résumé-bound external research
+   prompt, paste it into Claude, ChatGPT, or Gemini, and upload the resulting CSV/XLSX
+   workbook. The importer accepts exact job descriptions, public source URLs, named
+   contacts, and publicly listed emails; it never guesses an address or probes a
+   mailbox. Select up to 30 roles in the order you want to process, review any public
+   contact lead, and ask Groq to create editable drafts from the JD and résumé.
+   Open **Review & send** to review and approve each exact draft individually, then
+   confirm the handoff. The API enqueues the approved messages and a persistent worker
+   sends them after the browser closes. Database gates enforce the configured daily
+   cap (150 maximum), duplicate-recipient window, and idempotency. This subtab lists
+   email drafts only; Google Form revisions and answers remain in Form Pilot.
 
 This workflow is a bounded, user-driven convenience layer. It is not an autonomous or
 unreviewed bulk cold-email system; contact lookup, content approval, final confirmation,
@@ -108,6 +106,12 @@ and, for résumé-guided planning, an optional encrypted account-scoped Groq key
 - enumerate published jobs from up to 8 official Greenhouse, Lever, or Ashby company
   boards through their credential-free public APIs; and
 - run a deliberately bounded and throttled LinkedIn guest-job search.
+
+The résumé-guided **Find matching jobs** form exposes a shared maximum of 5, 10, 20,
+or 40 jobs and a 30-second, 60-second, or 2-minute worker time limit. The two queued
+collectors share that result budget; the worker stops source collection at the deadline,
+and the browser stops waiting and requests cancellation if the deadline is reached. A
+worker must run continuously outside Vercel for queued discovery to complete.
 
 **Form Pilot → Referral digest** exposes authenticated
 `POST /api/v1/discovery/referrals`. It accepts the full Telegram, WhatsApp, or email
@@ -203,19 +207,19 @@ résumé removes that object and its résumé metadata, not the user's applicati
 Browser (public SPA)
   ├─ Supabase Auth session
   ├─ private direct résumé upload
-  └─ non-authoritative outreach selection (maximum 10)
+   └─ non-authoritative outreach selection (maximum 30)
             │ bearer JWT
             ▼
 Vercel FastAPI control plane
   ├─ validates the current Supabase user
   ├─ accesses tenant rows with the user's JWT/RLS
-  ├─ resolves account-scoped encrypted Groq/Hunter credentials just in time
-  ├─ runs foreground Groq drafting and explicit Hunter contact searches
+  ├─ resolves account-scoped encrypted Groq credentials just in time
+  ├─ extracts tenant-owned public contact candidates without a contact API key
   ├─ ingests bounded paste/file discovery
   └─ manages Google OAuth and reviewed Gmail sends
             │
             ├─ Supabase Postgres + private Storage
-            ├─ Groq + Hunter (decrypted only for the owned request)
+            ├─ Groq (decrypted only for the owned request)
             └─ persistent worker
                  ├─ résumé-term-filtered Telegram/RSS + LinkedIn guest discovery
                  ├─ Greenhouse/Lever/Ashby public-board discovery
@@ -229,7 +233,7 @@ is used by `app.saas_main:app`.
 ### Account-scoped provider credentials
 
 `GET /api/v1/provider-credentials` returns safe connection status and masked hints for
-`groq`, `hunter`, and `browserbase`. `PUT` and `DELETE`
+`groq` and `browserbase`. `PUT` and `DELETE`
 `/api/v1/provider-credentials/{provider}` validate/replace or remove the authenticated
 user's credential. The API encrypts a versioned JSON payload with
 `TOKEN_ENCRYPTION_KEY` and writes only ciphertext to the service-role-only
@@ -237,9 +241,9 @@ user's credential. The API encrypts a versioned JSON payload with
 roles cannot read that table, ciphertext, or plaintext, and no API response returns a
 saved key.
 
-During the upgrade from the former browser-local Groq/Hunter design, the authenticated
+During the upgrade from the former browser-local Groq design, the authenticated
 frontend performs a one-time import of only the signed-in user's namespaced legacy
-values through these same validated PUT endpoints. It removes a browser copy only after
+value through the same validated PUT endpoint. It removes a browser copy only after
 the encrypted save succeeds; a failed import keeps the copy and shows a retry warning.
 New credentials are never written to browser storage.
 
@@ -448,12 +452,12 @@ Gmail user will configure the advanced user-managed client; setting both enables
 default platform-managed path. These values do not enable Supabase Google account
 login and do not connect Google Forms.
 `TOKEN_ENCRYPTION_KEY` is required for Gmail token storage, user-managed OAuth clients,
-account-scoped Groq/Hunter/Browserbase credentials, and encrypted provider context
+account-scoped Groq/Browserbase credentials, and encrypted provider context
 identifiers. It must be identical in every trusted API/worker environment.
 
-There is deliberately no `HUNTER_API_KEY` deployment variable. A user may keep their
-own Hunter key in their encrypted account credential; explicit Hunter requests decrypt
-it only for the provider call and the API never returns it.
+There is deliberately no `HUNTER_API_KEY` deployment variable or contact-provider
+requirement. The legacy Hunter adapter/API remains disabled in the web UI for old
+clients, while the active workflow uses only public/user-supplied job-record contacts.
 
 Then deploy a preview and promote only after the runbook checks pass:
 
@@ -492,11 +496,13 @@ docker run --env-file .env.worker autoapply-worker
 
 The worker needs `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `TOKEN_ENCRYPTION_KEY`,
 `WORKER_ID`, `WORKER_POLL_SECONDS`, `WORKER_MAX_IDLE_POLL_SECONDS`, and
-`WORKER_LEASE_SECONDS`. It polls at the short interval when work is active, backs off
-toward the idle ceiling after consecutive empty claims, and resets immediately after a
-claim. Browser work additionally needs the exact provider allowlist above and either
-an account-scoped Browserbase BYOK credential or the platform fallback
-`BROWSERBASE_API_KEY`/`BROWSERBASE_PROJECT_ID`. Keep the allowlist
+`WORKER_LEASE_SECONDS`. If platform-managed Gmail is enabled, copy the same
+`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` to the worker; advanced user-managed
+OAuth clients are loaded from encrypted Supabase rows. It polls at the short interval
+when work is active, backs off toward the idle ceiling after consecutive empty claims,
+and resets immediately after a claim. Browser work additionally needs the exact provider
+allowlist above and either an account-scoped Browserbase BYOK credential or the platform
+fallback `BROWSERBASE_API_KEY`/`BROWSERBASE_PROJECT_ID`. Keep the allowlist
 empty until staging has exercised Greenhouse and one-page Google Forms, then begin with
 only those two entries.
 
@@ -522,7 +528,7 @@ python -m pytest
 
 The suite includes legacy pure-logic regression tests plus hosted schema, API,
 encryption, provider, OAuth/MIME, PDF, résumé-guided discovery, Google Forms queue,
-Hunter redaction/bounds, immutable form-revision, worker, outreach-send, and
+public-contact extraction, immutable form-revision, worker, outreach-send, and
 tenant-boundary tests. Mocked provider tests do not replace the live staging gate.
 
 ## Documentation
