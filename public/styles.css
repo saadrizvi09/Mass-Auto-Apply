@@ -2142,11 +2142,18 @@ button[data-busy="true"] {
 }
 
 .file-input {
-  position: absolute;
-  width: 1px;
-  height: 1px;
+  position: absolute !important;
+  top: 0;
+  left: 0;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0;
+  margin: -1px;
   overflow: hidden;
   clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
 .upload-zone label {
@@ -3526,8 +3533,65 @@ button[data-busy="true"] {
 }
 
 .outreach-import-zone {
-  min-height: 150px;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px 20px;
+  padding: 18px 20px;
   margin-top: 2px;
+}
+
+.outreach-import-trigger {
+  display: grid;
+  min-width: 0;
+  min-height: 92px;
+  align-content: center;
+  justify-items: center;
+  gap: 0;
+  padding: 10px 14px;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  text-align: center;
+  cursor: pointer;
+}
+
+.outreach-import-trigger:hover {
+  background: rgb(255 255 255 / 72%);
+  border-color: var(--line);
+}
+
+.outreach-import-trigger strong,
+.outreach-import-trigger small {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.outreach-import-trigger strong {
+  margin: 8px 0 4px;
+  color: var(--navy);
+  text-wrap: balance;
+}
+
+.outreach-import-trigger small {
+  display: block;
+  max-height: 3.2em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.outreach-import-zone > .button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.outreach-import-zone.is-file-selected > .outreach-import-trigger {
+  background: rgb(229 238 228 / 58%);
+  border: 1px solid rgb(45 101 71 / 18%);
 }
 
 .outreach-selection-order {
@@ -6515,6 +6579,14 @@ button[data-busy="true"] {
   .outreach-stage {
     grid-template-columns: 42px minmax(0, 1fr);
     gap: 14px;
+  }
+
+  .outreach-import-zone {
+    grid-template-columns: 1fr;
+  }
+
+  .outreach-import-zone > .button {
+    width: 100%;
   }
 
   .outreach-stage-number {

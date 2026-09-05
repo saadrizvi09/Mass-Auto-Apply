@@ -440,6 +440,7 @@ def test_outreach_is_a_bounded_review_gated_workflow() -> None:
     assert 'id="outreach-research-form"' in outreach_view
     assert 'id="outreach-research-prompt"' in outreach_view
     assert 'id="outreach-import-form"' in outreach_view
+    assert 'id="outreach-import-trigger"' in outreach_view
     assert 'id="outreach-generate-prompt"' in outreach_view
     assert 'id="outreach-download-template"' not in outreach_view
     assert "at least 100 source-verified public contacts" in outreach_view
@@ -468,6 +469,15 @@ def test_outreach_is_a_bounded_review_gated_workflow() -> None:
     assert "findButton.disabled = !selected.length" in APP_JS
     assert 'id="outreach-credit-estimate"' in outreach_view
     assert 'idempotency_key: `outreach-batch-${crypto.randomUUID()}`' in APP_JS
+
+
+def test_outreach_workbook_picker_is_bounded_and_preserves_scroll() -> None:
+    assert ".outreach-import-trigger" in STYLES_CSS
+    assert "grid-template-columns: minmax(0, 1fr) auto" in STYLES_CSS
+    assert "clip-path: inset(50%)" in STYLES_CSS
+    assert 'byId("outreach-import-file")?.click()' in APP_JS
+    assert "rememberOutreachImportScroll" in APP_JS
+    assert 'focus({ preventScroll: true })' in APP_JS
 
 
 def test_mass_cold_email_contains_build_and_review_subtabs() -> None:

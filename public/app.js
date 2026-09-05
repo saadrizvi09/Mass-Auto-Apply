@@ -112,6 +112,7 @@ const state = {
   formWorkflowMonitors: new Map(),
   formRecoveryScanApplicationIds: new Set(),
   pendingJobImportFile: null,
+  outreachImportScroll: null,
   resumeSuggestions: null,
   pendingResumeFile: null,
   selectedApplicationId: null,
@@ -2779,7 +2780,9 @@ async function importJobFile(event) {
       const count = importedCount(payload);
       byId("outreach-import-form").reset();
       state.pendingJobImportFile = null;
-    setText("outreach-import-file-label", "Required: company, role, JD summary, public email, and evidence URL when available.");
+      byId("outreach-import-form")?.classList.remove("is-file-selected");
+      state.outreachImportScroll = null;
+      setText("outreach-import-file-label", "Required: company, role, JD summary, public email, and evidence URL when available.");
       await Promise.all([loadJobs(true), loadGoogleForms(true)]);
       setFormMessage("outreach-research-status", `${count} role${count === 1 ? "" : "s"} imported. Select them below to review contacts and draft emails.`, "success");
     } catch (error) {
@@ -6415,9 +6418,37 @@ function bindWorkspaceEvents() {
   byId("outreach-research-form").addEventListener("submit", generateOutreachResearchPrompt);
   byId("outreach-copy-prompt").addEventListener("click", (event) => copyOutreachResearchPrompt(event.currentTarget));
   byId("outreach-import-form").addEventListener("submit", importJobFile);
+  const rememberOutreachImportScroll = () => {
+    const mainContent = byId("main-content");
+    state.outreachImportScroll = {
+      mainTop: mainContent?.scrollTop || 0,
+      mainLeft: mainContent?.scrollLeft || 0,
+      windowX: window.scrollX || 0,
+      windowY: window.scrollY || 0,
+    };
+  };
+  byId("outreach-import-trigger").addEventListener("click", () => {
+    rememberOutreachImportScroll();
+    byId("outreach-import-file")?.click();
+  });
+  byId("outreach-import-file").addEventListener("focus", rememberOutreachImportScroll);
   byId("outreach-import-file").addEventListener("change", (event) => {
     state.pendingJobImportFile = event.target.files?.[0] || null;
+    const form = byId("outreach-import-form");
+    form?.classList.toggle("is-file-selected", Boolean(state.pendingJobImportFile));
     setText("outreach-import-file-label", state.pendingJobImportFile ? `${state.pendingJobImportFile.name} · ${formatBytes(state.pendingJobImportFile.size)}` : "Required: company, role, JD summary, public email, and evidence URL when available.");
+    event.target.blur();
+    const savedScroll = state.outreachImportScroll;
+    requestAnimationFrame(() => {
+      const mainContent = byId("main-content");
+      if (mainContent && savedScroll) {
+        mainContent.scrollTop = savedScroll.mainTop;
+        mainContent.scrollLeft = savedScroll.mainLeft;
+      }
+      if (savedScroll) window.scrollTo(savedScroll.windowX, savedScroll.windowY);
+      byId("outreach-import-trigger")?.focus({ preventScroll: true });
+      state.outreachImportScroll = null;
+    });
   });
   byId("ats-link-form").addEventListener("submit", ingestAtsLinks);
   byId("ats-board-form").addEventListener("submit", queueAtsBoardDiscovery);

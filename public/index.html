@@ -1027,8 +1027,10 @@
               <textarea id="outreach-research-prompt" rows="12" readonly aria-label="External AI research prompt"></textarea>
             </div>
             <form id="outreach-import-form" class="mini-upload-zone outreach-import-zone">
-              <input id="outreach-import-file" class="file-input" type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required />
-              <label for="outreach-import-file"><span class="upload-icon" aria-hidden="true">⇧</span><strong>Upload the completed CSV or XLSX</strong><small id="outreach-import-file-label">Required: company, role, JD summary, public email, and evidence URL when available.</small></label>
+              <input id="outreach-import-file" class="file-input" type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" tabindex="-1" aria-label="Completed contacts workbook" required />
+              <button id="outreach-import-trigger" class="outreach-import-trigger" type="button" aria-controls="outreach-import-file" aria-describedby="outreach-import-file-label">
+                <span class="upload-icon" aria-hidden="true">⇧</span><strong>Upload the completed CSV or XLSX</strong><small id="outreach-import-file-label">Required: company, role, JD summary, public email, and evidence URL when available.</small>
+              </button>
               <button id="outreach-import-submit" class="button button-primary button-small" type="submit">Import into outreach</button>
             </form>
             <p id="outreach-research-status" class="form-message" role="status" aria-live="polite"></p>
