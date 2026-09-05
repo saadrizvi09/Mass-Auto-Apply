@@ -739,8 +739,8 @@ def test_legacy_browser_keys_migrate_once_and_are_removed_only_after_server_save
 
 
 def test_local_frontend_assets_are_versioned_to_avoid_stale_validation_code() -> None:
-    assert 'href="/styles.css?v=20260905.1"' in INDEX_HTML
-    assert 'src="/app.js?v=20260905.1"' in INDEX_HTML
+    assert 'href="/styles.css?v=20260905.2"' in INDEX_HTML
+    assert 'src="/app.js?v=20260905.2"' in INDEX_HTML
 
 
 def test_ziprecruiter_is_not_presented_in_hosted_frontend() -> None:
