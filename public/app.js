@@ -2805,7 +2805,9 @@ async function generateOutreachResearchPrompt(event) {
       byId("outreach-research-prompt").value = data.prompt || "";
       byId("outreach-prompt-output").hidden = !data.prompt;
       const years = data.estimated_years_experience;
-      setText("outreach-prompt-summary", `Professional experience: ${years == null ? "review dated roles" : `${years} years`} (education and academic projects excluded) · ${Array.isArray(data.target_roles) && data.target_roles.length ? data.target_roles.join(", ") : "resume-derived roles"}`);
+      const yearsLabel = years == null ? "review dated roles" : `${years} ${Number(years) === 1 ? "year" : "years"}`;
+      const level = data.experience_level ? ` · ${data.experience_level}` : "";
+      setText("outreach-prompt-summary", `Professional experience: ${yearsLabel}${level} (education and academic projects excluded) · ${Array.isArray(data.target_roles) && data.target_roles.length ? data.target_roles.join(", ") : "resume-derived roles"}`);
       setFormMessage("outreach-research-status", "Prompt ready. Paste it into an AI tool with web/search access, then upload the completed workbook below.", "success");
     } catch (error) {
       setFormMessage("outreach-research-status", errorMessage(error, "The research prompt could not be generated."), "error");

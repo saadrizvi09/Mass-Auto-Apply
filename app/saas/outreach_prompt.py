@@ -111,6 +111,8 @@ RESUME TEXT (reference only)
     return {
         "prompt": prompt,
         "estimated_years_experience": experience,
+        "experience_level": experience_level,
+        "experience_basis": "professional employment and internships only; education enrollment ranges and academic projects excluded",
         "target_roles": roles,
         "location": location_label or None,
         "work_mode": work_mode,

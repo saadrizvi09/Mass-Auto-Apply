@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .discovery.common import extract_emails
+from .discovery.common import extract_emails, safe_http_url
 
 
 _MAX_CANDIDATES = 10
@@ -71,12 +71,8 @@ def public_contact_candidates(job: Mapping[str, Any]) -> list[dict[str, Any]]:
     linkedin_url = linkedin_url.strip()[:2_048] if isinstance(linkedin_url, str) and linkedin_url.strip() else None
     imported_source = metadata.get("contact_source")
     imported_source = imported_source.strip()[:240] if isinstance(imported_source, str) and imported_source.strip() else None
-    imported_source_url = metadata.get("contact_source_url")
-    imported_source_url = (
-        imported_source_url.strip()[:2_048]
-        if isinstance(imported_source_url, str) and imported_source_url.strip()
-        else None
-    )
+    imported_source_url = safe_http_url(metadata.get("contact_source_url"))
+    role_source_url = safe_http_url(metadata.get("source_url"))
     imported_status = metadata.get("email_verification_status")
     imported_status = imported_status.strip().lower() if isinstance(imported_status, str) else ""
     verification_status = (
@@ -84,19 +80,31 @@ def public_contact_candidates(job: Mapping[str, Any]) -> list[dict[str, Any]]:
         if imported_status in {"public_source_verified", "source_verified", "publicly_listed"}
         else "public_source_unverified"
     )
-    values: list[tuple[Any, str, str | None, str | None, str | None]] = [
+    values: list[
+        tuple[Any, str, str | None, str | None, str | None, str | None, str]
+    ] = [
         (
             job.get("contact_email"),
             imported_source or "saved contact field",
             contact_name,
             contact_title,
             linkedin_url,
+            imported_source_url,
+            verification_status,
         ),
-        (job.get("description"), source_label, None, None, None),
+        (
+            job.get("description"),
+            source_label,
+            None,
+            None,
+            None,
+            role_source_url,
+            "public_source_unverified",
+        ),
     ]
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for value, origin, name, position, profile_url in values:
+    for value, origin, name, position, profile_url, evidence_url, status in values:
         for email in extract_emails(value, limit=_MAX_CANDIDATES):
             if email in seen:
                 continue
@@ -108,8 +116,8 @@ def public_contact_candidates(job: Mapping[str, Any]) -> list[dict[str, Any]]:
                     name=name,
                     position=position,
                     linkedin_url=profile_url,
-                    source_url=imported_source_url,
-                    verification_status=verification_status,
+                    source_url=evidence_url,
+                    verification_status=status,
                 )
             )
             if len(candidates) >= _MAX_CANDIDATES:
