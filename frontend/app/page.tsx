@@ -542,7 +542,7 @@ function ApplicationsView({ client, applications, jobs, setApplications, notify,
   return <div className={embedded ? "aa-inline-review" : "aa-stack"} id={embedded ? "email-review" : undefined}>{embedded ? <SectionHeader eyebrow="Step 5 · Review" title="Review your drafts" text="Check the recipient, subject, and message. Approve only the emails you want to send." /> : <SectionHeader eyebrow="Review desk" title="Applications" text="Edit, approve, and queue one exact message at a time. Approved email delivery is handled by the persistent worker outside Vercel." />}<div className="aa-review-layout"><section className="aa-panel"><div className="aa-toolbar"><select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="all">All applications</option>{["draft_pending", "drafted", "approved", "queued", "applied", "rejected"].map((item) => <option key={item} value={item}>{humanize(item)}</option>)}</select><span className="aa-count-badge">{rows.length}</span></div>{rows.map((application) => <button className={`aa-application-row ${selectedId === application.id ? "aa-row-active" : ""}`} key={application.id} onClick={() => setSelectedId(application.id)}><div className="aa-list-symbol">@</div><div className="aa-list-copy"><strong>{stringValue(application.subject, "Untitled application")}</strong><span>{stringValue(recipientFor(application), "Recipient not selected")}</span></div><Status value={application.status} /></button>)}{!rows.length && <Empty title="No applications" text="Create a grounded draft from the Jobs library or Outreach." />}</section><section className="aa-panel aa-editor">{draft ? <><SectionHeader eyebrow="Exact message review" title={stringValue(selectedJob?.title, "Application draft")} text={stringValue(selectedJob?.company, "") + (selectedJob?.location ? ` · ${selectedJob.location}` : "")} /><form className="aa-form" onSubmit={save}><Field label="Recipient" value={stringValue(draft.recipient)} onChange={(value) => setDraft({ ...draft, recipient: value })} type="email" /><Field label="Subject" value={stringValue(draft.subject)} onChange={(value) => setDraft({ ...draft, subject: value })} /><label className="aa-field"><span>Message</span><textarea rows={15} value={stringValue(draft.body)} onChange={(event) => setDraft({ ...draft, body: event.target.value })} /></label><div className="aa-form-actions"><Button type="submit" busy={busy === "save"} className="aa-button-secondary">Save edits</Button>{draft.status !== "approved" && <Button type="button" busy={busy === "approve"} onClick={() => void approve()} className="aa-button-primary">Approve exact draft</Button>}{draft.status === "approved" && <Button type="button" busy={busy === "send"} onClick={() => void send()} className="aa-button-primary">Queue Gmail send</Button>}</div></form></> : <Empty title="Choose a message" text="Select an application to review its exact recipient, subject, and body." />}</section></div></div>;
 }
 
-function OutreachView({ client, profile, jobs, applications, setApplications, notify, refresh, setView }: ViewProps) {
+function OutreachView({ client, profile, jobs, applications, credentials, setApplications, notify, refresh, setView }: ViewProps) {
   const [selected, setSelected] = useState<string[]>([]);
   const [contacts, setContacts] = useState<Record<string, Contact[]>>({});
   const [chosen, setChosen] = useState<Record<string, string>>({});
@@ -556,6 +556,7 @@ function OutreachView({ client, profile, jobs, applications, setApplications, no
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState("");
   const [focusApplicationId, setFocusApplicationId] = useState<string | null>(null);
+  const groqReady = credentials.some((item) => item.provider === "groq" && item.configured && !item.requires_reconfiguration && item.verification_status !== "invalid");
   const candidates = useMemo(() => jobs.filter((job) => job.status !== "archived" && job.company && (job.contact_email || contacts[job.id]?.length)).sort((left, right) => numberValue(right.fit?.score) - numberValue(left.fit?.score)).slice(0, 50), [jobs, contacts]);
   useEffect(() => { setSelected((current) => { const allowed = new Set(candidates.map((job) => job.id)); const next = current.filter((id) => allowed.has(id)); return next.length === current.length ? current : next; }); }, [candidates]);
   const appFor = (jobId: string) => applications.filter((item) => item.job_id === jobId && item.channel === "email").sort((left, right) => new Date(stringValue(right.updated_at || right.created_at)).valueOf() - new Date(stringValue(left.updated_at || left.created_at)).valueOf())[0];
@@ -618,6 +619,10 @@ function OutreachView({ client, profile, jobs, applications, setApplications, no
   };
   const selectedContact = (job: Job) => chosen[job.id] || job.contact_email || contacts[job.id]?.[0]?.email || "";
   const createDrafts = async () => {
+    if (!groqReady) {
+      notify("Add a valid Groq API key in Connections before creating drafts.", "error");
+      return;
+    }
     const selectedJobs = selected.map((id) => jobs.find((job) => job.id === id)).filter((job): job is Job => Boolean(job));
     const recipients = new Map(selectedJobs.map((job) => [job.id, selectedContact(job)]));
     const missing = selectedJobs.filter((job) => !recipients.get(job.id));
@@ -627,6 +632,7 @@ function OutreachView({ client, profile, jobs, applications, setApplications, no
     }
     setBusy("drafts");
     let count = 0;
+    const failures: string[] = [];
     const createdApplicationIds: string[] = [];
     for (const job of selectedJobs) {
       const recipient = recipients.get(job.id) as string;
@@ -637,11 +643,11 @@ function OutreachView({ client, profile, jobs, applications, setApplications, no
         if (!created?.recipient) throw new Error("The draft was created without a recipient.");
         count += 1;
         if (created.id) createdApplicationIds.push(created.id);
-      } catch (error) { notify(`${job.company}: ${errorMessage(error, "Draft failed")}`, "error"); }
+      } catch (error) { const reason = errorMessage(error, "Draft failed"); failures.push(reason); notify(`${job.company}: ${reason}`, "error"); }
     }
     await refresh();
     setBusy("");
-    notify(`${count} email draft${count === 1 ? "" : "s"} ready for review.`, count ? "success" : "error");
+    notify(count ? `${count} email draft${count === 1 ? "" : "s"} ready for review.` : `No drafts created${failures[0] ? `: ${failures[0]}` : ". Check your Groq API key in Connections."}`, count ? "success" : "error");
     if (createdApplicationIds[0]) openDraft(createdApplicationIds[0]);
   };
   const sendApproved = async () => { const approved = selected.map((id) => appFor(id)).filter((app): app is Application => Boolean(app && app.status === "approved" && app.recipient)); if (!approved.length) { notify("Approve at least one selected draft before sending.", "error"); return; } if (!window.confirm(`Queue ${approved.length} approved email${approved.length === 1 ? "" : "s"} for Gmail?`)) return; setBusy("send"); try { const result = await apiRequest<{ count?: number }>(client, "/applications/send-batch", { method: "POST", body: { application_ids: approved.slice(0, 30).map((app) => app.id), attach_resume: true, idempotency_key: idempotencyKey("outreach-batch") } }); await refresh(); notify(`${numberValue(result.count, approved.length)} message${approved.length === 1 ? "" : "s"} queued for the persistent Gmail worker.`, "success"); } catch (error) { notify(errorMessage(error, "The email batch could not be queued."), "error"); } finally { setBusy(""); } };

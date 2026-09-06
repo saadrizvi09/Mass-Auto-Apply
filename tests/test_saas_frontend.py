@@ -115,6 +115,9 @@ def test_outreach_preserves_strict_prompt_import_review_and_queue_flow() -> None
         "View draft",
         "focusApplicationId",
         "body: { recipient }",
+        "const groqReady",
+        "Add a valid Groq API key in Connections before creating drafts.",
+        "No drafts created",
     ):
         assert marker in PAGE
     assert "download" not in PAGE.lower()
