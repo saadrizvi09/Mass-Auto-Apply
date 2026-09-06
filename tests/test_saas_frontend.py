@@ -116,6 +116,8 @@ def test_vercel_serves_the_committed_next_export_with_the_fastapi_function() -> 
 
 def test_layout_prevents_the_upload_viewport_regression() -> None:
     assert "overflow-x: hidden" in CSS
+    assert ".aa-auth-form label { display: grid" in CSS
+    assert ".aa-auth-form input { width: 100%" in CSS
     assert ".aa-dropzone input" in CSS
     assert "clip: rect(0 0 0 0)" in CSS
     assert ".aa-import-card" in CSS
