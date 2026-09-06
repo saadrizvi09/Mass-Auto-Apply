@@ -2573,7 +2573,10 @@ def create_app(
                     "created_at,updated_at"
                 ),
                 filters={"user_id": str(user.user_id)},
-                limit=len(STORED_PROVIDER_IDS),
+                # The migration retains legacy provider rows for old accounts.
+                # Do not let one of those rows consume the two-row limit and hide
+                # a currently supported Groq or Browserbase credential.
+                limit=10,
             )
         by_provider = {
             row.get("provider"): row
