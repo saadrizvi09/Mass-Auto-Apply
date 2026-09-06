@@ -31,6 +31,7 @@ DISCOVERY_JOB_KINDS: tuple[str, ...] = (
 _MAX_BATCH = 200
 _MAX_BATCH_BYTES = 1_500_000
 _MAX_CONTACTS_PER_COMPANY = 4
+_MAX_CONTACT_CRAWL_CONCURRENCY = 8
 _MAX_SEARCH_TERMS = 20
 _MAX_SEARCH_TERM_LENGTH = 100
 _DEFAULT_TIMEOUT_SECONDS = 60
@@ -403,7 +404,10 @@ class DiscoveryJobHandler:
             raise ValueError("contact discovery jobs are invalid")
 
         deadline = asyncio.get_running_loop().time() + timeout_seconds
-        semaphore = asyncio.Semaphore(4)
+        # Contact crawls are independent, network-bound jobs. Keep the worker
+        # responsive with a small bounded fan-out; the shared deadline,
+        # per-site page cap, and source-level HTTP limits still apply.
+        semaphore = asyncio.Semaphore(_MAX_CONTACT_CRAWL_CONCURRENCY)
 
         async def collect(
             target: Mapping[str, Any],

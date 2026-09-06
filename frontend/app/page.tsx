@@ -425,10 +425,10 @@ function DiscoveryView({ client, profile, jobs, activity, notify, refresh, setVi
   const prefs = records(profile.preferences);
   const [location, setLocation] = useState(stringValue(prefs.preferred_locations, stringValue(profile.location, "New Delhi, India")));
   const [maxJobs, setMaxJobs] = useState("20");
-  const [timeout, setTimeoutSeconds] = useState("60");
+  const [timeout, setTimeoutSeconds] = useState("45");
   const [remoteOnly, setRemoteOnly] = useState(Boolean(prefs.remote));
   const [keywords, setKeywords] = useState(stringValue(prefs.target_roles, "AI Engineer, Machine Learning Engineer, Software Engineer"));
-  const [feedLimit, setFeedLimit] = useState("60");
+  const [feedLimit, setFeedLimit] = useState("40");
   const [linkedinLocation, setLinkedinLocation] = useState("India");
   const [linkedinKeywords, setLinkedinKeywords] = useState("AI Engineer");
   const [busy, setBusy] = useState("");
@@ -443,8 +443,8 @@ function DiscoveryView({ client, profile, jobs, activity, notify, refresh, setVi
   };
   const runFeeds = async () => { setBusy("feeds"); try { await apiRequest(client, "/discovery/public-feeds", { method: "POST", body: { source_ids: ["rss", "telegram"], limit: Math.min(Number(feedLimit), 200), timeout_seconds: Number(timeout), idempotency_key: idempotencyKey("feed-search") } }); notify("Public feed discovery queued.", "success"); await refresh(); } catch (error) { notify(errorMessage(error, "Public feed discovery could not be queued."), "error"); } finally { setBusy(""); } };
   const recent = jobs.filter((job) => job.source && job.source !== "manual").slice(0, 8);
-  return <div className="aa-stack"><SectionHeader eyebrow="Bounded discovery" title="Find jobs without hanging the browser" text="Choose a result budget and a hard worker deadline. The request queues quickly; Vercel never waits ten minutes for scraping." action={<Button onClick={() => setView("activity")} className="aa-button-secondary">View activity</Button>} />
-    <section className="aa-panel aa-discovery-primary"><div className="aa-panel-intro"><div><p className="aa-eyebrow">Best option</p><h3>Search with your résumé</h3><p>We use your résumé and profile to find matching jobs. Jobs are saved as they arrive.</p></div><span className="aa-timeout-badge">Time limit on</span></div><form className="aa-form" onSubmit={runResumeSearch}><div className="aa-field-grid"><Field label="Location" value={location} onChange={setLocation} placeholder="New Delhi, India" /><Field label="Target roles" value={keywords} onChange={setKeywords} placeholder="AI Engineer, Backend Engineer" /></div><div className="aa-field-grid aa-three-fields"><Field label="Jobs to find" value={maxJobs} onChange={setMaxJobs} type="number" min={2} max={50} /><Field label="Time limit (seconds)" value={timeout} onChange={setTimeoutSeconds} type="number" min={15} max={120} /><Field label="Feed results" value={feedLimit} onChange={setFeedLimit} type="number" min={1} max={200} /></div><label className="aa-checkbox"><input type="checkbox" checked={remoteOnly} onChange={(event) => setRemoteOnly(event.target.checked)} /><span>Remote only</span></label><div className="aa-callout"><strong>Good starting point: 20 jobs / 60 seconds</strong><span>You can leave this page. Slow sources stop at the time limit instead of leaving a spinner forever.</span></div><Button type="submit" busy={busy === "resume"} className="aa-button-primary">Find matching jobs</Button></form></section>
+  return <div className="aa-stack"><SectionHeader eyebrow="Bounded discovery" title="Find jobs quickly" text="Choose a result budget and a hard worker deadline. The request queues in seconds; the worker continues in the background." action={<Button onClick={() => setView("activity")} className="aa-button-secondary">View activity</Button>} />
+    <section className="aa-panel aa-discovery-primary"><div className="aa-panel-intro"><div><p className="aa-eyebrow">Best option</p><h3>Search with your résumé</h3><p>We use your résumé and profile to find matching jobs. Jobs are saved as they arrive.</p></div><span className="aa-timeout-badge">Fast limit on</span></div><form className="aa-form" onSubmit={runResumeSearch}><div className="aa-field-grid"><Field label="Location" value={location} onChange={setLocation} placeholder="New Delhi, India" /><Field label="Target roles" value={keywords} onChange={setKeywords} placeholder="AI Engineer, Backend Engineer" /></div><div className="aa-field-grid aa-three-fields"><Field label="Jobs to find" value={maxJobs} onChange={setMaxJobs} type="number" min={2} max={50} /><Field label="Time limit (seconds)" value={timeout} onChange={setTimeoutSeconds} type="number" min={15} max={120} /><Field label="Feed results" value={feedLimit} onChange={setFeedLimit} type="number" min={1} max={200} /></div><label className="aa-checkbox"><input type="checkbox" checked={remoteOnly} onChange={(event) => setRemoteOnly(event.target.checked)} /><span>Remote only</span></label><div className="aa-callout"><strong>Quick start: 20 jobs / 45 seconds</strong><span>You can leave this page. Slow sources stop at the time limit instead of leaving a spinner forever.</span></div><Button type="submit" busy={busy === "resume"} className="aa-button-primary">Find matching jobs</Button></form></section>
     <div className="aa-two-column"><section className="aa-panel"><SectionHeader eyebrow="Additional public sources" title="Search by source" text="These are optional and use the same bounded worker model." /><form className="aa-form aa-compact-form" onSubmit={runLinkedin}><div className="aa-field-grid"><Field label="Keywords" value={linkedinKeywords} onChange={setLinkedinKeywords} /><Field label="Location" value={linkedinLocation} onChange={setLinkedinLocation} /></div><Button type="submit" busy={busy === "linkedin"} className="aa-button-secondary">Search LinkedIn</Button></form><div className="aa-divider-line" /><div className="aa-source-action"><div><strong>Public job feeds</strong><small>Public feeds with no login needed.</small></div><Button onClick={() => void runFeeds()} busy={busy === "feeds"} className="aa-button-secondary">Search public feeds</Button></div><p className="aa-muted">Need more leads? Use Email leads for an AI research workbook.</p></section><section className="aa-panel"><SectionHeader eyebrow="Worker status" title="Runs that are still working" action={<span className="aa-count-badge">{activeRuns.length}</span>} />{activeRuns.map((run) => <div className="aa-run-row" key={run.id}><span className="aa-spinner aa-spinner-small" /><div><strong>{humanize(run.kind)}</strong><small>{humanize(run.status)} · started {dateTimeLabel(run.created_at)}</small></div><Status value={run.status} /></div>)}{!activeRuns.length && <Empty title="No active runs" text="Completed and failed runs remain available in Activity." action={<Button onClick={() => setView("activity")} className="aa-button-link">Open run history</Button>} />}</section></div>
     <section className="aa-panel"><SectionHeader eyebrow="Saved from discovery" title="Latest discovered roles" action={<Button onClick={() => setView("jobs")} className="aa-button-link">Open jobs library</Button>} />{recent.map((job) => <JobMini key={job.id} job={job} />)}{!recent.length && <Empty title="Nothing discovered yet" text="Queue a bounded search above. Results will appear here when the persistent worker saves them." />}</section>
   </div>;
@@ -517,9 +517,9 @@ function OutreachView({ client, profile, jobs, applications, notify, refresh, se
   const [targetRole, setTargetRole] = useState("");
   const [location, setLocation] = useState(stringValue(profile.location, "New Delhi, India"));
   const [remoteOnly, setRemoteOnly] = useState(false);
-  const [contactLimit, setContactLimit] = useState(30);
-  const [contactPages, setContactPages] = useState(8);
-  const [contactTimeout, setContactTimeout] = useState(60);
+  const [contactLimit, setContactLimit] = useState(20);
+  const [contactPages, setContactPages] = useState(4);
+  const [contactTimeout, setContactTimeout] = useState(30);
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState("");
   const candidates = useMemo(() => jobs.filter((job) => job.status !== "archived" && job.company).sort((left, right) => numberValue(right.fit?.score) - numberValue(left.fit?.score)).slice(0, 50), [jobs]);
@@ -551,8 +551,8 @@ function OutreachView({ client, profile, jobs, applications, notify, refresh, se
       // browser responsive and makes the same flow safe behind Vercel limits.
       if (automationJobId) {
         void (async () => {
-          for (let attempt = 0; attempt < 24; attempt += 1) {
-            await new Promise((resolve) => window.setTimeout(resolve, 2500));
+          for (let attempt = 0; attempt < 40; attempt += 1) {
+            await new Promise((resolve) => window.setTimeout(resolve, attempt === 0 ? 0 : 1500));
             const statusResponse = await apiRequest<{ data?: AutomationJob }>(client, `/automation-jobs/${encodeURIComponent(automationJobId)}`).catch(() => null);
             const status = stringValue(unwrapData(statusResponse || {})?.status);
             const rows = await Promise.allSettled(selected.map(async (id) => {

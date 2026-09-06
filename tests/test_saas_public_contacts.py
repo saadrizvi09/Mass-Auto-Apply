@@ -29,6 +29,21 @@ def test_public_contact_candidates_only_extract_owned_record_text_and_mark_it_un
     assert all(candidate["confidence"] is None for candidate in candidates)
 
 
+def test_telegram_public_post_email_keeps_the_post_as_evidence() -> None:
+    candidates = public_contact_candidates(
+        {
+            "source": "telegram",
+            "contact_email": "hiring@example.org",
+            "apply_url": "https://t.me/fresheroffcampus/123",
+            "metadata": {"message_url": "https://t.me/fresheroffcampus/123"},
+        }
+    )
+
+    assert candidates[0]["source"] == "saved contact field"
+    assert candidates[0]["source_url"] == "https://t.me/fresheroffcampus/123"
+    assert candidates[0]["verification_status"] == "public_source_unverified"
+
+
 def test_public_contact_endpoint_is_tenant_bound_and_has_no_verification_side_effect() -> None:
     job_id = str(uuid4())
     secret_text = "private description marker"

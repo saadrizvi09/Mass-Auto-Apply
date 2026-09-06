@@ -16,7 +16,16 @@ from .discovery.common import extract_emails, safe_http_url
 
 _MAX_CANDIDATES = 10
 _PUBLIC_SOURCES = frozenset(
-    {"telegram", "rss", "linkedin", "public_ats", "referral_digest", "csv", "xlsx"}
+    {
+        "telegram",
+        "rss",
+        "linkedin",
+        "linkedin_guest",
+        "public_ats",
+        "referral_digest",
+        "csv",
+        "xlsx",
+    }
 )
 
 
@@ -71,8 +80,16 @@ def public_contact_candidates(job: Mapping[str, Any]) -> list[dict[str, Any]]:
     linkedin_url = linkedin_url.strip()[:2_048] if isinstance(linkedin_url, str) and linkedin_url.strip() else None
     imported_source = metadata.get("contact_source")
     imported_source = imported_source.strip()[:240] if isinstance(imported_source, str) and imported_source.strip() else None
-    imported_source_url = safe_http_url(metadata.get("contact_source_url"))
-    role_source_url = safe_http_url(metadata.get("source_url"))
+    # Telegram public-preview jobs carry their evidence URL as message_url.
+    # Preserve it when the post itself published an address, while keeping the
+    # lead explicitly unverified until the user reviews it.
+    public_post_url = safe_http_url(metadata.get("message_url"))
+    imported_source_url = safe_http_url(metadata.get("contact_source_url")) or public_post_url
+    role_source_url = (
+        safe_http_url(metadata.get("source_url"))
+        or public_post_url
+        or safe_http_url(job.get("apply_url"))
+    )
     imported_status = metadata.get("email_verification_status")
     imported_status = imported_status.strip().lower() if isinstance(imported_status, str) else ""
     verification_status = (
