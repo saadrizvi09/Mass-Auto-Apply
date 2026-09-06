@@ -616,13 +616,14 @@ the response.
 
 | Method | Path | Result |
 |---|---|---|
-| POST | `/api/v1/jobs/{id}/contacts/public` | extract bounded contact candidates from the owned job record |
+| POST | `/api/v1/jobs/{id}/contacts/public` | compatibility extraction from the owned job record |
+| GET | `/api/v1/jobs/{id}/contacts/public` | return persisted crawler evidence plus imported candidates |
+| POST | `/api/v1/contacts/discover` | queue a bounded same-site public contact crawl for 1–30 owned jobs |
 
-The endpoint requires no credential and does not crawl arbitrary sites, infer a person's
-address from a domain, probe SMTP, or send verification email. It extracts addresses
-already present in the saved contact field or job description, returns source provenance
-and `public_source_unverified`, and leaves selection to the user. The existing Groq
-draft, exact review, final confirmation, Gmail send, daily-cap, duplicate-recipient, and
+The compatibility endpoint requires no credential and does not crawl arbitrary sites,
+infer a person's address from a domain, or send verification email. The queue endpoint
+uses the public-page collector described below. The existing Groq draft, exact review,
+final confirmation, Gmail send, daily-cap, duplicate-recipient, and
 idempotency gates remain authoritative.
 
 ### Jobs/applications
@@ -689,6 +690,19 @@ network fetching uses an allowlisted source catalog, HTTPS redirect validation,
 timeouts, response-byte/item limits, and sanitized errors. LinkedIn guest search is
 unofficial, page/result bounded, has no account context, and cannot create an
 application-submit job.
+
+Public contact collection also returns HTTP 202 through
+`POST /api/v1/contacts/discover`. It accepts 1–30 owned job IDs, up to 50 contacts
+per job, 1–12 pages per site, and a 15–120 second shared worker deadline. The worker
+reads current jobs through `get_public_contact_discovery_bundle`, crawls only HTTPS
+pages on each saved host (including an explicitly imported company domain), respects
+`robots.txt`, follows hiring/team/contact-style links, extracts visible text and
+`mailto:` addresses, and persists evidence through `store_public_job_contacts`.
+Deduplication is tenant + normalized company + email. The results endpoint returns
+these rows alongside legacy workbook candidates. These addresses are source evidence,
+not SMTP deliverability verification; the collector does not log in, scrape LinkedIn
+or Telegram members, guess patterns, or probe mailboxes. Apply
+`202609060001_public_contact_discovery.sql` before deploying this worker kind.
 
 The résumé-guided request body accepts optional location (120 characters),
 `remote_only`, legacy per-source limits (`linkedin_limit` 1–25 and `feed_limit` 1–200),

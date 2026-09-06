@@ -85,6 +85,7 @@ from app.saas.schemas import (
     ProviderCredentialUpsert,
     PublicAtsBoardDiscoveryRequest,
     PublicAtsDiscoveryRequest,
+    PublicContactDiscoveryRequest,
     PublicFeedDiscoveryRequest,
     ReferralDigestIngest,
     ResumeGuidedDiscoveryRequest,
@@ -452,6 +453,43 @@ def _public_automation_job(value: Mapping[str, Any]) -> dict[str, Any]:
         "updated_at",
     )
     return {key: value.get(key) for key in allowed if key in value}
+
+
+def _public_contact_view(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose contact evidence without returning tenant/database internals."""
+
+    email = str(value.get("email") or "").strip().lower()
+    result: dict[str, Any] = {
+        "email": email,
+        "name": value.get("person_name") or value.get("name"),
+        "position": value.get("person_title") or value.get("position"),
+        "verification_status": value.get(
+            "email_verification_status", value.get("verification_status")
+        ),
+    }
+    for key in (
+        "person_name",
+        "person_title",
+        "contact_type",
+        "company_key",
+        "contact_source",
+        "source_date",
+        "source_url",
+        "linkedin_url",
+        "domain",
+        "source",
+        "confidence",
+    ):
+        if key in value:
+            result[key] = value.get(key)
+    return result
+
+
+def _contact_company_key(value: Any) -> str:
+    """Match the worker's stable company key for cross-role review."""
+
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+    return normalized[:160] or "unknown employer"
 
 
 def _required_answer_preflight(revision: Mapping[str, Any]) -> dict[str, Any]:
@@ -2985,6 +3023,132 @@ def create_app(
             }
         )
 
+    @application.get("/api/v1/jobs/{job_id}/contacts/public", tags=["jobs"])
+    async def get_job_public_contacts(
+        job_id: UUID, user: AuthUser = Depends(current_user)
+    ) -> dict[str, Any]:
+        """Return persisted crawler evidence plus legacy imported candidates."""
+
+        client = store_service.user(user.access_token)
+        job = await _required_row(client, "jobs", user, job_id)
+        persisted = await client.fetch_many(
+            "job_contacts",
+            filters={"user_id": str(user.user_id)},
+            order="created_at.desc",
+            limit=2_000,
+        )
+        contacts: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add_contact(value: Mapping[str, Any]) -> None:
+            email = str(value.get("email") or "").strip().lower()
+            if not email or email in seen:
+                return
+            seen.add(email)
+            contacts.append(_public_contact_view(value))
+
+        for row in persisted:
+            if (
+                isinstance(row, Mapping)
+                and row.get("status") != "rejected"
+                and (
+                    str(row.get("job_id") or "") == str(job_id)
+                    or row.get("company_key") == _contact_company_key(job.get("company"))
+                )
+            ):
+                add_contact(row)
+        for candidate in public_contact_candidates(job):
+            add_contact(candidate)
+        return _data(
+            {
+                "job_id": str(job_id),
+                "company": job.get("company"),
+                "contacts": contacts[:50],
+                "verification": {
+                    "status": "source_evidence" if persisted else "syntax_only",
+                    "message": (
+                        "Crawler contacts include the public page where the address appeared. "
+                        "They are not SMTP or deliverability verified; review before drafting."
+                        if persisted
+                        else "Imported candidates come from the saved job record and require review."
+                    ),
+                },
+            }
+        )
+
+    @application.post(
+        "/api/v1/contacts/discover",
+        status_code=status.HTTP_202_ACCEPTED,
+        tags=["contacts", "automation"],
+    )
+    async def queue_public_contact_discovery(
+        body: PublicContactDiscoveryRequest,
+        user: AuthUser = Depends(current_user),
+    ) -> dict[str, Any]:
+        """Queue one bounded, same-site public contact crawl for up to 30 jobs."""
+
+        client = store_service.user(user.access_token)
+        requested_ids = [str(job_id) for job_id in body.job_ids]
+        owned_jobs = await client.fetch_many(
+            "jobs",
+            filters={"user_id": str(user.user_id)},
+            limit=2_000,
+        )
+        owned_by_id = {
+            str(row.get("id")): row
+            for row in owned_jobs
+            if isinstance(row, Mapping) and row.get("id")
+        }
+        if any(job_id not in owned_by_id for job_id in requested_ids):
+            raise ApiError(404, "job_not_found", "One or more selected jobs were not found.")
+
+        queued = _first(
+            await client.rpc(
+                "enqueue_public_contact_discovery",
+                {
+                    "job_ids_input": requested_ids,
+                    "idempotency_key_input": body.idempotency_key,
+                    "max_contacts_input": body.max_contacts_per_job,
+                    "max_pages_input": body.max_pages_per_job,
+                    "timeout_seconds_input": body.timeout_seconds,
+                },
+            )
+        )
+        if queued is None:
+            raise ApiError(503, "data_store_invalid_response", "Contact discovery could not be queued.")
+
+        existing_rows = await client.fetch_many(
+            "job_contacts",
+            filters={"user_id": str(user.user_id)},
+            order="created_at.desc",
+            limit=2_000,
+        )
+        existing: dict[str, list[dict[str, Any]]] = {job_id: [] for job_id in requested_ids}
+        for row in existing_rows:
+            if not isinstance(row, Mapping):
+                continue
+            if row.get("status") == "rejected":
+                continue
+            job_id = str(row.get("job_id") or "")
+            if job_id not in existing:
+                continue
+            email = str(row.get("email") or "").strip().lower()
+            if not email or any(item.get("email") == email for item in existing[job_id]):
+                continue
+            existing[job_id].append(_public_contact_view(row))
+        return _data(
+            {
+                "automation_job": _public_automation_job(queued),
+                "job_ids": requested_ids,
+                "contacts": existing,
+                "status": "queued",
+                "message": (
+                    "Contact discovery is running in the persistent worker. "
+                    "Refresh this page when the leads are ready."
+                ),
+            }
+        )
+
     @application.post("/api/v1/outreach/research-prompt", tags=["outreach", "resumes"])
     async def create_outreach_research_prompt(
         body: OutreachResearchPromptRequest,
@@ -4658,6 +4822,7 @@ def create_app(
             "discover_public_feeds",
             "discover_linkedin_guest",
             "discover_public_ats",
+            "discover_public_contacts",
             "application_scan",
             "application_prefill",
             "application_submit",

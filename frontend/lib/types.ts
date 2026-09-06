@@ -90,8 +90,14 @@ export type Contact = Json & {
   email: string;
   name?: string | null;
   position?: string | null;
+  person_name?: string | null;
+  person_title?: string | null;
+  contact_type?: string | null;
+  company_key?: string | null;
+  contact_source?: string | null;
   source_url?: string | null;
   verification_status?: string | null;
+  email_verification_status?: string | null;
 };
 
 export type Connection = Json & {

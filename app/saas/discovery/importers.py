@@ -48,6 +48,7 @@ HEADER_SYNONYMS: dict[str, frozenset[str]] = {
     "external_id": frozenset({"external id", "external_id", "job id", "job_id", "requisition id", "req id"}),
     "source": frozenset({"source", "job source", "board", "platform"}),
     "domain": frozenset({"domain", "website", "site", "company website", "url domain"}),
+    "company_url": frozenset({"company url", "company_url", "company website url", "employer website"}),
     "salary": frozenset({"salary", "ctc", "compensation", "pay", "package", "stipend", "lpa"}),
     "verified": frozenset({"verified", "is verified", "trusted", "confirmed"}),
     # External-AI research workbooks use these fields to carry contact
@@ -179,6 +180,7 @@ def _matrix_to_jobs(matrix: list[list[Any]], *, max_rows: int) -> list[Normalize
                     "provider": provider,
                     "import_row": row_number,
                     "domain": domain,
+                    "company_url": safe_http_url(_value(row, mapping, "company_url")),
                     "compensation": salary,
                     "verified": verified_value
                     in {"1", "true", "yes", "y", "verified", "trusted"}

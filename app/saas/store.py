@@ -60,6 +60,16 @@ _SAFE_DATABASE_ERRORS: dict[str, tuple[int, str, str]] = {
         "automation_daily_limit_reached",
         "The daily automation job limit has been reached.",
     ),
+    "contact_jobs_invalid": (
+        422,
+        "contact_jobs_invalid",
+        "Select saved jobs from this workspace.",
+    ),
+    "contact_limits_invalid": (
+        422,
+        "contact_limits_invalid",
+        "Contact discovery limits are outside the allowed range.",
+    ),
     "provider_automation_unavailable": (
         409,
         "provider_automation_unavailable",

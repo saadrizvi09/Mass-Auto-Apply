@@ -19,15 +19,18 @@ from app.saas.discovery import (
     parse_public_ats_board_url,
 )
 from app.saas.discovery.common import safe_http_url
+from app.saas.contact_discovery import discover_public_contacts
 
 
 DISCOVERY_JOB_KINDS: tuple[str, ...] = (
     "discover_public_feeds",
     "discover_linkedin_guest",
     "discover_public_ats",
+    "discover_public_contacts",
 )
 _MAX_BATCH = 200
 _MAX_BATCH_BYTES = 1_500_000
+_MAX_CONTACTS_PER_COMPANY = 4
 _MAX_SEARCH_TERMS = 20
 _MAX_SEARCH_TERM_LENGTH = 100
 _DEFAULT_TIMEOUT_SECONDS = 60
@@ -181,6 +184,7 @@ class DiscoveryJobHandler:
         rss_discovery: Callable[..., list[Mapping[str, Any]]] = discover_rss,
         linkedin_discovery: Callable[..., list[Mapping[str, Any]]] = discover_linkedin_guest,
         public_ats_discovery: Callable[..., list[Mapping[str, Any]]] = discover_public_ats_board,
+        contact_discovery: Callable[..., list[Mapping[str, Any]]] = discover_public_contacts,
     ) -> None:
         self.repository = repository
         self.worker_id = worker_id
@@ -189,6 +193,7 @@ class DiscoveryJobHandler:
         self.rss_discovery = rss_discovery
         self.linkedin_discovery = linkedin_discovery
         self.public_ats_discovery = public_ats_discovery
+        self.contact_discovery = contact_discovery
 
     async def _public_feeds(
         self, payload: Mapping[str, Any]
@@ -376,6 +381,106 @@ class DiscoveryJobHandler:
                     return jobs, errors
         return jobs, errors
 
+    async def _public_contacts(
+        self, queue_job: Any
+    ) -> tuple[int, int, list[dict[str, str]]]:
+        """Crawl saved jobs concurrently, then persist only page-backed evidence."""
+
+        bundle = await self.repository.rpc(
+            "get_public_contact_discovery_bundle",
+            {"queue_job_id_input": queue_job.id, "worker_id_input": self.worker_id},
+        )
+        if not isinstance(bundle, Mapping):
+            raise ValueError("contact discovery bundle is invalid")
+        raw_jobs = bundle.get("jobs")
+        if not isinstance(raw_jobs, list) or not 1 <= len(raw_jobs) <= 30:
+            raise ValueError("contact discovery jobs are invalid")
+        max_contacts = _bounded_int(bundle.get("max_contacts"), 30, 50)
+        max_pages = _bounded_int(bundle.get("max_pages"), 8, 12)
+        timeout_seconds = _bounded_timeout(bundle.get("timeout_seconds"))
+        targets = [item for item in raw_jobs if isinstance(item, Mapping)]
+        if len(targets) != len(raw_jobs):
+            raise ValueError("contact discovery jobs are invalid")
+
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        semaphore = asyncio.Semaphore(4)
+
+        async def collect(
+            target: Mapping[str, Any],
+        ) -> tuple[list[Mapping[str, Any]], dict[str, str] | None]:
+            async with semaphore:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return [], {"code": "source_timeout"}
+                try:
+                    found = await _run_with_deadline(
+                        self.contact_discovery,
+                        target,
+                        max_pages=max_pages,
+                        max_contacts=max_contacts,
+                        # The outer wait_for enforces the shared budget. The
+                        # collector also uses this value for individual requests.
+                        timeout_seconds=max(15, min(timeout_seconds, int(remaining))),
+                        deadline=deadline,
+                    )
+                    if not isinstance(found, list):
+                        raise TypeError("contact source returned an invalid result")
+                except DiscoveryTimeLimitExceeded:
+                    return [], {"code": "source_timeout"}
+                except Exception:
+                    # Do not persist exception text: requests can contain source
+                    # URLs or response fragments that are not safe in job history.
+                    return [], {"code": "source_unavailable"}
+                return [item for item in found if isinstance(item, Mapping)], None
+
+        results = await asyncio.gather(*(collect(target) for target in targets))
+        contacts: list[Mapping[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        company_counts: dict[str, int] = {}
+        for target, (found, error) in zip(targets, results, strict=True):
+            if error is not None:
+                error_with_job = {"job_id": str(target.get("id") or ""), **error}
+                errors.append(error_with_job)
+                continue
+            for contact in found:
+                email = str(contact.get("email") or "").strip().lower()
+                company_key = str(contact.get("company_key") or "").strip().lower()
+                if (
+                    not email
+                    or not company_key
+                    or (company_key, email) in seen
+                    or company_counts.get(company_key, 0) >= _MAX_CONTACTS_PER_COMPANY
+                ):
+                    continue
+                seen.add((company_key, email))
+                company_counts[company_key] = company_counts.get(company_key, 0) + 1
+                normalized_contact = dict(contact)
+                normalized_contact["email"] = email
+                normalized_contact["company_key"] = company_key
+                contacts.append(normalized_contact)
+                if len(contacts) >= 1_500:
+                    break
+            if len(contacts) >= 1_500:
+                break
+
+        persisted = await self.repository.rpc(
+            "store_public_job_contacts",
+            {
+                "queue_job_id_input": queue_job.id,
+                "worker_id_input": self.worker_id,
+                "contacts_input": contacts,
+            },
+        )
+        saved_count = (
+            int(persisted.get("count", 0))
+            if isinstance(persisted, Mapping)
+            and isinstance(persisted.get("count", 0), int)
+            and persisted.get("count", 0) >= 0
+            else 0
+        )
+        return len(targets), saved_count, errors
+
     async def __call__(self, job: Any) -> Any:
         if job.kind not in DISCOVERY_JOB_KINDS:
             result = self.fallback(job)
@@ -383,13 +488,51 @@ class DiscoveryJobHandler:
 
         from worker.handlers import HandlerOutcome
 
+        if job.kind == "discover_public_contacts":
+            try:
+                searched, saved_count, source_errors = await self._public_contacts(job)
+            except (TypeError, ValueError):
+                return HandlerOutcome(
+                    status="needs_attention",
+                    code="contact_discovery_payload_invalid",
+                    message="Review the saved roles and contact search limits, then try again.",
+                    provider=job.provider,
+                )
+            except Exception:
+                return HandlerOutcome(
+                    status="needs_attention",
+                    code="contact_discovery_unavailable",
+                    message="The public contact sources could not be reached safely.",
+                    provider=job.provider,
+                )
+            status = "succeeded" if not source_errors else "needs_attention"
+            return HandlerOutcome(
+                status=status,
+                code=(
+                    "contact_discovery_completed"
+                    if status == "succeeded"
+                    else "contact_sources_unavailable"
+                ),
+                message=(
+                    "Public contact search completed. Review each address before drafting."
+                    if status == "succeeded"
+                    else "Some public contact pages were unavailable; review the saved results."
+                ),
+                provider=job.provider,
+                details={
+                    "jobs_searched": searched,
+                    "contacts_saved": saved_count,
+                    "source_errors": source_errors,
+                },
+            )
+
         try:
             if job.kind == "discover_public_feeds":
                 jobs, source_errors = await self._public_feeds(job.payload)
             elif job.kind == "discover_linkedin_guest":
                 jobs = await self._linkedin(job.payload)
                 source_errors = []
-            else:
+            elif job.kind == "discover_public_ats":
                 jobs, source_errors = await self._public_ats(job.payload)
         except (TypeError, ValueError):
             return HandlerOutcome(

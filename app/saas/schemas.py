@@ -439,6 +439,26 @@ class PublicAtsBoardDiscoveryRequest(StrictModel):
         return clean
 
 
+class PublicContactDiscoveryRequest(StrictModel):
+    """Bounded public-page contact collection for saved, tenant-owned jobs."""
+
+    job_ids: list[UUID] = Field(min_length=1, max_length=30)
+    max_contacts_per_job: int = Field(default=30, ge=1, le=50)
+    max_pages_per_job: int = Field(default=8, ge=1, le=12)
+    timeout_seconds: int = Field(default=60, ge=15, le=120)
+    idempotency_key: str = Field(
+        min_length=8, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$"
+    )
+
+    @field_validator("job_ids")
+    @classmethod
+    def deduplicate_job_ids(cls, value: list[UUID]) -> list[UUID]:
+        clean = list(dict.fromkeys(value))
+        if not clean:
+            raise ValueError("Select at least one saved job")
+        return clean
+
+
 class DiscoveryPreferencesUpdate(StrictModel):
     enabled_sources: list[str] | None = Field(default=None, max_length=30)
     keywords: list[str] | None = Field(default=None, max_length=50)
@@ -533,6 +553,7 @@ class AutomationJobCreate(StrictModel):
         "discover_public_feeds",
         "discover_linkedin_guest",
         "discover_public_ats",
+        "discover_public_contacts",
         "application_scan",
         "application_prefill",
         "application_submit",

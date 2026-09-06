@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest==9.0.3"]
+dev = ["pytest==9.0.3", "pglast==8.4"]
 
 [tool.setuptools.packages.find]
 include = ["app*"]

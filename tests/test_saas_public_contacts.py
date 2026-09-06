@@ -104,3 +104,113 @@ def test_public_contact_endpoint_cannot_read_another_tenants_job() -> None:
 
     assert response.status_code == 404
     assert "private@other.example" not in response.text
+
+
+def test_public_contact_discovery_is_queued_as_one_bounded_batch() -> None:
+    first_job_id = str(uuid4())
+    second_job_id = str(uuid4())
+    queue_id = str(uuid4())
+    store = FakeStore(
+        {
+            "jobs": [
+                {
+                    "id": first_job_id,
+                    "user_id": str(USER_ID),
+                    "company": "Acme",
+                    "apply_url": "https://acme.test/jobs/one",
+                },
+                {
+                    "id": second_job_id,
+                    "user_id": str(USER_ID),
+                    "company": "Beta",
+                    "apply_url": "https://beta.test/jobs/two",
+                },
+            ],
+            "job_contacts": [
+                {
+                    "job_id": first_job_id,
+                    "user_id": str(USER_ID),
+                    "email": "recruiting@acme.test",
+                    "person_name": "Alex Recruiter",
+                    "email_verification_status": "public_source_verified",
+                }
+            ],
+        },
+        rpc_results={
+            "enqueue_public_contact_discovery": {
+                "id": queue_id,
+                "kind": "discover_public_contacts",
+                "provider": "public_contacts",
+                "status": "queued",
+            }
+        },
+    )
+    client = TestClient(
+        create_app(settings=configured_settings(), auth=FakeAuth(), store=store)
+    )
+
+    response = client.post(
+        "/api/v1/contacts/discover",
+        json={
+            "job_ids": [first_job_id, second_job_id],
+            "max_contacts_per_job": 20,
+            "max_pages_per_job": 6,
+            "timeout_seconds": 30,
+            "idempotency_key": "contact-batch-123",
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    data = response.json()["data"]
+    assert data["status"] == "queued"
+    assert data["automation_job"]["id"] == queue_id
+    assert data["contacts"][first_job_id][0]["email"] == "recruiting@acme.test"
+    calls = [
+        (name, params)
+        for name, params in store.rpc_calls
+        if name == "enqueue_public_contact_discovery"
+    ]
+    assert len(calls) == 1
+    assert calls[0][1]["job_ids_input"] == [first_job_id, second_job_id]
+    assert calls[0][1]["max_contacts_input"] == 20
+
+
+def test_public_contact_get_includes_persisted_evidence_and_legacy_fallback() -> None:
+    job_id = str(uuid4())
+    store = FakeStore(
+        {
+            "jobs": [
+                {
+                    "id": job_id,
+                    "user_id": str(USER_ID),
+                    "company": "Acme",
+                    "contact_email": "old@acme.test",
+                }
+            ],
+            "job_contacts": [
+                {
+                    "job_id": job_id,
+                    "user_id": str(USER_ID),
+                    "email": "new@acme.test",
+                    "person_name": "Taylor Hiring",
+                    "person_title": "Recruiter",
+                    "email_verification_status": "public_source_verified",
+                    "source_url": "https://acme.test/team",
+                }
+            ],
+        }
+    )
+    client = TestClient(
+        create_app(settings=configured_settings(), auth=FakeAuth(), store=store)
+    )
+
+    response = client.get(f"/api/v1/jobs/{job_id}/contacts/public")
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert [item["email"] for item in data["contacts"]] == [
+        "new@acme.test",
+        "old@acme.test",
+    ]
+    assert data["contacts"][0]["name"] == "Taylor Hiring"
+    assert data["verification"]["status"] == "source_evidence"

@@ -25,6 +25,7 @@ COPY --chown=autoapply:autoapply \
     app/saas/crypto.py \
     app/saas/errors.py \
     app/saas/gmail.py \
+    app/saas/contact_discovery.py \
     app/saas/store.py \
     app/saas/providers.py \
     ./app/saas/

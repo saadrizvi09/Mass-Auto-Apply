@@ -300,6 +300,15 @@ must not be copied across users, logged, placed in a queue, or used as a fallbac
 header. Verify no legacy provider-key entry remains after successful import and no
 generation route requires transient key headers.
 
+For public contact crawling, apply
+`202609060001_public_contact_discovery.sql` before deploying the matching API and
+worker. It creates the RLS-protected `job_contacts` evidence table and three
+lease-bound RPCs; it adds no contact-provider key or mailbox probe. The worker image
+must include `app/saas/contact_discovery.py`; the checked-in `worker/Dockerfile`
+copies it. Give each imported role a public HTTPS job URL, and add a company URL or
+domain in import metadata when available. An ATS URL may not expose the employer's
+own contact page, so zero results can be an honest outcome.
+
 ## 5. Local SaaS development
 
 Create `.env.saas.local` from the example and fill only development project values.

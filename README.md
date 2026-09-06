@@ -33,7 +33,7 @@ unavailable, [open the source MP4](./docs/demo/autoapply-complete-product-demo.m
 | Tenant isolation | Every user-owned database row and résumé object is protected by Supabase RLS |
 | Résumés and profile facts | Up to five fixed private Storage slots, atomic registration/activation, PDF parsing, and conservative profile suggestions. A user-supplied public HTTPS résumé URL is stored separately from the private PDF; common graduation/passout questions use `graduation_year`, while recognized résumé/CV URL questions use only that public URL. |
 | Groq | A per-user key is validated, encrypted with `TOKEN_ENCRYPTION_KEY`, and stored in the service-role-only `user_provider_credentials` table. API responses expose only safe status/hints; the key supports résumé-guided search planning, reviewed email drafts, and one automatic grounded suggestion request when an eligible Form Pilot revision loads. |
-| Public contact leads | Contact discovery requires no provider key. It extracts syntactically valid addresses already present in public listings, referral text, CSV/XLSX imports, or a user-saved job record, and labels every candidate unverified. It never guesses addresses, probes SMTP/mailboxes, or sends verification mail. |
+| Public contact leads | Contact discovery requires no provider key. A durable worker crawls saved HTTPS job/company pages plus explicitly imported company domains, follows only same-site hiring/team/contact links, and saves an address only when it is visibly published with its evidence URL. Imported workbook leads remain clearly source-unverified when appropriate. |
 | Browserbase | A user may bring a Browserbase API key and Project ID. AutoApply validates the pair without creating a session, stores the encrypted pair per account, and prefers it for that user's browser work. Trusted deployment credentials are an optional platform fallback. |
 | Discovery | Résumé-guided Groq terms for bounded Telegram/RSS filtering and LinkedIn guest search, full referral-digest parsing, CSV/XLSX imports, individual ATS URL detection, a review queue for discovered Google Forms, and bounded public-board enumeration |
 | Jobs | Read-only library for imported/discovered roles, résumé-fit signals, URLs, archive/restore, and grounded draft actions. The duplicate manual job editor is removed. |
@@ -87,6 +87,14 @@ Email**. The final destination contains two ordered subtabs: **Build campaign �
    cap (150 maximum), duplicate-recipient window, and idempotency. This subtab lists
    email drafts only; Google Form revisions and answers remain in Form Pilot.
 
+   **Find contacts** is the app-owned collection step. It queues up to 30 selected
+   roles with configurable leads-per-role, pages-per-site, and a 15–120 second
+   deadline. The worker respects `robots.txt` and stays on the saved public HTTPS
+   host. It does not log in, scrape LinkedIn or Telegram members, guess address
+   patterns, or send verification mail. An ATS job URL may produce no contact when
+   the employer has not published an email; adding a company URL/domain in imported
+   metadata improves coverage.
+
 This workflow is a bounded, user-driven convenience layer. It is not an autonomous or
 unreviewed bulk cold-email system; contact lookup, content approval, final confirmation,
 and every provider send remain explicit.
@@ -138,6 +146,12 @@ board discovery enumerates only the company-board URLs the user supplies; it is 
 internet-wide job-search engine. No LinkedIn account cookie or password is collected.
 The 4 MB spreadsheet cap leaves margin under Vercel's Function payload limit. Résumé
 PDFs still upload directly to Supabase Storage and keep their separate 6 MiB limit.
+
+The contact pipeline uses `POST /api/v1/contacts/discover` and the durable
+`discover_public_contacts` worker kind. Results are written to the tenant-scoped
+`job_contacts` table through lease-bound service RPCs and read through
+`GET /api/v1/jobs/{job_id}/contacts/public`. The UI polls only queue status and this
+small result endpoint, so no Vercel request waits for crawling.
 
 Application automation uses sealed form revisions. A scan records the exact fields,
 résumé selection, and schema hash. When possible, the browser immediately asks the API for Groq

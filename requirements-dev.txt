@@ -2,6 +2,7 @@
 -r requirements.txt
 
 pytest==9.0.3
+pglast==8.4
 apscheduler==3.11.0
 sqlmodel==0.0.22
 beautifulsoup4==4.12.3

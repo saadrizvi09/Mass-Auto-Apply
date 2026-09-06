@@ -264,6 +264,7 @@ small { color: var(--muted); }
 .aa-list-symbol, .aa-activity-icon { width: 32px; height: 32px; border-radius: 8px; }
 .aa-form { gap: 12px; }
 .aa-field-grid { gap: 10px; }
+.aa-contact-limits { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 14px; }
 .aa-field { gap: 5px; font-size: .78rem; }
 .aa-field input, .aa-field textarea, .aa-form select, .aa-search, .aa-inline-form input, .aa-contact-row select { border-radius: 8px; padding: 10px 11px; font-size: .84rem; }
 .aa-field textarea { min-height: 92px; }
@@ -304,4 +305,5 @@ small { color: var(--muted); }
   .aa-use-case-grid { grid-template-columns: 1fr; }
   .aa-hero { align-items: flex-start; }
   .aa-hero h2 { font-size: 2.2rem; }
+  .aa-contact-limits { grid-template-columns: 1fr; }
 }
