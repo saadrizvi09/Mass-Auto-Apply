@@ -91,9 +91,10 @@ def test_discovery_has_explicit_budget_and_timeout() -> None:
 
 def test_outreach_preserves_strict_prompt_import_review_and_queue_flow() -> None:
     for marker in (
-        "Generate strict prompt",
-        "at least 100 qualifying public-source emails",
-        "never more than four rows per company",
+        "Generate 100-lead prompt",
+        "100 distinct email leads",
+        "not necessarily HR",
+        "no more than four contacts per company",
         "Choose completed CSV or XLSX",
         '"/outreach/research-prompt"',
         '"/discovery/import"',
