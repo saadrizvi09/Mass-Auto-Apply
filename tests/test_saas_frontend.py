@@ -112,9 +112,13 @@ def test_outreach_preserves_strict_prompt_import_review_and_queue_flow() -> None
             "/jobs/${encodeURIComponent(job.id)}/draft",
         '"/applications/send-batch"',
         "Find more public contacts",
+        "View draft",
+        "focusApplicationId",
+        "body: { recipient }",
     ):
         assert marker in PAGE
     assert "download" not in PAGE.lower()
+    assert "Review & send" not in PAGE
 
 
 def test_email_delivery_is_review_gated_and_persistent() -> None:

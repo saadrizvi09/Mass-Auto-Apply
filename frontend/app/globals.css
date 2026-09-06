@@ -178,6 +178,12 @@ small { color: var(--muted); }
 .aa-order { width: 27px; color: var(--orange-dark); font-family: "DM Mono", monospace; font-size: .76rem; }
 .aa-contact-row { display: flex; align-items: center; gap: 13px; border-bottom: 1px solid var(--line); padding: 13px 0; }
 .aa-contact-row select { max-width: 370px; }
+.aa-contact-email-area { display: flex; align-items: center; gap: 12px; min-width: 0; margin-left: auto; }
+.aa-contact-email-area > .aa-muted, .aa-contact-email-area > select { max-width: min(370px, 32vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aa-contact-row-actions { flex: 0 0 auto; min-width: 72px; text-align: right; }
+.aa-contact-row-actions .aa-muted { font-size: .72rem; white-space: nowrap; }
+.aa-inline-review { display: grid; gap: 16px; scroll-margin-top: 110px; }
+.aa-inline-review .aa-section-header { margin-bottom: 0; }
 .aa-connection-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; border: 1px solid var(--line); border-radius: 13px; padding: 15px; }
 .aa-connection-card .aa-button-row { grid-column: 1 / -1; }
 .aa-toggle { display: flex; gap: 3px; width: fit-content; margin-bottom: 18px; padding: 3px; border-radius: 999px; background: #eef0f2; }
@@ -306,4 +312,8 @@ small { color: var(--muted); }
   .aa-hero { align-items: flex-start; }
   .aa-hero h2 { font-size: 2.2rem; }
   .aa-contact-limits { grid-template-columns: 1fr; }
+  .aa-contact-row { align-items: flex-start; flex-wrap: wrap; }
+  .aa-contact-email-area { width: 100%; margin-left: 42px; }
+  .aa-contact-email-area > .aa-muted, .aa-contact-email-area > select { max-width: 100%; }
+  .aa-contact-row-actions { margin-left: 42px; text-align: left; }
 }
