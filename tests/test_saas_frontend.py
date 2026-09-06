@@ -101,17 +101,17 @@ def test_discovery_has_explicit_budget_and_timeout() -> None:
 
 def test_outreach_preserves_strict_prompt_import_review_and_queue_flow() -> None:
     for marker in (
-        "Generate 100-lead prompt",
-        "100 distinct email leads",
-        "not necessarily HR",
-        "no more than four contacts per company",
+        "Generate research prompt",
+        "distinct roles and contact emails",
+        "Only roles with email leads",
+        "Draft selected emails",
         "Choose completed CSV or XLSX",
         '"/outreach/research-prompt"',
         '"/discovery/import"',
             "/jobs/${encodeURIComponent(id)}/contacts/public",
             "/jobs/${encodeURIComponent(job.id)}/draft",
         '"/applications/send-batch"',
-        "Maximum 30 roles per batch",
+        "Find more public contacts",
     ):
         assert marker in PAGE
     assert "download" not in PAGE.lower()
@@ -120,7 +120,7 @@ def test_outreach_preserves_strict_prompt_import_review_and_queue_flow() -> None
 def test_email_delivery_is_review_gated_and_persistent() -> None:
     assert 'draft.status !== "approved"' in PAGE
     assert 'draft.status === "approved"' in PAGE
-    assert "/applications/${encodeURIComponent(draft.id)}/approve" in PAGE
+    assert "/applications/${encodeURIComponent(approvalTarget.id)}/approve" in PAGE
     assert "/applications/${encodeURIComponent(draft.id)}/send" in PAGE
     assert "persistent Gmail worker" in PAGE
     assert "daily_send_cap" in PAGE

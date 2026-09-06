@@ -297,6 +297,24 @@ class ApplicationCreate(StrictModel):
         return value
 
 
+class DraftApplicationRequest(StrictModel):
+    """The lead selected in the outreach picker for a new draft.
+
+    The recipient is sent explicitly instead of relying on a subsequent job update
+    being visible to the draft request. This closes the race that used to create
+    drafts with an empty recipient.
+    """
+
+    recipient: str | None = Field(default=None, max_length=320)
+
+    @field_validator("recipient")
+    @classmethod
+    def validate_recipient(cls, value: str | None) -> str | None:
+        if value and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+            raise ValueError("Enter a valid recipient email")
+        return value
+
+
 class ApplicationUpdate(StrictModel):
     recipient: str | None = Field(default=None, max_length=320)
     subject: str | None = Field(default=None, max_length=500)

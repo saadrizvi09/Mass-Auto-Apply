@@ -75,6 +75,7 @@ from app.saas.schemas import (
     ApproveApplicationRequest,
     ApplicationCreate,
     ApplicationUpdate,
+    DraftApplicationRequest,
     AutomationJobCreate,
     DiscoveryPreferencesUpdate,
     GoogleOAuthClientUpsert,
@@ -3242,14 +3243,22 @@ def create_app(
     @application.post("/api/v1/jobs/{job_id}/draft", tags=["groq", "applications"])
     async def draft_job_application(
         job_id: UUID,
+        body: DraftApplicationRequest | None = None,
         groq_key: str | None = Header(default=None, alias="X-Groq-Api-Key"),
         user: AuthUser = Depends(current_user),
     ) -> dict[str, Any]:
         groq_key = await resolve_groq_key(groq_key, user)
         client = store_service.user(user.access_token)
+        job = await _required_row(client, "jobs", user, job_id)
+        recipient = body.recipient if body and body.recipient else job.get("contact_email")
+        if not isinstance(recipient, str) or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", recipient):
+            raise ApiError(
+                422,
+                "recipient_required",
+                "Choose an email lead before creating a draft.",
+            )
         await client.rpc("reserve_groq_request", {"operation_input": "generate"})
         writer = store_service.secret()
-        job = await _required_row(client, "jobs", user, job_id)
         profile = await client.fetch_one("profiles", filters={"user_id": str(user.user_id)}) or {}
         resume = await client.fetch_one(
             "resumes", filters={"user_id": str(user.user_id), "is_active": True}
@@ -3278,7 +3287,7 @@ def create_app(
             filters={"user_id": str(user.user_id), "job_id": str(job_id), "status": "drafted"},
         )
         values = {
-            "recipient": job.get("contact_email"),
+            "recipient": recipient,
             "subject": draft["subject"],
             "body": draft["body"],
             "status": "drafted",

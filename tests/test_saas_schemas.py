@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from app.saas.schemas import (
     ApplicationFormApprovalRequest,
     AutomationJobCreate,
+    DraftApplicationRequest,
     GoogleOAuthClientUpsert,
     GoogleOAuthStartRequest,
     JobCreate,
@@ -153,6 +154,14 @@ def test_email_batch_selection_is_unique_and_capped_at_thirty() -> None:
             application_ids=[ids[0], ids[0]],
             idempotency_key="batch-request-123",
         )
+
+
+def test_draft_request_accepts_only_an_email_recipient() -> None:
+    assert DraftApplicationRequest(recipient="recruiting@example.com").recipient == "recruiting@example.com"
+    with pytest.raises(ValidationError):
+        DraftApplicationRequest(recipient="not-an-email")
+    with pytest.raises(ValidationError):
+        DraftApplicationRequest(recipient="recruiting@example.com", unexpected=True)
 
 
 def test_worker_kind_is_allowlisted() -> None:
