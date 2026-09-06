@@ -70,6 +70,16 @@ def test_core_workspace_views_are_present() -> None:
         assert marker in PAGE
 
 
+def test_compact_plain_language_workspace_refresh_is_present() -> None:
+    assert "const simpleCopy" in PAGE
+    assert "const simpleTitles" in PAGE
+    assert "From résumé to application" in PAGE
+    assert "function ServiceBadge" in PAGE
+    assert "aa-use-cases" in PAGE
+    assert "Compact workspace refresh" in CSS
+    assert ".aa-service-logo" in CSS
+
+
 def test_resume_upload_is_contained_and_uses_private_storage_registration() -> None:
     assert 'accept="application/pdf,.pdf"' in PAGE
     assert "client.storage.from(bucket).upload" in PAGE

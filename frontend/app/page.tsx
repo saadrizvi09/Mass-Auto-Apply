@@ -11,18 +11,79 @@ type Message = { text: string; tone?: "success" | "error" | "info" };
 
 const viewMeta: Record<View, { label: string; group: string; icon: string }> = {
   overview: { label: "Overview", group: "START", icon: "⌂" },
-  profile: { label: "Profile & résumé", group: "START", icon: "◎" },
+  profile: { label: "Profile", group: "START", icon: "◎" },
   discovery: { label: "Find jobs", group: "APPLY", icon: "⌕" },
-  form_pilot: { label: "Form Pilot", group: "APPLY", icon: "▤" },
-  outreach: { label: "Email outreach", group: "APPLY", icon: "@" },
+  form_pilot: { label: "Forms", group: "APPLY", icon: "▤" },
+  outreach: { label: "Email leads", group: "APPLY", icon: "@" },
   jobs: { label: "Jobs", group: "LIBRARY", icon: "◇" },
-  applications: { label: "Applications", group: "LIBRARY", icon: "↗" },
+  applications: { label: "Review & send", group: "LIBRARY", icon: "↗" },
   connections: { label: "Connections", group: "SYSTEM", icon: "⌁" },
   activity: { label: "Activity", group: "SYSTEM", icon: "◷" },
   settings: { label: "Settings", group: "SYSTEM", icon: "⚙" },
 };
 
 const navGroups = ["START", "APPLY", "LIBRARY", "SYSTEM"];
+
+const simpleEyebrows: Record<string, string> = {
+  "Applicant foundation": "Your setup",
+  "Private document": "Your résumé",
+  "Profile evidence": "Your details",
+  "Bounded discovery": "Job search",
+  "Additional public sources": "More sources",
+  "Worker status": "Running searches",
+  "Saved from discovery": "Latest results",
+  "Review-gated applications": "Forms",
+  "Review-gated outreach": "Email leads",
+  "Opportunity library": "Your jobs",
+  "Review desk": "Your drafts",
+  "Service connections": "Connections",
+  "BYOK vault": "AI tools",
+  "Gmail delivery": "Email sending",
+  "Managed browser providers": "Secure logins",
+  "Durable worker history": "Background work",
+  "Workspace controls": "Settings",
+};
+
+const simpleTitles: Record<string, string> = {
+  "Profile & résumé": "Profile",
+  "Active résumé": "Your résumé",
+  "Save the details you want applications to use": "Your details",
+  "Find jobs without hanging the browser": "Find jobs",
+  "Search by source": "Other ways to search",
+  "Runs that are still working": "Running searches",
+  "Latest discovered roles": "Latest results",
+  "Form Pilot": "Forms",
+  "Prepare an application URL": "Add an application link",
+  "Forms ready for preparation": "Saved forms",
+  "Groq and Browserbase": "AI tools",
+  "Secure provider login": "Secure logins",
+  "Sending guardrails": "Sending limits",
+};
+
+const simpleCopy: Record<string, string> = {
+  "The strongest results come from a parsed résumé, a saved target profile, and a clear send review.": "Start with a résumé, a profile, and a quick review before sending.",
+  "Your profile is the source of truth for matching. A résumé upload is parsed privately; extracted values stay suggestions until you review and save them.": "Add your details once. We use them to match jobs and write better drafts.",
+  "PDF only · maximum five files · stored in your private Supabase bucket.": "Upload one private PDF. We use it to match jobs.",
+  "Manual profile fields remain useful for links, preferences, and facts that a résumé cannot safely infer.": "Add anything your résumé does not show.",
+  "Choose a result budget and a hard worker deadline. The request queues quickly; Vercel never waits ten minutes for scraping.": "Choose how many jobs to find and set a time limit.",
+  "Uses your parsed résumé and profile to build a focused public-source search. Jobs are saved as they complete.": "We use your résumé and profile to find matching jobs.",
+  "These are optional and use the same bounded worker model.": "Optional searches with the same time limit.",
+  "Completed and failed runs remain available in Activity.": "Finished runs stay in Activity.",
+  "Queue a bounded search above. Results will appear here when the persistent worker saves them.": "Start a search above. Results will appear here when ready.",
+  "Capture exact provider questions in the background, review grounded answers, then approve a one-time submission.": "Save a form, review suggested answers, then approve before sending.",
+  "Paste a Google Form, YC job detail, or another supported public application URL. Search/listing pages are rejected.": "Paste the exact form or job link. We will prepare the questions.",
+  "Answers are editable until you approve this exact revision.": "Edit answers before you approve.",
+  "Every role here came from a bounded discovery run or an imported research workbook. There is no duplicate manual job form.": "Review jobs from search or your imported file.",
+  "Edit, approve, and queue one exact message at a time. Approved email delivery is handled by the persistent worker outside Vercel.": "Check each message, approve it, and send when ready.",
+  "Generate a strict external research brief, import the completed workbook, choose up to 30 roles in order, then draft and send only after review.": "Find leads with AI, choose up to 30, and review every email.",
+  "This picker is a normal contained React control. It does not open an overlay or mutate page scroll. Required evidence columns are validated by the API.": "Upload the file Claude, ChatGPT, or Gemini created. We check the columns for you.",
+  "Keep provider credentials encrypted on the server. Secrets are never returned to the browser after saving.": "Connect the tools you use. Keys are encrypted and never shown again.",
+  "Groq powers grounded drafts and résumé analysis. Browserbase powers managed form workflows when enabled.": "Groq writes drafts. Browserbase helps with supported forms.",
+  "Gmail is used only after you approve exact messages. Daily sending is capped in Settings.": "Connect Gmail to send approved emails. A daily cap is always on.",
+  "Discovery, form scans, and email delivery continue in the persistent worker even after a Vercel request ends.": "Searches, forms, and emails keep running in the background.",
+  "Delivery safety remains review-gated. Change the daily cap and duplicate window for the persistent Gmail worker.": "Set your daily email limit and duplicate window.",
+  "This picker is a normal contained React control. It does not open an overlay or mutate page scroll. Email leads may be source-verified or source-unverified; both remain review-gated before drafting.": "Upload the file Claude, ChatGPT, or Gemini created. We check the columns before importing it.",
+};
 
 function stringValue(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
@@ -68,7 +129,7 @@ function Empty({ title, text, action }: { title: string; text: string; action?: 
 }
 
 function SectionHeader({ eyebrow, title, text, action }: { eyebrow?: string; title: string; text?: string; action?: React.ReactNode }) {
-  return <div className="aa-section-header"><div>{eyebrow && <p className="aa-eyebrow">{eyebrow}</p>}<h2>{title}</h2>{text && <p>{text}</p>}</div>{action}</div>;
+  return <div className="aa-section-header"><div>{eyebrow && <p className="aa-eyebrow">{simpleEyebrows[eyebrow] || eyebrow}</p>}<h2>{simpleTitles[title] || title}</h2>{text && <p>{simpleCopy[text] || text}</p>}</div>{action}</div>;
 }
 
 function AuthScreen({ client, config }: { client: SupabaseClient | null; config: Config | null }) {
@@ -109,7 +170,7 @@ function AuthScreen({ client, config }: { client: SupabaseClient | null; config:
     <div className="aa-brand aa-brand-large"><span className="aa-brand-mark">A</span><span><strong>AutoApply</strong><small>CLOUD</small></span></div>
     <p className="aa-eyebrow">Evidence-first job workspace</p>
     <h1>{mode === "reset" ? "Reset your password" : mode === "signup" ? "Create your workspace" : "Welcome back"}</h1>
-    <p className="aa-auth-copy">Keep job discovery, résumé evidence, reviewed drafts, and Gmail delivery in one calm workspace.</p>
+    <p className="aa-auth-copy">Find jobs, prepare applications, and send approved emails in one place.</p>
     {!config?.supabase_url ? <Notice message={{ text: "Authentication is not configured on this deployment.", tone: "error" }} /> : <>
       <form className="aa-form aa-auth-form" onSubmit={submit}>
         <label>Email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required autoComplete="email" /></label>
@@ -141,6 +202,11 @@ function Sidebar({ view, setView, userEmail, onSignOut, open }: { view: View; se
 
 function StatCard({ label, value, detail }: { label: string; value: string | number; detail: string }) {
   return <div className="aa-stat"><span>{label}</span><strong>{value}</strong><small>{detail}</small></div>;
+}
+
+function ServiceBadge({ kind, title, text }: { kind: "resume" | "search" | "groq" | "gmail"; title: string; text: string }) {
+  const mark = { resume: "CV", search: "⌕", groq: "GQ", gmail: "G" }[kind];
+  return <div className="aa-service-badge"><span className={`aa-service-logo aa-service-${kind}`}>{mark}</span><span><strong>{title}</strong><small>{text}</small></span></div>;
 }
 
 type WorkspaceProps = { client: SupabaseClient; session: Session; config: Config };
@@ -281,9 +347,10 @@ function Overview({ profile, resumes, jobs, applications, connections, activity,
   const connected = connections.filter((item) => stringValue(item.connection && records(item.connection).status) === "connected").length;
   const parsed = resumes.find((resume) => resume.parse_status === "parsed");
   const name = stringValue(profile.full_name, "there").split(" ")[0];
-  return <div className="aa-stack"><section className="aa-hero"><div><p className="aa-eyebrow">Your opportunity workspace</p><h2>Good to see you, {name}.</h2><p>One focused place to turn résumé evidence into carefully reviewed applications and outreach.</p></div><Button onClick={() => setView("discovery")} className="aa-button-primary">Find jobs</Button></section>
-    <div className="aa-stat-grid"><StatCard label="Saved roles" value={readyJobs} detail="ranked against your profile" /><StatCard label="Approved drafts" value={approved} detail="ready for your review" /><StatCard label="Connected services" value={connected} detail="Gmail and providers" /><StatCard label="Background work" value={queued} detail="running outside the request" /></div>
-    <div className="aa-two-column"><section className="aa-panel"><SectionHeader eyebrow="Next best action" title="Keep your application kit current" text="The strongest results come from a parsed résumé, a saved target profile, and a clear send review." /><div className="aa-checklist"><Checklist done={Boolean(parsed)} title="Parse an active résumé" text={parsed ? "Your résumé is available for matching and grounded drafts." : "Upload one PDF in Profile & résumé."} action={() => setView("profile")} /><Checklist done={Boolean(profile.headline && profile.skills?.length)} title="Complete your profile" text="Add target roles and links so fit scoring has useful context." action={() => setView("profile")} /><Checklist done={connected > 0} title="Connect the services you use" text="Gmail is required only when you decide to queue approved email." action={() => setView("connections")} /></div></section><section className="aa-panel"><SectionHeader eyebrow="Recent roles" title="Your latest opportunities" action={<Button className="aa-button-link" onClick={() => setView("jobs")}>View all</Button>} />{jobs.slice(0, 4).map((job) => <JobMini key={job.id} job={job} />)}{!jobs.length && <Empty title="No roles yet" text="Start with Find jobs or import a reviewed research workbook in Email outreach." action={<Button onClick={() => setView("discovery")} className="aa-button-secondary">Start discovery</Button>} />}</section></div>
+  return <div className="aa-stack"><section className="aa-hero"><div><p className="aa-eyebrow">Your job workspace</p><h2>Good to see you, {name}.</h2><p>Find matching jobs, write better emails, and send only when you approve.</p></div><Button onClick={() => setView("discovery")} className="aa-button-primary">Find jobs</Button></section>
+    <section className="aa-panel aa-use-cases"><div className="aa-panel-heading"><div><p className="aa-eyebrow">How it works</p><h3>From résumé to application</h3><p>Four simple steps. You stay in control.</p></div></div><div className="aa-use-case-grid"><ServiceBadge kind="resume" title="1. Add résumé" text="Build your profile" /><ServiceBadge kind="search" title="2. Find jobs" text="See your best matches" /><ServiceBadge kind="groq" title="3. Draft emails" text="Personalise each message" /><ServiceBadge kind="gmail" title="4. Send" text="Review before Gmail sends" /></div></section>
+    <div className="aa-stat-grid"><StatCard label="Saved jobs" value={readyJobs} detail="matched to you" /><StatCard label="Email drafts" value={approved} detail="ready to review" /><StatCard label="Connections" value={connected} detail="Gmail and AI tools" /><StatCard label="Running now" value={queued} detail="working in the background" /></div>
+    <div className="aa-two-column"><section className="aa-panel"><SectionHeader eyebrow="Start here" title="Get ready in three steps" text="Add your résumé, check your profile, then connect Gmail when you want to send." /><div className="aa-checklist"><Checklist done={Boolean(parsed)} title="Add your résumé" text={parsed ? "Ready for job matching." : "Upload one PDF."} action={() => setView("profile")} /><Checklist done={Boolean(profile.headline && profile.skills?.length)} title="Check your profile" text="Add your role and skills." action={() => setView("profile")} /><Checklist done={connected > 0} title="Connect your tools" text="Gmail is only needed to send." action={() => setView("connections")} /></div></section><section className="aa-panel"><SectionHeader eyebrow="Your jobs" title="Latest matches" action={<Button className="aa-button-link" onClick={() => setView("jobs")}>View all</Button>} />{jobs.slice(0, 4).map((job) => <JobMini key={job.id} job={job} />)}{!jobs.length && <Empty title="No jobs yet" text="Start a search or import a research file." action={<Button onClick={() => setView("discovery")} className="aa-button-secondary">Find jobs</Button>} />}</section></div>
   </div>;
 }
 
@@ -377,8 +444,8 @@ function DiscoveryView({ client, profile, jobs, activity, notify, refresh, setVi
   const runFeeds = async () => { setBusy("feeds"); try { await apiRequest(client, "/discovery/public-feeds", { method: "POST", body: { source_ids: ["rss", "telegram"], limit: Math.min(Number(feedLimit), 200), timeout_seconds: Number(timeout), idempotency_key: idempotencyKey("feed-search") } }); notify("Public feed discovery queued.", "success"); await refresh(); } catch (error) { notify(errorMessage(error, "Public feed discovery could not be queued."), "error"); } finally { setBusy(""); } };
   const recent = jobs.filter((job) => job.source && job.source !== "manual").slice(0, 8);
   return <div className="aa-stack"><SectionHeader eyebrow="Bounded discovery" title="Find jobs without hanging the browser" text="Choose a result budget and a hard worker deadline. The request queues quickly; Vercel never waits ten minutes for scraping." action={<Button onClick={() => setView("activity")} className="aa-button-secondary">View activity</Button>} />
-    <section className="aa-panel aa-discovery-primary"><div className="aa-panel-intro"><div><p className="aa-eyebrow">Recommended route</p><h3>Search from your résumé</h3><p>Uses your parsed résumé and profile to build a focused public-source search. Jobs are saved as they complete.</p></div><span className="aa-timeout-badge">Worker deadline enforced</span></div><form className="aa-form" onSubmit={runResumeSearch}><div className="aa-field-grid"><Field label="Location" value={location} onChange={setLocation} placeholder="New Delhi, India" /><Field label="Target roles" value={keywords} onChange={setKeywords} placeholder="AI Engineer, Backend Engineer" /></div><div className="aa-field-grid aa-three-fields"><Field label="Maximum jobs" value={maxJobs} onChange={setMaxJobs} type="number" min={2} max={50} /><Field label="Worker timeout (seconds)" value={timeout} onChange={setTimeoutSeconds} type="number" min={15} max={120} /><Field label="Feed candidates" value={feedLimit} onChange={setFeedLimit} type="number" min={1} max={200} /></div><label className="aa-checkbox"><input type="checkbox" checked={remoteOnly} onChange={(event) => setRemoteOnly(event.target.checked)} /><span>Remote only</span></label><div className="aa-callout"><strong>Safe default: 20 jobs / 60 seconds</strong><span>Runs are durable and visible in Activity. A slow source is cut off at the deadline instead of leaving a spinner forever.</span></div><Button type="submit" busy={busy === "resume"} className="aa-button-primary">Queue résumé-guided search</Button></form></section>
-    <div className="aa-two-column"><section className="aa-panel"><SectionHeader eyebrow="Additional public sources" title="Search by source" text="These are optional and use the same bounded worker model." /><form className="aa-form aa-compact-form" onSubmit={runLinkedin}><div className="aa-field-grid"><Field label="Keywords" value={linkedinKeywords} onChange={setLinkedinKeywords} /><Field label="Location" value={linkedinLocation} onChange={setLinkedinLocation} /></div><Button type="submit" busy={busy === "linkedin"} className="aa-button-secondary">Queue LinkedIn guest search</Button></form><div className="aa-divider-line" /><div className="aa-source-action"><div><strong>Public RSS and Telegram feeds</strong><small>Credential-free, bounded sources from the deployment catalog.</small></div><Button onClick={() => void runFeeds()} busy={busy === "feeds"} className="aa-button-secondary">Queue feeds</Button></div><p className="aa-muted">For an external AI research workbook, use Email outreach. It is intentionally separate from live discovery.</p></section><section className="aa-panel"><SectionHeader eyebrow="Worker status" title="Runs that are still working" action={<span className="aa-count-badge">{activeRuns.length}</span>} />{activeRuns.map((run) => <div className="aa-run-row" key={run.id}><span className="aa-spinner aa-spinner-small" /><div><strong>{humanize(run.kind)}</strong><small>{humanize(run.status)} · started {dateTimeLabel(run.created_at)}</small></div><Status value={run.status} /></div>)}{!activeRuns.length && <Empty title="No active runs" text="Completed and failed runs remain available in Activity." action={<Button onClick={() => setView("activity")} className="aa-button-link">Open run history</Button>} />}</section></div>
+    <section className="aa-panel aa-discovery-primary"><div className="aa-panel-intro"><div><p className="aa-eyebrow">Best option</p><h3>Search with your résumé</h3><p>We use your résumé and profile to find matching jobs. Jobs are saved as they arrive.</p></div><span className="aa-timeout-badge">Time limit on</span></div><form className="aa-form" onSubmit={runResumeSearch}><div className="aa-field-grid"><Field label="Location" value={location} onChange={setLocation} placeholder="New Delhi, India" /><Field label="Target roles" value={keywords} onChange={setKeywords} placeholder="AI Engineer, Backend Engineer" /></div><div className="aa-field-grid aa-three-fields"><Field label="Jobs to find" value={maxJobs} onChange={setMaxJobs} type="number" min={2} max={50} /><Field label="Time limit (seconds)" value={timeout} onChange={setTimeoutSeconds} type="number" min={15} max={120} /><Field label="Feed results" value={feedLimit} onChange={setFeedLimit} type="number" min={1} max={200} /></div><label className="aa-checkbox"><input type="checkbox" checked={remoteOnly} onChange={(event) => setRemoteOnly(event.target.checked)} /><span>Remote only</span></label><div className="aa-callout"><strong>Good starting point: 20 jobs / 60 seconds</strong><span>You can leave this page. Slow sources stop at the time limit instead of leaving a spinner forever.</span></div><Button type="submit" busy={busy === "resume"} className="aa-button-primary">Find matching jobs</Button></form></section>
+    <div className="aa-two-column"><section className="aa-panel"><SectionHeader eyebrow="Additional public sources" title="Search by source" text="These are optional and use the same bounded worker model." /><form className="aa-form aa-compact-form" onSubmit={runLinkedin}><div className="aa-field-grid"><Field label="Keywords" value={linkedinKeywords} onChange={setLinkedinKeywords} /><Field label="Location" value={linkedinLocation} onChange={setLinkedinLocation} /></div><Button type="submit" busy={busy === "linkedin"} className="aa-button-secondary">Search LinkedIn</Button></form><div className="aa-divider-line" /><div className="aa-source-action"><div><strong>Public job feeds</strong><small>Public feeds with no login needed.</small></div><Button onClick={() => void runFeeds()} busy={busy === "feeds"} className="aa-button-secondary">Search public feeds</Button></div><p className="aa-muted">Need more leads? Use Email leads for an AI research workbook.</p></section><section className="aa-panel"><SectionHeader eyebrow="Worker status" title="Runs that are still working" action={<span className="aa-count-badge">{activeRuns.length}</span>} />{activeRuns.map((run) => <div className="aa-run-row" key={run.id}><span className="aa-spinner aa-spinner-small" /><div><strong>{humanize(run.kind)}</strong><small>{humanize(run.status)} · started {dateTimeLabel(run.created_at)}</small></div><Status value={run.status} /></div>)}{!activeRuns.length && <Empty title="No active runs" text="Completed and failed runs remain available in Activity." action={<Button onClick={() => setView("activity")} className="aa-button-link">Open run history</Button>} />}</section></div>
     <section className="aa-panel"><SectionHeader eyebrow="Saved from discovery" title="Latest discovered roles" action={<Button onClick={() => setView("jobs")} className="aa-button-link">Open jobs library</Button>} />{recent.map((job) => <JobMini key={job.id} job={job} />)}{!recent.length && <Empty title="Nothing discovered yet" text="Queue a bounded search above. Results will appear here when the persistent worker saves them." />}</section>
   </div>;
 }
