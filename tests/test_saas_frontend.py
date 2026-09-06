@@ -38,6 +38,13 @@ def test_old_dom_frontend_entrypoints_are_removed() -> None:
     assert 'src="../public/app.js"' not in PAGE
 
 
+def test_local_fastapi_serves_the_checked_in_next_export() -> None:
+    source = (ROOT / "app" / "saas_main.py").read_text(encoding="utf-8")
+    assert '@application.get("/assets/{asset_path:path}"' in source
+    assert "PUBLIC_ASSET_DIR" in source
+    assert "Asset not found" in source
+
+
 def test_same_origin_api_and_supabase_auth_contract_is_preserved() -> None:
     assert 'const API_PREFIX = "/api/v1"' in API
     assert 'credentials: "same-origin"' in API
@@ -90,8 +97,8 @@ def test_outreach_preserves_strict_prompt_import_review_and_queue_flow() -> None
         "Choose completed CSV or XLSX",
         '"/outreach/research-prompt"',
         '"/discovery/import"',
-        '"/jobs/${encodeURIComponent(id)}/contacts/public"',
-        '"/jobs/${encodeURIComponent(job.id)}/draft"',
+            "/jobs/${encodeURIComponent(id)}/contacts/public",
+            "/jobs/${encodeURIComponent(job.id)}/draft",
         '"/applications/send-batch"',
         "Maximum 30 roles per batch",
     ):
@@ -102,8 +109,8 @@ def test_outreach_preserves_strict_prompt_import_review_and_queue_flow() -> None
 def test_email_delivery_is_review_gated_and_persistent() -> None:
     assert 'draft.status !== "approved"' in PAGE
     assert 'draft.status === "approved"' in PAGE
-    assert '"/applications/${encodeURIComponent(draft.id)}/approve"' in PAGE
-    assert '"/applications/${encodeURIComponent(draft.id)}/send"' in PAGE
+    assert "/applications/${encodeURIComponent(draft.id)}/approve" in PAGE
+    assert "/applications/${encodeURIComponent(draft.id)}/send" in PAGE
     assert "persistent Gmail worker" in PAGE
     assert "daily_send_cap" in PAGE
 

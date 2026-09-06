@@ -18,7 +18,7 @@ from typing import Any, Literal, Mapping
 from urllib.parse import urlencode
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, File, Header, Query, Request, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, RedirectResponse
 
@@ -102,6 +102,7 @@ from app.saas.store import StoreClient, SupabaseStore
 
 VERSION = "2.0.0"
 PUBLIC_DIR = Path(__file__).resolve().parent.parent / "public"
+PUBLIC_ASSET_DIR = (PUBLIC_DIR / "assets").resolve()
 RESUME_BUCKET = "resumes"
 RESUME_ANALYSIS_TIMEOUT_SECONDS = 50
 STORAGE_LIST_PAGE_SIZE = 1000
@@ -4738,6 +4739,23 @@ def create_app(
     async def index() -> FileResponse:
         return FileResponse(
             PUBLIC_DIR / "index.html", headers={"Cache-Control": "no-store"}
+        )
+
+    @application.get("/assets/{asset_path:path}", include_in_schema=False)
+    async def next_asset(asset_path: str) -> FileResponse:
+        """Serve the checked-in Next export during direct Uvicorn development.
+
+        Vercel serves these files from its public CDN.  The explicit local route
+        keeps `./dev.command` equivalent to production without exposing files
+        outside the public asset directory.
+        """
+
+        candidate = (PUBLIC_ASSET_DIR / asset_path).resolve()
+        if PUBLIC_ASSET_DIR not in candidate.parents or not candidate.is_file():
+            raise HTTPException(status_code=404, detail="Asset not found")
+        return FileResponse(
+            candidate,
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
         )
 
     @application.get("/privacy.html", include_in_schema=False)
